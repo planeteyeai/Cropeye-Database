@@ -1,6 +1,41 @@
-fastapi
-uvicorn[standard]
-earthengine-api
-requests
-python-dotenv
-supabase
+# -----------------------------
+# Core API
+# -----------------------------
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.4
+python-dotenv==1.0.1
+
+# -----------------------------
+# HTTP + Data
+# -----------------------------
+requests==2.31.0
+numpy==1.26.4
+
+# -----------------------------
+# Google Earth Engine
+# -----------------------------
+earthengine-api==0.1.390
+
+# -----------------------------
+# Database
+# -----------------------------
+supabase==2.3.4
+postgrest==0.13.0
+
+# -----------------------------
+# Geospatial
+# -----------------------------
+shapely==2.0.3
+geopy==2.4.1
+
+# -----------------------------
+# Visualization
+# -----------------------------
+plotly==5.19.0
+matplotlib==3.8.3
+
+# -----------------------------
+# Server Utils
+# -----------------------------
+python-multipart==0.0.9
