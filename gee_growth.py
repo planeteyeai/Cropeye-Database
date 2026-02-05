@@ -1,7 +1,6 @@
 import ee
 from datetime import datetime, timedelta, date
 
-# ee.Initialize() must be called in main file before using this
 service_account_info = json.loads(os.environ["EE_SERVICE_ACCOUNT_JSON"])
 
 credentials = ee.ServiceAccountCredentials(
@@ -9,7 +8,7 @@ credentials = ee.ServiceAccountCredentials(
     key_data=json.dumps(service_account_info)
 )
 
-ee.Initialize(credentials)
+ee.Initialize(credentials, project=service_account_info["project_id"])
     
 def run_growth_analysis_by_plot(plot_data, start_date, end_date):
     geometry = plot_data["geometry"]
