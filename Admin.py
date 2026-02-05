@@ -24,7 +24,7 @@ from db import supabase
 
 # Initialize Earth Engine - move this to the top
 
-private_key = os.getenv("GEE_PRIVATE_KEY").replace("\\n", "\n")
+private_key = os.getenv("EE_SERVICE_ACCOUNT_JSON").replace("\\n", "\n")
 
 credentials = ee.ServiceAccountCredentials(
     os.getenv("GEE_SERVICE_ACCOUNT_EMAIL"),
