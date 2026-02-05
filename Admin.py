@@ -24,14 +24,14 @@ from db import supabase
 
 # Initialize Earth Engine - move this to the top
 
-private_key = os.getenv("EE_SERVICE_ACCOUNT_JSON").replace("\\n", "\n")
+service_account_info = json.loads(os.environ["EE_SERVICE_ACCOUNT_JSON"])
 
 credentials = ee.ServiceAccountCredentials(
-    os.getenv("GEE_SERVICE_ACCOUNT_EMAIL"),
-    key_data=private_key
+    service_account_info["client_email"],
+    key_data=json.dumps(service_account_info)
 )
 
-ee.Initialize(credentials, project=os.getenv("GEE_PROJECT_ID"))
+ee.Initialize(credentials, project=service_account_info["project_id"])
 print("SUPABASE URL:", os.environ.get("SUPABASE_URL"))
 
 # Pydantic models for request/response  
