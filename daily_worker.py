@@ -21,7 +21,7 @@ credentials = ee.ServiceAccountCredentials(
     key_data=json.dumps(service_account_info)
 )
 
-ee.Initialize(credentials)
+ee.Initialize(credentials, project=service_account_info["project_id"])
 
 
 # ---------------- MAIN ----------------
