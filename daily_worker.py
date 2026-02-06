@@ -2,6 +2,7 @@ import os
 import json
 import ee
 from supabase import create_client
+from postgrest.exceptions import APIError
 
 # =========================
 # ENV VALIDATION
@@ -12,11 +13,9 @@ REQUIRED_ENV = [
     "EE_SERVICE_ACCOUNT_JSON",
 ]
 
-missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
-if missing:
-    for k in missing:
-        print(f"❌ Missing env: {k}")
-    raise RuntimeError("Environment validation failed")
+for k in REQUIRED_ENV:
+    if not os.getenv(k):
+        raise RuntimeError(f"❌ Missing env: {k}")
 
 # =========================
 # INIT SUPABASE
@@ -41,15 +40,40 @@ ee.Initialize(
 print("✅ GEE initialized successfully")
 
 # =========================
+# FIND GEOMETRY COLUMN
+# =========================
+def detect_geometry_column():
+    candidates = [
+        "geometry",
+        "geom",
+        "geojson",
+        "geometry_json",
+        "boundary",
+        "polygon",
+    ]
+
+    for col in candidates:
+        try:
+            supabase.table("plots").select(col).limit(1).execute()
+            print(f"✅ Using geometry column: {col}")
+            return col
+        except APIError:
+            continue
+
+    raise RuntimeError("❌ No geometry column found in plots table")
+
+# =========================
 # MAIN WORKER
 # =========================
 def run():
     print("🛰 Fetching plots directly from Supabase...")
 
+    geom_col = detect_geometry_column()
+
     plots = (
         supabase
         .table("plots")
-        .select("id, plot_name, geometry")
+        .select(f"id, plot_name, {geom_col}")
         .execute()
         .data
     )
@@ -58,24 +82,27 @@ def run():
 
     for plot in plots:
         plot_id = plot["id"]
-        plot_name = plot["plot_name"]
-        geometry = plot["geometry"]
+        plot_name = plot.get("plot_name", "UNKNOWN")
+        geometry = plot.get(geom_col)
 
         print(f"\n🌱 Processing plot: {plot_name}")
 
         if not geometry:
-            print("⚠️ No geometry, skipping")
+            print("⚠️ Missing geometry, skipping")
             continue
 
         try:
-            # ✅ Convert GeoJSON → GEE Geometry
             ee_geom = ee.Geometry(geometry)
 
-            # ✅ Area (required by your earlier failures)
-            area_ha = ee_geom.area(maxError=1).divide(10000).getInfo()
+            area_ha = (
+                ee_geom
+                .area(maxError=1)
+                .divide(10_000)
+                .getInfo()
+            )
+
             print(f"📐 Area: {area_ha:.2f} ha")
 
-            # ✅ Fast, safe Sentinel-2 fetch
             img = (
                 ee.ImageCollection("COPERNICUS/S2_SR")
                 .filterBounds(ee_geom)
@@ -99,7 +126,6 @@ def run():
 
             print(f"🌿 NDVI: {mean_ndvi}")
 
-            # ✅ Store result (idempotent-safe)
             supabase.table("plot_metrics").insert({
                 "plot_id": plot_id,
                 "plot_name": plot_name,
@@ -107,7 +133,7 @@ def run():
                 "ndvi": mean_ndvi
             }).execute()
 
-            print("✅ Stored successfully")
+            print("✅ Stored")
 
         except ee.EEException as e:
             print(f"❌ GEE error (skipped): {e}")
