@@ -10,7 +10,7 @@ from supabase import create_client
 REQUIRED_ENV = [
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
-    "EE_CREDENTIALS",
+    "EE_SERVICE_ACCOUNT_JSON",
     "FASTAPI_PLOTS_URL",
     "WORKER_TOKEN"
 ]
