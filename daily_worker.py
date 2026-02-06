@@ -9,7 +9,7 @@ from supabase import create_client
 # =========================
 REQUIRED_ENV = [
     "SUPABASE_URL",
-    "SUPABASE_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY",
     "EE_CREDENTIALS",
     "FASTAPI_PLOTS_URL",
     "WORKER_TOKEN"
