@@ -15,8 +15,13 @@ REQUIRED_ENV = [
     "WORKER_TOKEN"
 ]
 
-if not all(os.getenv(k) for k in REQUIRED_ENV):
-    raise RuntimeError("❌ Missing one or more required environment variables")
+missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
+if missing:
+    print("❌ Missing environment variables:")
+    for k in missing:
+        print(f"   - {k}")
+    raise RuntimeError("Environment validation failed")
+
 
 # =========================
 # INIT SUPABASE
