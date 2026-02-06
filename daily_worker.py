@@ -1,8 +1,8 @@
 import os
 import json
+import datetime
 import ee
 from supabase import create_client
-from postgrest.exceptions import APIError
 
 # =========================
 # ENV VALIDATION
@@ -15,10 +15,12 @@ REQUIRED_ENV = [
 
 for k in REQUIRED_ENV:
     if not os.getenv(k):
-        raise RuntimeError(f"❌ Missing env: {k}")
+        raise RuntimeError(f"❌ Missing env var: {k}")
+
+TODAY = datetime.date.today().isoformat()
 
 # =========================
-# INIT SUPABASE
+# SUPABASE
 # =========================
 supabase = create_client(
     os.environ["SUPABASE_URL"],
@@ -26,11 +28,10 @@ supabase = create_client(
 )
 
 # =========================
-# INIT GEE
+# GEE INIT
 # =========================
 print("🚀 Initializing Google Earth Engine...")
 creds = json.loads(os.environ["EE_SERVICE_ACCOUNT_JSON"])
-
 ee.Initialize(
     ee.ServiceAccountCredentials(
         creds["client_email"],
@@ -40,40 +41,15 @@ ee.Initialize(
 print("✅ GEE initialized successfully")
 
 # =========================
-# FIND GEOMETRY COLUMN
-# =========================
-def detect_geometry_column():
-    candidates = [
-        "geometry",
-        "geom",
-        "geojson",
-        "geometry_json",
-        "boundary",
-        "polygon",
-    ]
-
-    for col in candidates:
-        try:
-            supabase.table("plots").select(col).limit(1).execute()
-            print(f"✅ Using geometry column: {col}")
-            return col
-        except APIError:
-            continue
-
-    raise RuntimeError("❌ No geometry column found in plots table")
-
-# =========================
 # MAIN WORKER
 # =========================
 def run():
-    print("🛰 Fetching plots directly from Supabase...")
-
-    geom_col = detect_geometry_column()
+    print("🛰 Fetching plots from Supabase...")
 
     plots = (
         supabase
         .table("plots")
-        .select(f"id, plot_name, {geom_col}")
+        .select("id, plot_name, geojson")
         .execute()
         .data
     )
@@ -82,64 +58,89 @@ def run():
 
     for plot in plots:
         plot_id = plot["id"]
-        plot_name = plot.get("plot_name", "UNKNOWN")
-        geometry = plot.get(geom_col)
+        plot_name = plot["plot_name"]
+        geojson = plot["geojson"]
 
         print(f"\n🌱 Processing plot: {plot_name}")
 
-        if not geometry:
-            print("⚠️ Missing geometry, skipping")
+        if not geojson:
+            print("⚠️ Missing geojson, skipping")
+            continue
+
+        # 🚫 Skip if already processed today
+        existing = (
+            supabase
+            .table("satellite_images")
+            .select("id")
+            .eq("plot_id", plot_id)
+            .eq("satellite_date", TODAY)
+            .execute()
+            .data
+        )
+
+        if existing:
+            print("⏩ Already processed today, skipping")
             continue
 
         try:
-            ee_geom = ee.Geometry(geometry)
+            ee_geom = ee.Geometry(geojson)
 
-            area_ha = (
-                ee_geom
-                .area(maxError=1)
-                .divide(10_000)
+            # 📐 Area
+            area_ha = ee_geom.area(maxError=1).getInfo() / 10_000
+            print(f"📐 Area: {area_ha:.2f} ha")
+
+            # 🛰 Sentinel-2
+            collection = (
+                ee.ImageCollection("COPERNICUS/S2_SR")
+                .filterBounds(ee_geom)
+                .filterDate("2024-01-01", TODAY)
+                .sort("CLOUDY_PIXEL_PERCENTAGE")
+            )
+
+            img = collection.first()
+            if img is None:
+                print("⚠️ No satellite image found")
+                continue
+
+            # 🌿 NDVI
+            ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+            mean_ndvi = (
+                ndvi
+                .reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=ee_geom,
+                    scale=10,
+                    maxPixels=1e9
+                )
+                .get("NDVI")
                 .getInfo()
             )
 
-            print(f"📐 Area: {area_ha:.2f} ha")
-
-            img = (
-                ee.ImageCollection("COPERNICUS/S2_SR")
-                .filterBounds(ee_geom)
-                .filterDate("2024-01-01", "2024-12-31")
-                .sort("CLOUDY_PIXEL_PERCENTAGE")
-                .first()
-            )
-
-            if img is None:
-                print("⚠️ No imagery, skipping")
-                continue
-
-            ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-
-            mean_ndvi = ndvi.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=ee_geom,
-                scale=10,
-                maxPixels=1e9
-            ).get("NDVI").getInfo()
-
             print(f"🌿 NDVI: {mean_ndvi}")
 
-            supabase.table("plot_metrics").insert({
+            # 📡 Save satellite image log
+            supabase.table("satellite_images").insert({
                 "plot_id": plot_id,
-                "plot_name": plot_name,
-                "area_ha": area_ha,
-                "ndvi": mean_ndvi
+                "satellite": "sentinel-2",
+                "satellite_date": TODAY
             }).execute()
 
-            print("✅ Stored")
+            # 📊 Save analysis
+            supabase.table("analysis_results").insert({
+                "plot_id": plot_id,
+                "analysis_type": "growth",
+                "sensor_used": "Sentinel-2",
+                "analysis_date": TODAY,
+                "response_json": {
+                    "ndvi": mean_ndvi,
+                    "area_hectares": area_ha
+                }
+            }).execute()
 
-        except ee.EEException as e:
-            print(f"❌ GEE error (skipped): {e}")
+            print("✅ Stored successfully")
 
         except Exception as e:
-            print(f"❌ Unexpected error (skipped): {e}")
+            print(f"❌ Skipped due to error: {e}")
 
 # =========================
 # ENTRYPOINT
