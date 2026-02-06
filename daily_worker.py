@@ -1,145 +1,116 @@
 import os
 import json
-import ee
 import requests
-from datetime import date
+import ee
 from supabase import create_client
-from gee_growth import run_growth_analysis_by_plot
 
-# ================== CONFIG ==================
-GEOMETRY_COLUMN = os.getenv("PLOT_GEOMETRY_COLUMN", "geom")  
-# 👆 change to geom / polygon / geojson if needed
-
-# ================== ENV VALIDATION ==================
-REQUIRED_ENV_VARS = [
+# =========================
+# ENV VALIDATION
+# =========================
+REQUIRED_ENV = [
     "SUPABASE_URL",
-    "SUPABASE_SERVICE_ROLE_KEY",
+    "SUPABASE_KEY",
+    "EE_CREDENTIALS",
     "FASTAPI_PLOTS_URL",
-    "WORKER_TOKEN",
-    "EE_SERVICE_ACCOUNT_JSON",
+    "WORKER_TOKEN"
 ]
 
-missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
-if missing:
-    raise RuntimeError(f"❌ Missing environment variables: {missing}")
+if not all(os.getenv(k) for k in REQUIRED_ENV):
+    raise RuntimeError("❌ Missing one or more required environment variables")
 
-# ================== ENV ==================
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-FASTAPI_URL = os.getenv("FASTAPI_PLOTS_URL")
-WORKER_TOKEN = os.getenv("WORKER_TOKEN")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-# ================== GEE INIT ==================
-print("🚀 Initializing Google Earth Engine...")
-
-service_account_info = json.loads(os.environ["EE_SERVICE_ACCOUNT_JSON"])
-
-credentials = ee.ServiceAccountCredentials(
-    service_account_info["client_email"],
-    key_data=json.dumps(service_account_info),
+# =========================
+# INIT SUPABASE
+# =========================
+supabase = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_KEY"]
 )
 
-ee.Initialize(credentials, project=service_account_info["project_id"])
+# =========================
+# INIT GEE
+# =========================
+print("🚀 Initializing Google Earth Engine...")
+creds = json.loads(os.environ["EE_CREDENTIALS"])
+ee.Initialize(ee.ServiceAccountCredentials(
+    creds["client_email"],
+    key_data=json.dumps(creds)
+))
 print("✅ GEE initialized successfully")
 
-# ================== MAIN ==================
+# =========================
+# MAIN WORKER
+# =========================
 def run():
     print("🛰 Fetching plots from API...")
 
     res = requests.get(
-        FASTAPI_URL,
-        headers={"x-worker-token": WORKER_TOKEN},
-        timeout=30,
+        os.environ["FASTAPI_PLOTS_URL"],
+        headers={"x-worker-token": os.environ["WORKER_TOKEN"]},
+        timeout=60
     )
 
-    if res.status_code != 200:
-        raise RuntimeError(res.text)
-
+    res.raise_for_status()
     plots = res.json()
-    if not isinstance(plots, list):
-        raise RuntimeError("❌ API response must be List[str]")
 
     print(f"📍 Found {len(plots)} plots")
 
-    for plot_name in plots:
+    for plot in plots:
+        plot_name = plot.get("plot_name")
+        geometry = plot.get("geometry")
+
         print(f"\n🌱 Processing plot: {plot_name}")
 
-        # ---------- Fetch plot ----------
-        db_plot = (
-            supabase
-            .table("plots")
-            .select(f"id,{GEOMETRY_COLUMN}")
-            .eq("plot_name", plot_name)
-            .execute()
-        )
-
-        if not db_plot.data:
-            print("❌ Plot not found:", plot_name)
-            continue
-
-        plot = db_plot.data[0]
-        plot_id = plot["id"]
-        geometry = plot.get(GEOMETRY_COLUMN)
-
         if not geometry:
-            print(f"❌ Geometry missing ({GEOMETRY_COLUMN}) for:", plot_name)
+            print("⚠️ No geometry found, skipping")
             continue
 
-        # ---------- Run GEE ----------
         try:
-            result = run_growth_analysis_by_plot(
-                plot_data={
-                    "plot_name": plot_name,
-                    "geometry": geometry,
-                },
-                start_date="2025-01-01",
-                end_date=str(date.today()),
+            # 🔑 THIS IS THE FIX
+            ee_geom = ee.Geometry(geometry)
+
+            area_m2 = ee_geom.area(maxError=1).getInfo()
+            area_ha = area_m2 / 10_000
+
+            print(f"📐 Area: {area_ha:.2f} ha")
+
+            # Example NDVI (safe)
+            img = (
+                ee.ImageCollection("COPERNICUS/S2_SR")
+                .filterBounds(ee_geom)
+                .filterDate("2024-01-01", "2024-12-31")
+                .sort("CLOUDY_PIXEL_PERCENTAGE")
+                .first()
             )
+
+            if not img:
+                print("⚠️ No imagery found")
+                continue
+
+            ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+
+            mean_ndvi = ndvi.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=ee_geom,
+                scale=10,
+                maxPixels=1e9
+            ).get("NDVI").getInfo()
+
+            print(f"🌿 NDVI: {mean_ndvi}")
+
+            # Save to Supabase
+            supabase.table("plot_metrics").insert({
+                "plot_name": plot_name,
+                "area_ha": area_ha,
+                "ndvi": mean_ndvi
+            }).execute()
+
+        except ee.EEException as e:
+            print(f"❌ GEE error: {e}")
         except Exception as e:
-            print("❌ GEE failed:", e)
-            continue
+            print(f"❌ Unexpected error: {e}")
 
-        analysis_date = result["analysis_date"]
-
-        # ---------- Cache check ----------
-        cached = (
-            supabase
-            .table("analysis_results")
-            .select("id")
-            .eq("plot_id", plot_id)
-            .eq("analysis_type", "growth")
-            .eq("analysis_date", analysis_date)
-            .execute()
-        )
-
-        if cached.data:
-            print("⏭ Already exists:", analysis_date)
-            continue
-
-        # ---------- Satellite image ----------
-        sat = supabase.table("satellite_images").insert({
-            "plot_id": plot_id,
-            "satellite": result["sensor"],
-            "satellite_date": analysis_date,
-        }).execute()
-
-        sat_id = sat.data[0]["id"]
-
-        # ---------- Store result ----------
-        supabase.table("analysis_results").insert({
-            "plot_id": plot_id,
-            "satellite_image_id": sat_id,
-            "analysis_type": "growth",
-            "analysis_date": analysis_date,
-            "sensor_used": result["sensor"],
-            "tile_url": result["tile_url"],
-            "response_json": result["response_json"],
-        }).execute()
-
-        print("✅ Stored growth:", plot_name, analysis_date)
-
-# ================== RUN ==================
+# =========================
+# ENTRYPOINT
+# =========================
 if __name__ == "__main__":
     run()
