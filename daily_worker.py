@@ -6,6 +6,10 @@ from datetime import date
 from supabase import create_client
 from gee_growth import run_growth_analysis_by_plot
 
+# ================== CONFIG ==================
+GEOMETRY_COLUMN = os.getenv("PLOT_GEOMETRY_COLUMN", "geom")  
+# 👆 change to geom / polygon / geojson if needed
+
 # ================== ENV VALIDATION ==================
 REQUIRED_ENV_VARS = [
     "SUPABASE_URL",
@@ -19,12 +23,12 @@ missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
     raise RuntimeError(f"❌ Missing environment variables: {missing}")
 
+# ================== ENV ==================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 FASTAPI_URL = os.getenv("FASTAPI_PLOTS_URL")
 WORKER_TOKEN = os.getenv("WORKER_TOKEN")
 
-# ================== SUPABASE ==================
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ================== GEE INIT ==================
@@ -38,10 +42,9 @@ credentials = ee.ServiceAccountCredentials(
 )
 
 ee.Initialize(credentials, project=service_account_info["project_id"])
-
 print("✅ GEE initialized successfully")
 
-# ================== MAIN WORKER ==================
+# ================== MAIN ==================
 def run():
     print("🛰 Fetching plots from API...")
 
@@ -52,41 +55,36 @@ def run():
     )
 
     if res.status_code != 200:
-        raise RuntimeError(f"❌ API failed: {res.status_code} {res.text}")
+        raise RuntimeError(res.text)
 
     plots = res.json()
-
     if not isinstance(plots, list):
-        raise RuntimeError("❌ API response is not a list")
+        raise RuntimeError("❌ API response must be List[str]")
 
     print(f"📍 Found {len(plots)} plots")
 
     for plot_name in plots:
-        if not isinstance(plot_name, str):
-            print("⚠️ Skipping invalid plot:", plot_name)
-            continue
-
         print(f"\n🌱 Processing plot: {plot_name}")
 
-        # ---------- Fetch plot from Supabase ----------
+        # ---------- Fetch plot ----------
         db_plot = (
             supabase
             .table("plots")
-            .select("id, geometry")
+            .select(f"id,{GEOMETRY_COLUMN}")
             .eq("plot_name", plot_name)
             .execute()
         )
 
         if not db_plot.data:
-            print("❌ Plot not found in Supabase:", plot_name)
+            print("❌ Plot not found:", plot_name)
             continue
 
-        plot_record = db_plot.data[0]
-        plot_id = plot_record["id"]
-        geometry = plot_record.get("geometry")
+        plot = db_plot.data[0]
+        plot_id = plot["id"]
+        geometry = plot.get(GEOMETRY_COLUMN)
 
         if not geometry:
-            print("❌ Geometry missing for plot:", plot_name)
+            print(f"❌ Geometry missing ({GEOMETRY_COLUMN}) for:", plot_name)
             continue
 
         # ---------- Run GEE ----------
@@ -100,12 +98,12 @@ def run():
                 end_date=str(date.today()),
             )
         except Exception as e:
-            print("❌ GEE failed for", plot_name, ":", e)
+            print("❌ GEE failed:", e)
             continue
 
         analysis_date = result["analysis_date"]
 
-        # ---------- Skip if cached ----------
+        # ---------- Cache check ----------
         cached = (
             supabase
             .table("analysis_results")
@@ -117,24 +115,19 @@ def run():
         )
 
         if cached.data:
-            print("⏭ Already cached:", plot_name, analysis_date)
+            print("⏭ Already exists:", analysis_date)
             continue
 
         # ---------- Satellite image ----------
-        sat = (
-            supabase
-            .table("satellite_images")
-            .insert({
-                "plot_id": plot_id,
-                "satellite": result["sensor"],
-                "satellite_date": analysis_date,
-            })
-            .execute()
-        )
+        sat = supabase.table("satellite_images").insert({
+            "plot_id": plot_id,
+            "satellite": result["sensor"],
+            "satellite_date": analysis_date,
+        }).execute()
 
         sat_id = sat.data[0]["id"]
 
-        # ---------- Store analysis ----------
+        # ---------- Store result ----------
         supabase.table("analysis_results").insert({
             "plot_id": plot_id,
             "satellite_image_id": sat_id,
@@ -145,7 +138,7 @@ def run():
             "response_json": result["response_json"],
         }).execute()
 
-        print("✅ Stored growth for", plot_name, analysis_date)
+        print("✅ Stored growth:", plot_name, analysis_date)
 
 # ================== RUN ==================
 if __name__ == "__main__":
