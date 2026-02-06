@@ -28,14 +28,14 @@ if missing:
 # =========================
 supabase = create_client(
     os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_KEY"]
+    os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 )
 
 # =========================
 # INIT GEE
 # =========================
 print("🚀 Initializing Google Earth Engine...")
-creds = json.loads(os.environ["EE_CREDENTIALS"])
+creds = json.loads(os.environ["EE_SERVICE_ACCOUNT_JSON"])
 ee.Initialize(ee.ServiceAccountCredentials(
     creds["client_email"],
     key_data=json.dumps(creds)
