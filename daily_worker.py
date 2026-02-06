@@ -45,7 +45,7 @@ ee.Initialize(
 print("✅ GEE initialized successfully")
 
 # =========================
-# SAFE PLOT FETCH (RETRY + FAST)
+# FETCH + NORMALIZE PLOTS
 # =========================
 def fetch_plots():
     url = os.environ["FASTAPI_PLOTS_URL"]
@@ -59,18 +59,27 @@ def fetch_plots():
                 timeout=20
             )
             res.raise_for_status()
-
             data = res.json()
 
-            # Handle both API shapes
+            # Case 1: { "plots": [...] }
             if isinstance(data, dict) and "plots" in data:
-                return data["plots"]
+                data = data["plots"]
 
-            if isinstance(data, list):
-                return data
+            normalized = []
 
-            print("⚠️ Unexpected API response format")
-            return []
+            for item in data:
+                # Case 2: "999_11"
+                if isinstance(item, str):
+                    normalized.append({
+                        "plot_name": item,
+                        "geometry": None
+                    })
+
+                # Case 3: full object
+                elif isinstance(item, dict):
+                    normalized.append(item)
+
+            return normalized
 
         except requests.exceptions.ReadTimeout:
             print(f"⏳ Timeout fetching plots (attempt {attempt+1}/3)")
@@ -97,12 +106,11 @@ def run():
 
         print(f"\n🌱 Processing plot: {plot_name}")
 
-        if not plot_name or not geometry:
-            print("⚠️ Invalid plot payload, skipping")
+        if not geometry:
+            print("⚠️ No geometry provided by API, skipping GEE")
             continue
 
         try:
-            # ✅ ALWAYS convert dict → ee.Geometry
             ee_geom = ee.Geometry(geometry)
 
             area_m2 = ee_geom.area(maxError=1).getInfo()
