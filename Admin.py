@@ -827,13 +827,15 @@ def store_analysis_result(
     
 @app.post("/internal/run-daily-cron")
 async def run_daily_cron(
-    dry_run: bool = Query(False, description="If true, do not run EE. Only log actions."),
-    force: bool = Query(False, description="If true, ignore cache and force reprocessing.")
+    dry_run: bool = Query(False, description="If true, do not write to DB"),
+    force: bool = Query(False, description="Force re-run even if analysis exists"),
 ):
     today = date.today().isoformat()
+    start_date = (date.today() - timedelta(days=15)).isoformat()
+    end_date = today
 
     counters = {
-        "total_plots": len(plot_dict),
+        "total_plots": 0,
         "processed": 0,
         "skipped": 0,
         "errors": 0
@@ -845,94 +847,111 @@ async def run_daily_cron(
         "errors": []
     }
 
-    for plot_name, plot_data in plot_dict.items():
-        try:
-            # -----------------------------
-            # 1. Validate plot
-            # -----------------------------
-            geometry = plot_data.get("geometry")
-            plot_id = plot_data.get("id")
+    plot_service = PlotSyncService()
+    plots = plot_service.get_plots_dict(force_refresh=True)
 
-            if not geometry or not plot_id:
-                counters["skipped"] += 1
-                logs["skipped"].append({
-                    "plot": plot_name,
-                    "reason": "missing geometry or plot_id"
-                })
-                continue
+    counters["total_plots"] = len(plots)
 
-            # -----------------------------
-            # 2. Cache check
-            # -----------------------------
-            cached = supabase.table("analysis_results") \
+    for plot_name, plot_data in plots.items():
+
+        # ------------------------------
+        # 1. Validate geometry
+        # ------------------------------
+        geometry = plot_data.get("geometry")
+        if not geometry:
+            counters["skipped"] += 1
+            logs["skipped"].append({
+                "plot": plot_name,
+                "reason": "missing geometry"
+            })
+            continue
+
+        # ------------------------------
+        # 2. Resolve django_id
+        # ------------------------------
+        django_id = plot_data.get("properties", {}).get("django_id")
+        if not django_id:
+            counters["skipped"] += 1
+            logs["skipped"].append({
+                "plot": plot_name,
+                "reason": "missing django_id"
+            })
+            continue
+
+        # ------------------------------
+        # 3. Resolve Supabase plot_id
+        # ------------------------------
+        plot_row = supabase.table("plots") \
+            .select("id") \
+            .eq("django_plot_id", django_id) \
+            .execute()
+
+        if not plot_row.data:
+            counters["skipped"] += 1
+            logs["skipped"].append({
+                "plot": plot_name,
+                "reason": "no matching supabase plot"
+            })
+            continue
+
+        plot_id = plot_row.data[0]["id"]
+
+        # ------------------------------
+        # 4. Skip if already analyzed (unless force)
+        # ------------------------------
+        if not force:
+            existing = supabase.table("analysis_results") \
                 .select("id") \
                 .eq("plot_id", plot_id) \
                 .eq("analysis_type", "growth") \
                 .eq("analysis_date", today) \
                 .execute()
 
-            if cached.data and not force:
+            if existing.data:
                 counters["skipped"] += 1
                 logs["skipped"].append({
                     "plot": plot_name,
-                    "reason": "cached result exists"
+                    "reason": "already analyzed today"
                 })
                 continue
 
-            # -----------------------------
-            # 3. Dry-run handling
-            # -----------------------------
-            if dry_run:
-                counters["skipped"] += 1
-                logs["skipped"].append({
-                    "plot": plot_name,
-                    "reason": "dry_run (no processing executed)"
-                })
-                continue
-
-            # -----------------------------
-            # 4. Run GEE Growth Analysis
-            # -----------------------------
-            (
-                response_json,
-                tile_url,
-                sensor,
-                image_date
-            ) = run_growth(geometry, plot_name)
-
-            if not response_json:
-                counters["skipped"] += 1
-                logs["skipped"].append({
-                    "plot": plot_name,
-                    "reason": "no satellite data returned"
-                })
-                continue
-
-            # -----------------------------
-            # 5. Store result in Supabase
-            # -----------------------------
-            supabase.table("analysis_results").insert({
-                "plot_id": plot_id,
-                "analysis_type": "growth",
-                "analysis_date": image_date,
-                "sensor_used": sensor,
-                "tile_url": tile_url,
-                "response_json": response_json
-            }).execute()
-
-            counters["processed"] += 1
-            logs["processed"].append(plot_name)
-
+        # ------------------------------
+        # 5. Run GEE Growth Analysis
+        # ------------------------------
+        try:
+            result = run_growth_analysis_by_plot(
+                plot_data=plot_data,
+                start_date=start_date,
+                end_date=end_date
+            )
         except Exception as e:
             counters["errors"] += 1
             logs["errors"].append({
                 "plot": plot_name,
                 "error": str(e)
             })
+            continue
 
-    # -----------------------------
-    # Final response (mentor-friendly)
-    # -----------------------------
+        # ------------------------------
+        # 6. Store result (unless dry_run)
+        # ------------------------------
+        if not dry_run:
+            supabase.table("analysis_results").insert({
+                "plot_id": plot_id,
+                "analysis_type": "growth",
+                "analysis_date": result["analysis_date"],
+                "sensor_used": result["sensor"],
+                "tile_url": result["tile_url"],
+                "response_json": result["response_json"]
+            }).execute()
+
+        counters["processed"] += 1
+        logs["processed"].append({
+            "plot": plot_name,
+            "sensor": result["sensor"],
+            "date": result["analysis_date"]
+        })
+
     return {
         "status": "done",
         "date": today,
