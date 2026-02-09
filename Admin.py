@@ -21,7 +21,14 @@ from shapely.geometry import shape, Point, Polygon
 from geopy.distance import geodesic
 from shared_services import PlotSyncService
 from db import supabase
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import httpx
+import traceback
 from gee_growth import run_growth_analysis_by_plot
+
+scheduler = AsyncIOScheduler()
+
 
 # Initialize Earth Engine - move this to the top
 
@@ -808,6 +815,34 @@ def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
         return res.data[0]
 
     return None
+    
+async def trigger_daily_growth_cron():
+    """
+    SAFE cron trigger.
+    Calls the internal endpoint instead of doing work here.
+    """
+    url = f"{settings.INTERNAL_BASE_URL}/internal/run-daily-cron"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url)
+
+        print("[CRON] Growth cron triggered:", resp.status_code)
+
+    except Exception as e:
+        print("[CRON] Failed to trigger growth cron:", str(e))
+
+@app.on_event("startup")
+async def start_crons():
+    scheduler.add_job(
+        trigger_daily_growth_cron,
+        CronTrigger(hour=0, minute=0),  # daily midnight
+        id="daily_growth_trigger",
+        replace_existing=True
+    )
+
+    scheduler.start()
+
 
 def store_analysis_result(
     plot_id,
