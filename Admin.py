@@ -827,8 +827,8 @@ def store_analysis_result(
     
 @app.post("/internal/run-daily-cron")
 async def run_daily_cron(
-    dry_run: bool = Query(False, description="If true, do not write to DB"),
-    force: bool = Query(False, description="Force re-run even if analysis exists"),
+    dry_run: bool = Query(False),
+    force: bool = Query(False),
 ):
     today = date.today().isoformat()
     start_date = (date.today() - timedelta(days=15)).isoformat()
@@ -848,15 +848,33 @@ async def run_daily_cron(
     }
 
     plot_service = PlotSyncService()
+
+    # ======================================================
+    # PHASE 0 — SYNC DJANGO PLOTS → SUPABASE (CRITICAL)
+    # ======================================================
     plots = plot_service.get_plots_dict(force_refresh=True)
 
+    for plot_name, plot_data in plots.items():
+        django_id = plot_data.get("properties", {}).get("django_id")
+        if not django_id:
+            continue
+
+        # idempotent upsert
+        supabase.table("plots").upsert(
+            {
+                "django_plot_id": django_id,
+                "plot_name": plot_name
+            },
+            on_conflict="django_plot_id"
+        ).execute()
+
+    # ======================================================
+    # PHASE 1 — RUN DAILY ANALYSIS
+    # ======================================================
     counters["total_plots"] = len(plots)
 
     for plot_name, plot_data in plots.items():
 
-        # ------------------------------
-        # 1. Validate geometry
-        # ------------------------------
         geometry = plot_data.get("geometry")
         if not geometry:
             counters["skipped"] += 1
@@ -866,9 +884,6 @@ async def run_daily_cron(
             })
             continue
 
-        # ------------------------------
-        # 2. Resolve django_id
-        # ------------------------------
         django_id = plot_data.get("properties", {}).get("django_id")
         if not django_id:
             counters["skipped"] += 1
@@ -878,9 +893,6 @@ async def run_daily_cron(
             })
             continue
 
-        # ------------------------------
-        # 3. Resolve Supabase plot_id
-        # ------------------------------
         plot_row = supabase.table("plots") \
             .select("id") \
             .eq("django_plot_id", django_id) \
@@ -890,15 +902,13 @@ async def run_daily_cron(
             counters["skipped"] += 1
             logs["skipped"].append({
                 "plot": plot_name,
-                "reason": "no matching supabase plot"
+                "reason": "supabase plot not found after sync"
             })
             continue
 
         plot_id = plot_row.data[0]["id"]
 
-        # ------------------------------
-        # 4. Skip if already analyzed (unless force)
-        # ------------------------------
+        # Skip if already analyzed today
         if not force:
             existing = supabase.table("analysis_results") \
                 .select("id") \
@@ -915,9 +925,6 @@ async def run_daily_cron(
                 })
                 continue
 
-        # ------------------------------
-        # 5. Run GEE Growth Analysis
-        # ------------------------------
         try:
             result = run_growth_analysis_by_plot(
                 plot_data=plot_data,
@@ -932,9 +939,6 @@ async def run_daily_cron(
             })
             continue
 
-        # ------------------------------
-        # 6. Store result (unless dry_run)
-        # ------------------------------
         if not dry_run:
             supabase.table("analysis_results").insert({
                 "plot_id": plot_id,
@@ -948,8 +952,8 @@ async def run_daily_cron(
         counters["processed"] += 1
         logs["processed"].append({
             "plot": plot_name,
-            "sensor": result["sensor"],
-            "date": result["analysis_date"]
+            "date": result["analysis_date"],
+            "sensor": result["sensor"]
         })
 
     return {
