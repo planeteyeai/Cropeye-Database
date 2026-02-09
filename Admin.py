@@ -893,7 +893,7 @@ async def run_daily_cron(
     # ===============================
     # CONFIG (OPTION A – FASTEST)
     # ===============================
-    MAX_PLOTS_PER_RUN = 3
+    MAX_PLOTS_PER_RUN = 10
 
     today = date.today().isoformat()
     analysis_date = today
@@ -992,7 +992,7 @@ async def run_daily_cron(
                 # ----------------------------
                 # 5. UPSERT analysis result
                 # ----------------------------
-                supabase.table("analysis").upsert(
+                supabase.table("analysis_results").upsert(
                     {
                         "plot_id": plot_id,
                         "analysis_type": "growth",
