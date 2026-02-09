@@ -21,6 +21,7 @@ from shapely.geometry import shape, Point, Polygon
 from geopy.distance import geodesic
 from shared_services import PlotSyncService
 from db import supabase
+from gee_growth import run_growth_analysis_by_plot
 
 # Initialize Earth Engine - move this to the top
 
