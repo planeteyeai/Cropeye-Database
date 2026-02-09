@@ -824,49 +824,126 @@ def store_analysis_result(
         "tile_url": tile_url,
         "response_json": response_json
     }).execute()
+    
 @app.post("/internal/run-daily-cron")
-def run_daily_cron(x_worker_token: str = Header(None)):
-    verify_worker(x_worker_token)
+async def run_daily_cron(
+    dry_run: bool = Query(False, description="If true, do not run EE. Only log actions."),
+    force: bool = Query(False, description="If true, ignore cache and force reprocessing.")
+):
+    today = date.today().isoformat()
 
-    results = {
-        "growth": 0,
-        "water": 0,
-        "soil": 0,
-        "pest": 0,
+    counters = {
+        "total_plots": len(plot_dict),
+        "processed": 0,
+        "skipped": 0,
         "errors": 0
     }
 
-    today = date.today().strftime("%Y-%m-%d")
+    logs = {
+        "processed": [],
+        "skipped": [],
+        "errors": []
+    }
 
     for plot_name, plot_data in plot_dict.items():
         try:
-            # ---- GROWTH ----
-            growth_json, tile_url, sensor, image_date = run_growth_analysis_by_plot_name(plot_name)
+            # -----------------------------
+            # 1. Validate plot
+            # -----------------------------
+            geometry = plot_data.get("geometry")
+            plot_id = plot_data.get("id")
 
-            store_analysis_result(
-                plot_id=get_plot_id(plot_name),
-                analysis_type="growth",
-                analysis_date=image_date,
-                sensor=sensor,
-                tile_url=tile_url,
-                response_json=growth_json
-            )
-            results["growth"] += 1
+            if not geometry or not plot_id:
+                counters["skipped"] += 1
+                logs["skipped"].append({
+                    "plot": plot_name,
+                    "reason": "missing geometry or plot_id"
+                })
+                continue
 
-            # ---- REPEAT for other APIs later ----
-            # water
-            # soil
-            # pest
+            # -----------------------------
+            # 2. Cache check
+            # -----------------------------
+            cached = supabase.table("analysis_results") \
+                .select("id") \
+                .eq("plot_id", plot_id) \
+                .eq("analysis_type", "growth") \
+                .eq("analysis_date", today) \
+                .execute()
+
+            if cached.data and not force:
+                counters["skipped"] += 1
+                logs["skipped"].append({
+                    "plot": plot_name,
+                    "reason": "cached result exists"
+                })
+                continue
+
+            # -----------------------------
+            # 3. Dry-run handling
+            # -----------------------------
+            if dry_run:
+                counters["skipped"] += 1
+                logs["skipped"].append({
+                    "plot": plot_name,
+                    "reason": "dry_run (no processing executed)"
+                })
+                continue
+
+            # -----------------------------
+            # 4. Run GEE Growth Analysis
+            # -----------------------------
+            (
+                response_json,
+                tile_url,
+                sensor,
+                image_date
+            ) = run_growth(geometry, plot_name)
+
+            if not response_json:
+                counters["skipped"] += 1
+                logs["skipped"].append({
+                    "plot": plot_name,
+                    "reason": "no satellite data returned"
+                })
+                continue
+
+            # -----------------------------
+            # 5. Store result in Supabase
+            # -----------------------------
+            supabase.table("analysis_results").insert({
+                "plot_id": plot_id,
+                "analysis_type": "growth",
+                "analysis_date": image_date,
+                "sensor_used": sensor,
+                "tile_url": tile_url,
+                "response_json": response_json
+            }).execute()
+
+            counters["processed"] += 1
+            logs["processed"].append(plot_name)
 
         except Exception as e:
-            print(f"❌ {plot_name}: {e}")
-            results["errors"] += 1
+            counters["errors"] += 1
+            logs["errors"].append({
+                "plot": plot_name,
+                "error": str(e)
+            })
 
+    # -----------------------------
+    # Final response (mentor-friendly)
+    # -----------------------------
     return {
         "status": "done",
         "date": today,
-        "summary": results
+        "mode": {
+            "dry_run": dry_run,
+            "force": force
+        },
+        "counters": counters,
+        "details": logs
     }
+    
 def get_plot_id(plot_name: str) -> str:
     res = supabase.table("plots") \
         .select("id") \
