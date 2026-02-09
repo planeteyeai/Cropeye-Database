@@ -66,7 +66,7 @@ class PlotSyncService:
     Service to fetch plot data from Django /plots/ API
     """
     
-    def __init__(self, django_api_url: str = "https://cropeye-server-1.onrender.com"):
+    def __init__(self, django_api_url: str = "https://cropeye-server-flyio.onrender.com/admin/"):
         self.django_api_url = django_api_url
         self.plots_cache = {}
         self.last_sync = None
