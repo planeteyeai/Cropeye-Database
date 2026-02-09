@@ -825,7 +825,7 @@ def store_analysis_result(
         "response_json": response_json
     }).execute()
     
-@router.post("/internal/run-daily-cron")
+@app.post("/internal/run-daily-cron")
 async def run_daily_cron(
     dry_run: bool = Query(False),
     force: bool = Query(False),
