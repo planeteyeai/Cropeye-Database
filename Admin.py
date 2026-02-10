@@ -817,18 +817,12 @@ def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
     return None
     
 def trigger_daily_growth_cron():
-    """
-    Triggers ONE batch of growth analysis.
-    Safe to call multiple times.
-    """
     try:
         url = "https://cropeye-api.onrender.com/internal/run-daily-cron"
-        params = {"dry_run": False, "force": False}
-        r = requests.post(url, params=params, timeout=90)
-        print("[CRON] Growth batch:", r.status_code, r.text)
+        r = requests.post(url, params={"dry_run": False, "force": False}, timeout=90)
+        print("[CRON] Growth batch:", r.status_code)
     except Exception as e:
         print("[CRON][ERROR]", str(e))
-
 
 @app.on_event("startup")
 async def start_crons():
@@ -841,6 +835,7 @@ async def start_crons():
         coalesce=True,
     )
     scheduler.start()
+
 @app.post("/internal/run-daily-cron")
 async def run_daily_cron(
     dry_run: bool = Query(False),
@@ -915,14 +910,15 @@ async def run_daily_cron(
                 {
                     "plot_id": plot_id,
                     "satellite_image_id": satellite_image["id"],
-                    "analysis_type": "growth",        # 🔥 REQUIRED
-                    "analysis_date": today,
-                    "sensor_used": satellite_image["satellite"],
+                    "analysis_type": "growth",
+                    "analysis_date": result["analysis_date"],  # 🔥 FIXED
+                    "sensor_used": result["sensor"],           # 🔥 FIXED
                     "tile_url": result["tile_url"],
                     "response_json": result["response_json"],
                 },
                 on_conflict="plot_id,satellite_image_id,analysis_date"
             ).execute()
+
 
 
             counters["processed"] += 1
