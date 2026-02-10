@@ -915,6 +915,7 @@ async def run_daily_cron(
                 {
                     "plot_id": plot_id,
                     "satellite_image_id": satellite_image["id"],
+                    "analysis_type": "growth",        # 🔥 REQUIRED
                     "analysis_date": today,
                     "sensor_used": satellite_image["satellite"],
                     "tile_url": result["tile_url"],
@@ -922,6 +923,7 @@ async def run_daily_cron(
                 },
                 on_conflict="plot_id,satellite_image_id,analysis_date"
             ).execute()
+
 
             counters["processed"] += 1
             logs["processed"].append({
