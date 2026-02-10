@@ -1,8 +1,8 @@
-name: Daily GEE Analysis Cron
+name: Daily Growth Cron
 
 on:
   schedule:
-    - cron: "30 2 * * *"   # Every day 02:30 UTC
+    - cron: "*/10 * * * *"   # every 10 minutes
   workflow_dispatch:
 
 jobs:
@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Call FastAPI cron endpoint
+      - name: Trigger growth cron
         run: |
-          curl -X POST "${{ secrets.FASTAPI_PLOTS_URL }}/internal/run-daily-cron" \
-          -H "X-Worker-Token: ${{ secrets.WORKER_TOKEN }}"
+          curl -X POST "https://cropeye-api.onrender.com/internal/run-daily-cron"
