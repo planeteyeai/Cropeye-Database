@@ -818,28 +818,29 @@ def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
     
 def trigger_daily_growth_cron():
     try:
-        url = "https://cropeye-api.onrender.com/internal/run-daily-cron"
-        r = requests.post(
-            url,
-            params={"dry_run": False, "force": False},
-            timeout=90
+        print("🔥 DAILY GROWTH CRON TRIGGERED")
+        requests.post(
+            f"http://localhost:{os.environ['PORT']}/internal/run-daily-cron",
+            timeout=60
         )
-        print("[CRON] Growth batch:", r.status_code)
     except Exception as e:
-        print("[CRON][ERROR]", str(e))
+        print("[CRON ERROR]", str(e))
+
 
 
 @app.on_event("startup")
 async def start_crons():
     scheduler.add_job(
         trigger_daily_growth_cron,
-        CronTrigger(minute="*/5"),  # 🔥 every 5 minutes
+        CronTrigger(hour=0, minute=0),  # ✅ once per day (UTC)
         id="daily_growth_cron",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
     )
     scheduler.start()
+    print("✅ APScheduler started (daily full run)")
+
 
 
 @app.post("/internal/run-daily-cron")
@@ -847,86 +848,93 @@ async def run_daily_cron(
     dry_run: bool = Query(False),
     force: bool = Query(False),
 ):
-    MAX_PLOTS_PER_RUN = 10
-
     today = date.today().isoformat()
     start_date = (date.today() - timedelta(days=30)).isoformat()
     end_date = today
 
-    counters = {"total_plots": 0, "processed": 0, "skipped": 0, "errors": 0}
-    logs = {"processed": [], "skipped": [], "errors": []}
+    counters = {
+        "total_plots": 0,
+        "processed": 0,
+        "skipped": 0,
+        "errors": 0
+    }
 
-    # ---------------- LOAD OR INIT STATE ----------------
-    state = supabase.table("cron_state") \
-        .select("last_index") \
-        .eq("job_name", "daily_growth") \
-        .execute()
+    logs = {
+        "processed": [],
+        "skipped": [],
+        "errors": []
+    }
 
-    if state.data:
-        start_index = state.data[0]["last_index"]
-    else:
-        supabase.table("cron_state").insert({
-            "job_name": "daily_growth",
-            "last_index": 0
-        }).execute()
-        start_index = 0
-
-    end_index = start_index + MAX_PLOTS_PER_RUN
+    print("🚀 DAILY FULL GROWTH RUN STARTED")
 
     # ---------------- LOAD PLOTS ----------------
     plot_service = PlotSyncService()
-    plots = list(plot_service.get_plots_dict(force_refresh=True).items())
+    plots = plot_service.get_plots_dict(force_refresh=True)
     counters["total_plots"] = len(plots)
 
-    # ---------------- PROCESS BATCH ----------------
-    for i in range(start_index, min(end_index, len(plots))):
-        plot_name, plot_data = plots[i]
-
+    for plot_name, plot_data in plots.items():
         try:
             props = plot_data.get("properties") or {}
             django_id = props.get("django_id")
 
             if not django_id:
                 counters["skipped"] += 1
-                logs["skipped"].append({"plot": plot_name, "reason": "missing django_id"})
+                logs["skipped"].append({
+                    "plot": plot_name,
+                    "reason": "missing django_id"
+                })
                 continue
 
-            plot_row = supabase.table("plots") \
-                .select("id") \
-                .eq("django_plot_id", django_id) \
-                .single() \
+            plot_row = (
+                supabase.table("plots")
+                .select("id")
+                .eq("django_plot_id", django_id)
+                .single()
                 .execute()
+            )
 
             plot_id = plot_row.data["id"]
 
-            sat_row = supabase.table("satellite_images") \
-                .select("id,satellite,satellite_date") \
-                .eq("plot_id", plot_id) \
-                .order("satellite_date", desc=True) \
-                .limit(1) \
+            # ---------------- LATEST SAT IMAGE ----------------
+            sat_row = (
+                supabase.table("satellite_images")
+                .select("id,satellite,satellite_date")
+                .eq("plot_id", plot_id)
+                .order("satellite_date", desc=True)
+                .limit(1)
                 .execute()
+            )
 
             if not sat_row.data:
                 counters["skipped"] += 1
-                logs["skipped"].append({"plot": plot_name, "reason": "no satellite image"})
+                logs["skipped"].append({
+                    "plot": plot_name,
+                    "reason": "no satellite image"
+                })
                 continue
 
             satellite_image = sat_row.data[0]
 
-            # ---------- DUPLICATE SAFETY ----------
-            exists = supabase.table("analysis_results") \
-                .select("id") \
-                .eq("plot_id", plot_id) \
-                .eq("satellite_image_id", satellite_image["id"]) \
-                .eq("analysis_type", "growth") \
-                .limit(1) \
+            # ---------------- DUPLICATE CHECK ----------------
+            exists = (
+                supabase.table("analysis_results")
+                .select("id")
+                .eq("plot_id", plot_id)
+                .eq("satellite_image_id", satellite_image["id"])
+                .eq("analysis_type", "growth")
+                .limit(1)
                 .execute()
+            )
 
-            if exists.data:
+            if exists.data and not force:
                 counters["skipped"] += 1
-                logs["skipped"].append({"plot": plot_name, "reason": "already analyzed"})
+                logs["skipped"].append({
+                    "plot": plot_name,
+                    "reason": "already analyzed"
+                })
                 continue
 
+            # ---------------- RUN ANALYSIS ----------------
             result = run_growth_analysis_by_plot(
                 plot_data=plot_data,
                 start_date=start_date,
@@ -956,12 +964,12 @@ async def run_daily_cron(
 
         except Exception as e:
             counters["errors"] += 1
-            logs["errors"].append({"plot": plot_name, "error": str(e)})
+            logs["errors"].append({
+                "plot": plot_name,
+                "error": str(e)
+            })
 
-    # ---------------- UPDATE STATE ----------------
-    supabase.table("cron_state").update(
-        {"last_index": end_index}
-    ).eq("job_name", "daily_growth").execute()
+    print("✅ DAILY FULL GROWTH RUN COMPLETED", counters)
 
     return {
         "status": "done",
