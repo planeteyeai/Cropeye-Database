@@ -28,8 +28,6 @@ import traceback
 from gee_growth import run_growth_analysis_by_plot
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import timezone
-UTC = timezone.utc
-scheduler = BackgroundScheduler(timezone=UTC)
 
 
 # Initialize Earth Engine - move this to the top
@@ -225,7 +223,8 @@ app = FastAPI(
     lifespan=lifespan
 )
 import os
-
+UTC = timezone.utc
+scheduler = BackgroundScheduler(timezone=UTC)
 WORKER_TOKEN = os.getenv("WORKER_TOKEN")
 
 def run_growth_analysis_by_plot_name(plot_name: str):
@@ -817,44 +816,42 @@ def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
         return res.data[0]
 
     return None
+    
 def trigger_daily_growth_cron():
-    print("🚀 DAILY GROWTH CRON TRIGGERED")
+    print("🚀 DAILY GROWTH CRON TRIGGERED", flush=True)
 
     try:
         port = os.environ.get("PORT", "8080")
         url = f"http://127.0.0.1:{port}/internal/run-daily-cron"
-        r = requests.post(url, params={"dry_run": False, "force": False}, timeout=600)
-        print("[CRON RESPONSE]", r.status_code)
+        r = requests.post(url, timeout=600)
+        print("[CRON RESPONSE]", r.status_code, flush=True)
     except Exception as e:
-        print("[CRON ERROR]", str(e))
+        print("[CRON ERROR]", str(e), flush=True)
 
-
+def heartbeat():
+    print("💓 APSCHEDULER HEARTBEAT", flush=True)
 @app.on_event("startup")
 async def start_crons():
     print("🔥🔥🔥 FASTAPI STARTUP EVENT FIRED 🔥🔥🔥", flush=True)
 
     scheduler.add_job(
         trigger_daily_growth_cron,
-        CronTrigger(minute="*/1"),  # every 1 minute for testing
+        CronTrigger(minute="*/1"),  # every 1 minute (test)
         id="daily_growth_cron",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
     )
 
+    scheduler.add_job(
+        heartbeat,
+        CronTrigger(minute="*/1"),
+        id="heartbeat",
+        replace_existing=True,
+    )
+
     scheduler.start()
     print("✅ APSCHEDULER STARTED", flush=True)
-
-def heartbeat():
-    print("💓 APSCHEDULER HEARTBEAT", flush=True)
-
-scheduler.add_job(
-    heartbeat,
-    CronTrigger(minute="*/1"),
-    id="heartbeat",
-    replace_existing=True,
-)
-
 
 
 
