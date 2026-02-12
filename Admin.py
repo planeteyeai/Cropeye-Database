@@ -817,29 +817,32 @@ def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
     return None
     
 def trigger_daily_growth_cron():
+    print("🚀 DAILY GROWTH CRON TRIGGERED")
+
     try:
-        print("🔥 DAILY GROWTH CRON TRIGGERED")
-        requests.post(
-            f"http://localhost:{os.environ['PORT']}/internal/run-daily-cron",
-            timeout=60
-        )
+        url = f"http://localhost:{os.environ['PORT']}/internal/run-daily-cron"
+        r = requests.post(url, params={"dry_run": False, "force": False}, timeout=300)
+        print("[CRON] Growth batch:", r.status_code)
     except Exception as e:
-        print("[CRON ERROR]", str(e))
+        print("[CRON][ERROR]", str(e))
 
 
 
 @app.on_event("startup")
 async def start_crons():
+    print("🔥 STARTING APSCHEDULER")
+    
     scheduler.add_job(
         trigger_daily_growth_cron,
-        CronTrigger(hour=0, minute=0),  # ✅ once per day (UTC)
+        CronTrigger(minute="*/1"),
         id="daily_growth_cron",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
     )
+
     scheduler.start()
-    print("✅ APScheduler started (daily full run)")
+    print("✅ DAILY GROWTH CRON REGISTERED (00:00 UTC)")
 
 
 
