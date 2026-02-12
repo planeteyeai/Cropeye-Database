@@ -26,8 +26,10 @@ from apscheduler.triggers.cron import CronTrigger
 import httpx
 import traceback
 from gee_growth import run_growth_analysis_by_plot
+from apscheduler.schedulers.background import BackgroundScheduler
+from pytz import UTC
 
-scheduler = AsyncIOScheduler()
+scheduler = BackgroundScheduler(timezone=UTC)
 
 
 # Initialize Earth Engine - move this to the top
@@ -815,26 +817,25 @@ def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
         return res.data[0]
 
     return None
-    
-def trigger_daily_growth_cron():
+    def trigger_daily_growth_cron():
     print("🚀 DAILY GROWTH CRON TRIGGERED")
 
     try:
-        url = f"http://localhost:{os.environ['PORT']}/internal/run-daily-cron"
-        r = requests.post(url, params={"dry_run": False, "force": False}, timeout=300)
-        print("[CRON] Growth batch:", r.status_code)
+        port = os.environ.get("PORT", "8080")
+        url = f"http://127.0.0.1:{port}/internal/run-daily-cron"
+        r = requests.post(url, params={"dry_run": False, "force": False}, timeout=600)
+        print("[CRON RESPONSE]", r.status_code)
     except Exception as e:
-        print("[CRON][ERROR]", str(e))
-
+        print("[CRON ERROR]", str(e))
 
 
 @app.on_event("startup")
 async def start_crons():
     print("🔥 STARTING APSCHEDULER")
-    
+
     scheduler.add_job(
         trigger_daily_growth_cron,
-        CronTrigger(minute="*/1"),
+        CronTrigger(minute="*/1"),  # TEMP TEST
         id="daily_growth_cron",
         replace_existing=True,
         max_instances=1,
@@ -842,7 +843,7 @@ async def start_crons():
     )
 
     scheduler.start()
-    print("✅ DAILY GROWTH CRON REGISTERED (00:00 UTC)")
+    print("✅ CRON REGISTERED (every 1 min for test)")
 
 
 
