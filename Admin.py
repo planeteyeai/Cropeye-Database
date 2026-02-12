@@ -831,11 +831,11 @@ def trigger_daily_growth_cron():
 
 @app.on_event("startup")
 async def start_crons():
-    print("🔥 STARTING APSCHEDULER")
+    print("🔥🔥🔥 FASTAPI STARTUP EVENT FIRED 🔥🔥🔥", flush=True)
 
     scheduler.add_job(
         trigger_daily_growth_cron,
-        CronTrigger(minute="*/1"),  # TEMP TEST
+        CronTrigger(minute="*/1"),  # every 1 minute for testing
         id="daily_growth_cron",
         replace_existing=True,
         max_instances=1,
@@ -843,7 +843,18 @@ async def start_crons():
     )
 
     scheduler.start()
-    print("✅ CRON REGISTERED (every 1 min for test)")
+    print("✅ APSCHEDULER STARTED", flush=True)
+
+def heartbeat():
+    print("💓 APSCHEDULER HEARTBEAT", flush=True)
+
+scheduler.add_job(
+    heartbeat,
+    CronTrigger(minute="*/1"),
+    id="heartbeat",
+    replace_existing=True,
+)
+
 
 
 
