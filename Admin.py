@@ -27,8 +27,8 @@ import httpx
 import traceback
 from gee_growth import run_growth_analysis_by_plot
 from apscheduler.schedulers.background import BackgroundScheduler
-from pytz import UTC
-
+from datetime import timezone
+UTC = timezone.utc
 scheduler = BackgroundScheduler(timezone=UTC)
 
 
