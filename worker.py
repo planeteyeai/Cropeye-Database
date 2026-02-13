@@ -1,20 +1,18 @@
-import os
-import requests
 from datetime import date, timedelta
 from gee_growth import run_growth_analysis_by_plot
-from shared_services import PlotSyncService
+from shared_services import PlotSyncService, run_plot_sync
 from db import supabase
-from shared_services import run_plot_sync
+
+
+# =====================================================
+# STEP 1 — RUN INTERNAL PLOT SYNC
+# =====================================================
 
 print("🔄 Running internal plot sync before growth...", flush=True)
 
-sync_result = run_plot_sync(max_plots=50)
-
-print("✅ Sync result:", sync_result, flush=True)
-
-print("✅ Plot sync response:", response.status_code, flush=True)
-print("Sync response body:", response.text[:500], flush=True)
-
+try:
+    sync_result = run_plot_sync(max_plots=50)
+    print("✅ Sync result:", sync_result, flush=True)
 except Exception as e:
     print("❌ Plot sync failed:", str(e), flush=True)
 
@@ -90,16 +88,22 @@ for plot_name, plot_data in plots.items():
 
         for result in results:
 
-            supabase.table("analysis_results").upsert({
-                "plot_id": plot_id,
-                "analysis_type": "growth",
-                "analysis_date": result["analysis_date"],
-                "sensor_used": result["sensor"],
-                "tile_url": result["tile_url"],
-                "response_json": result["response_json"],
-            }, on_conflict="plot_id,analysis_type,analysis_date,sensor_used").execute()
+            supabase.table("analysis_results").upsert(
+                {
+                    "plot_id": plot_id,
+                    "analysis_type": "growth",
+                    "analysis_date": result["analysis_date"],
+                    "sensor_used": result["sensor"],
+                    "tile_url": result["tile_url"],
+                    "response_json": result["response_json"],
+                },
+                on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
+            ).execute()
 
-            print(f"   ✅ Stored {result['sensor']} for {result['analysis_date']}", flush=True)
+            print(
+                f"   ✅ Stored {result['sensor']} for {result['analysis_date']}",
+                flush=True
+            )
 
     except Exception as e:
         print("🔥 ERROR:", str(e), flush=True)
