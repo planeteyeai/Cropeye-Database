@@ -7,6 +7,7 @@ print("🚀 DAILY GROWTH WORKER STARTED")
 
 today = date.today().isoformat()
 start_date = (date.today() - timedelta(days=30)).isoformat()
+end_date = today
 
 plots = PlotSyncService().get_plots_dict(force_refresh=True)
 
