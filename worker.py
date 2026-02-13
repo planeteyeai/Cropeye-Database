@@ -1,24 +1,47 @@
+import os
+import requests
 from datetime import date, timedelta
 from gee_growth import run_growth_analysis_by_plot
 from shared_services import PlotSyncService
 from db import supabase
 
-print("🔄 Running plot sync before growth...")
+
+# =====================================================
+# STEP 1 — RUN PLOT SYNC FIRST
+# =====================================================
+
+print("🔄 Running plot sync before growth...", flush=True)
 
 try:
-    sync_url = os.environ.get("APP_URL") + "/internal/sync-plots-to-supabase"
+    app_url = os.environ.get("APP_URL")
+    worker_token = os.environ.get("WORKER_TOKEN")
+
+    if not app_url:
+        raise Exception("APP_URL not set")
+
+    if not worker_token:
+        raise Exception("WORKER_TOKEN not set")
+
+    sync_url = f"{app_url}/internal/sync-plots-to-supabase"
 
     headers = {
-        "x-worker-token": os.environ.get("WORKER_TOKEN")
+        "x-worker-token": worker_token
     }
 
-    r = requests.post(sync_url, headers=headers, timeout=300)
-    print("✅ Plot sync response:", r.status_code)
+    response = requests.post(sync_url, headers=headers, timeout=300)
+
+    print("✅ Plot sync response:", response.status_code, flush=True)
+    print("Sync response body:", response.text[:500], flush=True)
 
 except Exception as e:
-    print("❌ Plot sync failed:", str(e))
+    print("❌ Plot sync failed:", str(e), flush=True)
 
-print("🚀 DAILY GROWTH WORKER STARTED")
+
+# =====================================================
+# STEP 2 — RUN DAILY GROWTH WORKER
+# =====================================================
+
+print("🚀 DAILY GROWTH WORKER STARTED", flush=True)
 
 today = date.today().isoformat()
 start_date = (date.today() - timedelta(days=30)).isoformat()
@@ -37,6 +60,8 @@ for plot_name, plot_data in plots.items():
             print("❌ Missing django_id", flush=True)
             continue
 
+        # ---------------- DB CHECK ----------------
+
         plot_row = (
             supabase.table("plots")
             .select("id")
@@ -50,6 +75,8 @@ for plot_name, plot_data in plots.items():
 
         plot_id = plot_row.data[0]["id"]
         print("✔ Plot ID:", plot_id, flush=True)
+
+        # ---------------- SATELLITE CHECK ----------------
 
         sat_row = (
             supabase.table("satellite_images")
@@ -67,28 +94,30 @@ for plot_name, plot_data in plots.items():
         satellite_image = sat_row.data[0]
         print("✔ Satellite found:", satellite_image["id"], flush=True)
 
+        # ---------------- GEE ANALYSIS ----------------
+
         results = run_growth_analysis_by_plot(
             plot_data=plot_data,
             start_date=start_date,
             end_date=end_date
-            )
+        )
 
-        print("✔ Growth analysis done")
+        print("✔ Growth analysis done", flush=True)
+
+        # ---------------- STORE RESULTS ----------------
 
         for result in results:
 
-            supabase.table("analysis_results").insert({
+            supabase.table("analysis_results").upsert({
                 "plot_id": plot_id,
                 "analysis_type": "growth",
                 "analysis_date": result["analysis_date"],
                 "sensor_used": result["sensor"],
                 "tile_url": result["tile_url"],
                 "response_json": result["response_json"],
-            }).execute()
+            }, on_conflict="plot_id,analysis_type,analysis_date,sensor_used").execute()
 
-            print(f"   ✅ Stored {result['sensor']} for {result['analysis_date']}")
-
+            print(f"   ✅ Stored {result['sensor']} for {result['analysis_date']}", flush=True)
 
     except Exception as e:
         print("🔥 ERROR:", str(e), flush=True)
-
