@@ -3,6 +3,21 @@ from gee_growth import run_growth_analysis_by_plot
 from shared_services import PlotSyncService
 from db import supabase
 
+print("🔄 Running plot sync before growth...")
+
+try:
+    sync_url = os.environ.get("APP_URL") + "/internal/sync-plots-to-supabase"
+
+    headers = {
+        "x-worker-token": os.environ.get("WORKER_TOKEN")
+    }
+
+    r = requests.post(sync_url, headers=headers, timeout=300)
+    print("✅ Plot sync response:", r.status_code)
+
+except Exception as e:
+    print("❌ Plot sync failed:", str(e))
+
 print("🚀 DAILY GROWTH WORKER STARTED")
 
 today = date.today().isoformat()
