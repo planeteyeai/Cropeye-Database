@@ -770,9 +770,11 @@ def sync_plots_to_supabase(x_worker_token: Optional[str] = Header(None)):
             ) + "))"
 
             area_ha = float(geom.area().divide(10000).getInfo())
-
+            django_id = data["properties"].get("django_id")
+  
             supabase.table("plots").insert({
                 "plot_name": name,
+                "django_plot_id": django_id,
                 "geom": f"SRID=4326;{wkt}",
                 "geojson": geom_geojson,
                 "area_hectares": area_ha
