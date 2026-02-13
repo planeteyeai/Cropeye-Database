@@ -56,6 +56,11 @@ for plot_name, plot_data in plots.items():
         plot_id = plot_row.data[0]["id"]
         print("✔ Plot ID:", plot_id, flush=True)
 
+        if not django_id:
+            print("❌ Missing django_id", flush=True)
+            continue
+
+
         # ---------------- SATELLITE CHECK ----------------
 
         sat_row = (
