@@ -4,31 +4,13 @@ from datetime import date, timedelta
 from gee_growth import run_growth_analysis_by_plot
 from shared_services import PlotSyncService
 from db import supabase
+from shared_services import run_plot_sync
 
+print("🔄 Running internal plot sync before growth...", flush=True)
 
-# =====================================================
-# STEP 1 — RUN PLOT SYNC FIRST
-# =====================================================
+sync_result = run_plot_sync(max_plots=50)
 
-print("🔄 Running plot sync before growth...", flush=True)
-
-try:
-    app_url = os.environ.get("APP_URL")
-    worker_token = os.environ.get("WORKER_TOKEN")
-
-    if not app_url:
-        raise Exception("APP_URL not set")
-
-    if not worker_token:
-        raise Exception("WORKER_TOKEN not set")
-
-    sync_url = f"{app_url}/internal/sync-plots-to-supabase"
-
-    headers = {
-        "x-worker-token": worker_token
-    }
-
-    response = requests.post(sync_url, headers=headers, timeout=300)
+print("✅ Sync result:", sync_result, flush=True)
 
     print("✅ Plot sync response:", response.status_code, flush=True)
     print("Sync response body:", response.text[:500], flush=True)
