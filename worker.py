@@ -89,6 +89,23 @@ for plot_name, plot_data in plots.items():
 
         print("✔ Growth analysis done", flush=True)
 
+        for result in results:
+
+    # ---------------- STORE SATELLITE METADATA ----------------
+
+            supabase.table("satellite_images").upsert(
+                {
+                    "plot_id": plot_id,
+                    "satellite": result["sensor"],
+                    "satellite_date": result["analysis_date"],
+                },
+                on_conflict="plot_id,satellite,satellite_date"
+            ).execute()
+
+            print(f"   🛰 Satellite stored {result['sensor']} ({result['analysis_date']})", 
+                  flush=True
+            )
+        
         # ---------------- STORE RESULTS ----------------
 
         for result in results:
