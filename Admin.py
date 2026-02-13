@@ -725,40 +725,52 @@ async def get_plots():
     return list(plot_dict.keys())
 
 
-@app.post("/sync_plots_to_supabase", tags=["Admin"])
-def sync_plots_to_supabase():
+@app.post("/internal/sync-plots-to-supabase", include_in_schema=False)
+def sync_plots_to_supabase(x_worker_token: Optional[str] = Header(None)):
     """
-    Sync all plots from Django/GEE memory into Supabase PostGIS plots table
+    Sync plots from in-memory plot_dict to Supabase.
+    Designed for worker use.
     """
+
+    if x_worker_token != os.environ.get("WORKER_TOKEN"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    print("🔄 Starting plot sync...", flush=True)
+
     inserted = 0
     skipped = 0
     errors = 0
+    processed = 0
+
+    MAX_PLOTS_PER_RUN = 50  # prevent timeout
+
+    # Fetch existing plot names once (fast)
+    existing_rows = supabase.table("plots").select("plot_name").execute()
+    existing_names = {row["plot_name"] for row in existing_rows.data}
 
     for name, data in plot_dict.items():
+
+        if processed >= MAX_PLOTS_PER_RUN:
+            break
+
+        processed += 1
+
         try:
-            geom = data["geometry"]
-            geom_geojson = geom.getInfo()
-
-            # Check if exists
-            res = supabase.table("plots") \
-                .select("id") \
-                .eq("plot_name", name) \
-                .limit(1) \
-                .execute()
-
-            if res.data:
+            if name in existing_names:
                 skipped += 1
                 continue
 
-            # Convert GeoJSON → WKT
+            geom = data["geometry"]
+            geom_geojson = geom.getInfo()
+
             coords = geom_geojson["coordinates"][0]
+
             wkt = "POLYGON((" + ",".join(
                 [f"{lng} {lat}" for lng, lat in coords]
             ) + "))"
 
             area_ha = float(geom.area().divide(10000).getInfo())
 
-            # Insert
             supabase.table("plots").insert({
                 "plot_name": name,
                 "geom": f"SRID=4326;{wkt}",
@@ -769,16 +781,19 @@ def sync_plots_to_supabase():
             inserted += 1
 
         except Exception as e:
-            print(f"❌ Error inserting {name}: {e}")
+            print(f"❌ Error inserting {name}: {e}", flush=True)
             errors += 1
 
+    print("✅ Sync finished", flush=True)
+
     return {
+        "status": "completed",
         "inserted": inserted,
         "skipped": skipped,
         "errors": errors,
-        "total": len(plot_dict)
+        "processed_this_run": processed,
+        "total_available": len(plot_dict)
     }
-
 
 
 @app.get("/plots/{plot_name}/info", response_model=PlotInfo)
