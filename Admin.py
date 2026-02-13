@@ -2125,23 +2125,25 @@ async def daily_satellite_sync(x_worker_token: str = Header(None)):
                     results["skipped"] += 1
                     continue
 
-            # -------------------- RUN ANALYSIS --------------------
+# -------------------- RUN ANALYSIS --------------------
             print("  ⚡ Running GEE analysis...")
-            result_json, tile_url, sensor, image_date = \
-                run_growth_analysis_by_plot_name(plot_name)
 
-            # -------------------- STORE --------------------
-            store_analysis_result(
+            results = run_growth_analysis_by_plot_name(plot_name)
+
+# -------------------- STORE MULTIPLE RESULTS --------------------
+            for r in results:
+                store_analysis_result(
                 plot_id=plot_id,
                 analysis_type="growth",
-                analysis_date=image_date,
-                sensor=sensor,
-                tile_url=tile_url,
-                response_json=result_json
-            )
+                analysis_date=r["analysis_date"],
+                sensor=r["sensor"],
+                tile_url=r["tile_url"],
+                response_json=r["response_json"]
+                )
 
             print("  ✅ Stored")
             results["updated"] += 1
+
 
         except Exception as e:
             print(f"  ❌ Error for {plot_name}: {e}")
