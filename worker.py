@@ -12,8 +12,8 @@ sync_result = run_plot_sync(max_plots=50)
 
 print("✅ Sync result:", sync_result, flush=True)
 
-    print("✅ Plot sync response:", response.status_code, flush=True)
-    print("Sync response body:", response.text[:500], flush=True)
+print("✅ Plot sync response:", response.status_code, flush=True)
+print("Sync response body:", response.text[:500], flush=True)
 
 except Exception as e:
     print("❌ Plot sync failed:", str(e), flush=True)
