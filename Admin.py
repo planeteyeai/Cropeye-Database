@@ -222,7 +222,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
-import os
+
 UTC = timezone.utc
 scheduler = BackgroundScheduler(timezone=UTC)
 WORKER_TOKEN = os.getenv("WORKER_TOKEN")
