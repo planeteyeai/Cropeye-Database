@@ -52,28 +52,27 @@ for plot_name, plot_data in plots.items():
         satellite_image = sat_row.data[0]
         print("✔ Satellite found:", satellite_image["id"], flush=True)
 
-        result = run_growth_analysis_by_plot(
+        results = run_growth_analysis_by_plot(
             plot_data=plot_data,
             start_date=start_date,
             end_date=end_date
-        )
+            )
 
-        print("✔ Growth analysis done", flush=True)
+        print("✔ Growth analysis done")
 
-        response = supabase.table("analysis_results").upsert(
-            {
+        for result in results:
+
+            supabase.table("analysis_results").insert({
                 "plot_id": plot_id,
-                "satellite_image_id": satellite_image["id"],
                 "analysis_type": "growth",
                 "analysis_date": result["analysis_date"],
                 "sensor_used": result["sensor"],
                 "tile_url": result["tile_url"],
                 "response_json": result["response_json"],
-            },
-            on_conflict="plot_id,satellite_image_id,analysis_type"
-        ).execute()
+            }).execute()
 
-        print("✔ Insert response:", response.data, flush=True)
+            print(f"   ✅ Stored {result['sensor']} for {result['analysis_date']}")
+
 
     except Exception as e:
         print("🔥 ERROR:", str(e), flush=True)
