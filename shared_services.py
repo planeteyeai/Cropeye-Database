@@ -4,6 +4,7 @@ from datetime import datetime
 import ee
 import numpy as np
 import math
+from db import supabase   # ✅ ADDED
 
 # ------------------------------
 # Helpers: safe rounding & JSON sanitization
@@ -57,6 +58,7 @@ def strip_z(coords):
         else:
             return coords
 
+
 # ------------------------------
 # PlotSyncService for Django API
 # ------------------------------
@@ -107,9 +109,16 @@ class PlotSyncService:
             farms = plot.get('farms', [])
             plantation_date = None
             plantation_type = None
+            crop_type_name = plot.get('crop_type_name')
+            if crop_type_name is None and isinstance(plot.get('crop_type'), dict):
+                crop_type_name = plot.get('crop_type', {}).get('name')
             if farms:
                 plantation_date = farms[0].get('plantation_date')
                 plantation_type = farms[0].get('plantation_type')
+                if crop_type_name is None:
+                    crop_type_name = farms[0].get('crop_type_name')
+                if crop_type_name is None and isinstance(farms[0].get('crop_type'), dict):
+                    crop_type_name = farms[0].get('crop_type', {}).get('name')
 
             plot_name = f"{gat_number}_{plot_number}" if gat_number and plot_number else gat_number or f"plot_{plot_id}"
 
@@ -156,6 +165,7 @@ class PlotSyncService:
                     'django_id': plot_id,
                     'plantation_date': plantation_date,
                     'plantation_type': plantation_type,
+                    'crop_type_name': crop_type_name,
                 }
             }
 
@@ -174,7 +184,68 @@ class PlotSyncService:
         self.plots_cache = plots_data
         self.last_sync = current_time
         return plots_data
-    
 
 
-    
+# =====================================================
+# ✅ INTERNAL SUPABASE SYNC (NO HTTP CALL)
+# =====================================================
+
+def run_plot_sync(max_plots=50):
+
+    print("🔄 Starting internal plot sync...", flush=True)
+
+    inserted = 0
+    skipped = 0
+    errors = 0
+    processed = 0
+
+    plot_service = PlotSyncService()
+    plot_dict = plot_service.get_plots_dict(force_refresh=True)
+
+    existing_rows = supabase.table("plots").select("plot_name").execute()
+    existing_names = {row["plot_name"] for row in existing_rows.data}
+
+    for name, data in plot_dict.items():
+
+        if processed >= max_plots:
+            break
+
+        processed += 1
+
+        try:
+            if name in existing_names:
+                skipped += 1
+                continue
+
+            geom = data["geometry"]
+            geom_geojson = geom.getInfo()
+
+            coords = geom_geojson["coordinates"][0]
+
+            wkt = "POLYGON((" + ",".join(
+                [f"{lng} {lat}" for lng, lat in coords]
+            ) + "))"
+
+            area_ha = float(geom.area().divide(10000).getInfo())
+
+            supabase.table("plots").insert({
+                "plot_name": name,
+                "geom": f"SRID=4326;{wkt}",
+                "geojson": geom_geojson,
+                "area_hectares": area_ha
+            }).execute()
+
+            inserted += 1
+
+        except Exception as e:
+            print(f"❌ Error inserting {name}: {e}", flush=True)
+            errors += 1
+
+    print("✅ Internal sync complete", flush=True)
+
+    return {
+        "inserted": inserted,
+        "skipped": skipped,
+        "errors": errors,
+        "processed": processed
+    }
