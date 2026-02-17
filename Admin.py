@@ -839,7 +839,7 @@ def run_monthly_backfill_for_plot(plot_name: str, plot_data: dict):
     plot_row = (
         supabase.table("plots")
         .select("id")
-        .eq("django_plot_id", django_id)
+        .eq("plot_name", plot_name)
         .execute()
     )
 
