@@ -28,6 +28,9 @@ import traceback
 from gee_growth import run_growth_analysis_by_plot
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import timezone
+from dateutil.relativedelta import relativedelta
+UTC = timezone.utc
+scheduler = BackgroundScheduler(timezone=UTC)
 
 
 # Initialize Earth Engine - move this to the top
@@ -222,9 +225,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+import os
 
-UTC = timezone.utc
-scheduler = BackgroundScheduler(timezone=UTC)
 WORKER_TOKEN = os.getenv("WORKER_TOKEN")
 
 def run_growth_analysis_by_plot_name(plot_name: str):
@@ -725,56 +727,42 @@ async def get_plots():
     return list(plot_dict.keys())
 
 
-@app.post("/internal/sync-plots-to-supabase", include_in_schema=False)
-def sync_plots_to_supabase(x_worker_token: Optional[str] = Header(None)):
+@app.post("/sync_plots_to_supabase", tags=["Admin"])
+def sync_plots_to_supabase():
     """
-    Sync plots from in-memory plot_dict to Supabase.
-    Designed for worker use.
+    Sync all plots from Django/GEE memory into Supabase PostGIS plots table
     """
-
-    if x_worker_token != os.environ.get("WORKER_TOKEN"):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    print("🔄 Starting plot sync...", flush=True)
-
     inserted = 0
     skipped = 0
     errors = 0
-    processed = 0
-
-    MAX_PLOTS_PER_RUN = 50  # prevent timeout
-
-    # Fetch existing plot names once (fast)
-    existing_rows = supabase.table("plots").select("plot_name").execute()
-    existing_names = {row["plot_name"] for row in existing_rows.data}
 
     for name, data in plot_dict.items():
-
-        if processed >= MAX_PLOTS_PER_RUN:
-            break
-
-        processed += 1
-
         try:
-            if name in existing_names:
-                skipped += 1
-                continue
-
             geom = data["geometry"]
             geom_geojson = geom.getInfo()
 
-            coords = geom_geojson["coordinates"][0]
+            # Check if exists
+            res = supabase.table("plots") \
+                .select("id") \
+                .eq("plot_name", name) \
+                .limit(1) \
+                .execute()
 
+            if res.data:
+                skipped += 1
+                continue
+
+            # Convert GeoJSON → WKT
+            coords = geom_geojson["coordinates"][0]
             wkt = "POLYGON((" + ",".join(
                 [f"{lng} {lat}" for lng, lat in coords]
             ) + "))"
 
             area_ha = float(geom.area().divide(10000).getInfo())
-            django_id = data["properties"].get("django_id")
-  
+
+            # Insert
             supabase.table("plots").insert({
                 "plot_name": name,
-                "django_plot_id": django_id,
                 "geom": f"SRID=4326;{wkt}",
                 "geojson": geom_geojson,
                 "area_hectares": area_ha
@@ -783,19 +771,16 @@ def sync_plots_to_supabase(x_worker_token: Optional[str] = Header(None)):
             inserted += 1
 
         except Exception as e:
-            print(f"❌ Error inserting {name}: {e}", flush=True)
+            print(f"❌ Error inserting {name}: {e}")
             errors += 1
 
-    print("✅ Sync finished", flush=True)
-
     return {
-        "status": "completed",
         "inserted": inserted,
         "skipped": skipped,
         "errors": errors,
-        "processed_this_run": processed,
-        "total_available": len(plot_dict)
+        "total": len(plot_dict)
     }
+
 
 
 @app.get("/plots/{plot_name}/info", response_model=PlotInfo)
@@ -833,42 +818,141 @@ def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
         return res.data[0]
 
     return None
-    
+
+def run_monthly_backfill_for_plot(plot_name: str, plot_data: dict):
+
+    print(f"📦 Checking historical monthly backfill for {plot_name}", flush=True)
+
+    props = plot_data.get("properties") or {}
+    django_id = props.get("django_id")
+    plantation_date = props.get("plantation_date")
+
+    if not django_id or not plantation_date:
+        print("⚠ Missing django_id or plantation_date", flush=True)
+        return
+
+    # ---------------- Get plot_id ----------------
+
+    plot_row = (
+        supabase.table("plots")
+        .select("id")
+        .eq("django_plot_id", django_id)
+        .execute()
+    )
+
+    if not plot_row.data:
+        print("❌ Plot not found in DB", flush=True)
+        return
+
+    plot_id = plot_row.data[0]["id"]
+
+    # ---------------- Find latest stored satellite date ----------------
+
+    sat_row = (
+        supabase.table("satellite_images")
+        .select("satellite_date")
+        .eq("plot_id", plot_id)
+        .order("satellite_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if sat_row.data:
+        last_date = sat_row.data[0]["satellite_date"]
+        start_date = datetime.fromisoformat(last_date) + relativedelta(months=1)
+    else:
+        start_date = datetime.fromisoformat(plantation_date)
+
+    today = datetime.utcnow()
+
+    if start_date >= today:
+        print("✔ Historical data already up to date", flush=True)
+        return
+
+    current = start_date.replace(day=1)
+
+    while current < today:
+
+        month_start = current
+        month_end = current + relativedelta(months=1)
+
+        print(
+            f"🛰 Fetching monthly data {month_start.date()} → {month_end.date()}",
+            flush=True
+        )
+
+        try:
+            results = run_growth_analysis_by_plot(
+                plot_data=plot_data,
+                start_date=month_start.date().isoformat(),
+                end_date=month_end.date().isoformat()
+            )
+
+            for result in results:
+
+                # Store satellite metadata
+                supabase.table("satellite_images").upsert(
+                    {
+                        "plot_id": plot_id,
+                        "satellite": result["sensor"],
+                        "satellite_date": result["analysis_date"],
+                    },
+                    on_conflict="plot_id,satellite,satellite_date"
+                ).execute()
+
+                # Store analysis
+                supabase.table("analysis_results").upsert(
+                    {
+                        "plot_id": plot_id,
+                        "analysis_type": "growth",
+                        "analysis_date": result["analysis_date"],
+                        "sensor_used": result["sensor"],
+                        "tile_url": result["tile_url"],
+                        "response_json": result["response_json"],
+                    },
+                    on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
+                ).execute()
+
+                print(
+                    f"   ✅ Stored {result['sensor']} ({result['analysis_date']})",
+                    flush=True
+                )
+
+        except Exception as e:
+            print("🔥 Monthly backfill error:", str(e), flush=True)
+
+        current += relativedelta(months=1)
+
+    print(f"✅ Monthly backfill completed for {plot_name}", flush=True)
+
 def trigger_daily_growth_cron():
-    print("🚀 DAILY GROWTH CRON TRIGGERED", flush=True)
+    print("🚀 DAILY GROWTH CRON TRIGGERED")
 
     try:
         port = os.environ.get("PORT", "8080")
         url = f"http://127.0.0.1:{port}/internal/run-daily-cron"
-        r = requests.post(url, timeout=600)
-        print("[CRON RESPONSE]", r.status_code, flush=True)
+        r = requests.post(url, params={"dry_run": False, "force": False}, timeout=600)
+        print("[CRON RESPONSE]", r.status_code)
     except Exception as e:
-        print("[CRON ERROR]", str(e), flush=True)
+        print("[CRON ERROR]", str(e))
 
-def heartbeat():
-    print("💓 APSCHEDULER HEARTBEAT", flush=True)
+
 @app.on_event("startup")
 async def start_crons():
     print("🔥🔥🔥 FASTAPI STARTUP EVENT FIRED 🔥🔥🔥", flush=True)
 
     scheduler.add_job(
         trigger_daily_growth_cron,
-        CronTrigger(minute="*/1"),  # every 1 minute (test)
+        CronTrigger(minute="*/1"),  # every 1 minute for testing
         id="daily_growth_cron",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
     )
 
-    scheduler.add_job(
-        heartbeat,
-        CronTrigger(minute="*/1"),
-        id="heartbeat",
-        replace_existing=True,
-    )
-
     scheduler.start()
     print("✅ APSCHEDULER STARTED", flush=True)
+
 
 
 
@@ -1905,42 +1989,6 @@ def get_vis_params(index_name):
     """Get visualization parameters for index"""
     return indexVisParams.get(index_name, {})
 
-
-
-
-@app.get("/satellite-updates/{plot_name}")
-async def check_satellite_updates(
-    plot_name: str,
-    end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    start_date: str = Query(..., description="Start date in YYYY-MM-DD format")
-):
-    """Check for satellite updates for a specific plot"""
-    if plot_name not in plot_dict:
-        raise HTTPException(status_code=404, detail="Plot not found")
-   
-    try:
-        aoi = plot_dict[plot_name]['geometry']
-       
-        # Get current collection info
-        coll = filter_s1(
-            ee.ImageCollection('COPERNICUS/S1_GRD'),
-            start_date, end_date, aoi
-        ).map(addIndices)
-       
-        current_satellite_update = get_latest_satellite_update(coll)
-        image_count = coll.size().getInfo()
-       
-        return {
-            "plot_name": plot_name,
-            "date_range": f"{start_date} to {end_date}",
-            "current_satellite_update": current_satellite_update,
-            "image_count": image_count,
-            "checked_at": datetime.now().isoformat()
-        }
-       
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Update check failed: {str(e)}") 
-
 def calculate_area_hectares(geometry):
     """Calculate area in hectares (approximate)"""
     try:
@@ -1954,6 +2002,7 @@ def calculate_area_hectares(geometry):
         print(f"Error calculating area: {e}")
         return None
 plot_service = PlotSyncService()
+
 @app.get("/distance")
 def calculate_distances(
     lat: float = Query(..., description="Factory latitude"),
@@ -2025,70 +2074,6 @@ def verify_worker(token):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
 
-@app.get("/internal/latest_satellite", include_in_schema=False)
-async def get_latest_satellite(plot_id: str = Query(...), x_worker_token: str = Header(None)):
-    verify_worker(x_worker_token)
-
-    try:
-        # Get plot data from database
-        plot_row = supabase.table("plots").select("plot_name, geojson").eq("id", plot_id).single().execute()
-        if not plot_row.data:
-            raise HTTPException(status_code=404, detail="Plot not found")
-
-        plot_name = plot_row.data["plot_name"]
-        geojson = plot_row.data["geojson"]
-
-        # Create geometry from geojson
-        geometry = ee.Geometry(geojson)
-
-        # Get latest satellite date
-        s1_collection = (
-            ee.ImageCollection("COPERNICUS/S1_GRD")
-            .filterBounds(geometry)
-            .sort("system:time_start", False)
-        )
-
-        result = get_latest_satellite_update(s1_collection)
-        if not result or result == "no_data":
-            raise HTTPException(status_code=404, detail="No satellite data found for this plot")
-
-        return {"date": result, "satellite": "sentinel-1"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching latest satellite: {str(e)}")
-
-@app.post("/internal/run_analysis", include_in_schema=False)
-async def run_analysis(request: Dict[str, Any], x_worker_token: str = Header(None)):
-    verify_worker(x_worker_token)
-
-    plot_id = request.get("plot_id")
-    analysis_type = request.get("analysis_type", "growth")
-
-    if not plot_id:
-        raise HTTPException(status_code=400, detail="plot_id is required")
-
-    try:
-        # Get plot name from plot_id
-        plot_row = supabase.table("plots").select("plot_name").eq("id", plot_id).single().execute()
-        if not plot_row.data:
-            raise HTTPException(status_code=404, detail="Plot not found")
-
-        plot_name = plot_row.data["plot_name"]
-
-        # Run analysis
-        result_json, tile_url, sensor, image_date = run_growth_analysis_by_plot_name(plot_name)
-
-        return {
-            "sensor_used": sensor,
-            "tile_url": tile_url,
-            "result": result_json,
-            "analysis_date": image_date
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
 @app.post("/internal/daily_satellite_sync", include_in_schema=False)
 async def daily_satellite_sync(x_worker_token: str = Header(None)):
     verify_worker(x_worker_token)
@@ -2142,25 +2127,23 @@ async def daily_satellite_sync(x_worker_token: str = Header(None)):
                     results["skipped"] += 1
                     continue
 
-# -------------------- RUN ANALYSIS --------------------
+            # -------------------- RUN ANALYSIS --------------------
             print("  ⚡ Running GEE analysis...")
+            result_json, tile_url, sensor, image_date = \
+                run_growth_analysis_by_plot_name(plot_name)
 
-            results = run_growth_analysis_by_plot_name(plot_name)
-
-# -------------------- STORE MULTIPLE RESULTS --------------------
-            for r in results:
-                store_analysis_result(
+            # -------------------- STORE --------------------
+            store_analysis_result(
                 plot_id=plot_id,
                 analysis_type="growth",
-                analysis_date=r["analysis_date"],
-                sensor=r["sensor"],
-                tile_url=r["tile_url"],
-                response_json=r["response_json"]
-                )
+                analysis_date=image_date,
+                sensor=sensor,
+                tile_url=tile_url,
+                response_json=result_json
+            )
 
             print("  ✅ Stored")
             results["updated"] += 1
-
 
         except Exception as e:
             print(f"  ❌ Error for {plot_name}: {e}")
@@ -2169,36 +2152,6 @@ async def daily_satellite_sync(x_worker_token: str = Header(None)):
     print("📊 Daily Sync Summary:", results)
     return result
 
-@app.get("/internal/satellite_range")
-def satellite_range(
-    plot_id: str,
-    start: str,
-    end: str,
-    x_worker_token: str = Header(None)
-):
-    if x_worker_token != WORKER_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid worker token")
-
-    try:
-        start_date = datetime.fromisoformat(start).date()
-        end_date = datetime.fromisoformat(end).date()
-    except:
-        raise HTTPException(status_code=400, detail="Bad date format, use YYYY-MM-DD")
-
-    # 🛰 MOCK — replace with real GEE call later
-    dates = []
-    current = start_date
-
-    while current <= end_date:
-        # Simulate Sentinel pass every 5 days
-        dates.append(current.isoformat())
-        current += timedelta(days=5)
-
-    return {
-        "plot_id": plot_id,
-        "satellite": "sentinel-1",
-        "dates": dates
-    }
 
 if __name__ == "__main__":
     uvicorn.run("Admin:app", host="0.0.0.0", port=3000, reload=True)
