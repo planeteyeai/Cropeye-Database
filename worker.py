@@ -12,7 +12,7 @@ from Admin import run_monthly_backfill_for_plot
 print("🔄 Running internal plot sync before growth...", flush=True)
 
 try:
-    sync_result = run_plot_sync(max_plots=50)
+    sync_result = run_plot_sync()
     print("✅ Sync result:", sync_result, flush=True)
 except Exception as e:
     print("❌ Plot sync failed:", str(e), flush=True)
