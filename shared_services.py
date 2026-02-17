@@ -4,7 +4,6 @@ from datetime import datetime
 import ee
 import numpy as np
 import math
-from db import supabase   # ✅ ADDED
 
 # ------------------------------
 # Helpers: safe rounding & JSON sanitization
@@ -184,13 +183,8 @@ class PlotSyncService:
         self.plots_cache = plots_data
         self.last_sync = current_time
         return plots_data
-
-
-# =====================================================
-# ✅ INTERNAL SUPABASE SYNC (NO HTTP CALL)
-# =====================================================
-
-def run_plot_sync(max_plots=10000):
+    
+def run_plot_sync():
 
     print("🔄 Starting internal plot sync...", flush=True)
 
@@ -206,9 +200,6 @@ def run_plot_sync(max_plots=10000):
     existing_names = {row["plot_name"] for row in existing_rows.data}
 
     for name, data in plot_dict.items():
-
-        if processed >= max_plots:
-            break
 
         processed += 1
 
@@ -249,3 +240,7 @@ def run_plot_sync(max_plots=10000):
         "errors": errors,
         "processed": processed
     }
+
+
+
+    
