@@ -4,7 +4,7 @@ from datetime import datetime
 import ee
 import numpy as np
 import math
-
+from db import supabase
 # ------------------------------
 # Helpers: safe rounding & JSON sanitization
 # ------------------------------
