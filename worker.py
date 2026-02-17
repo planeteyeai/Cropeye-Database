@@ -2,6 +2,7 @@ from datetime import date, timedelta
 from gee_growth import run_growth_analysis_by_plot
 from shared_services import PlotSyncService, run_plot_sync
 from db import supabase
+from Admin import run_monthly_backfill_for_plot
 
 
 # =====================================================
@@ -28,6 +29,14 @@ start_date = (date.today() - timedelta(days=30)).isoformat()
 end_date = today
 
 plots = PlotSyncService().get_plots_dict(force_refresh=True)
+
+print("🔁 Running monthly historical backfill check...", flush=True)
+
+for plot_name, plot_data in plots.items():
+    try:
+        run_monthly_backfill_for_plot(plot_name, plot_data)
+    except Exception as e:
+        print("🔥 Backfill failed for", plot_name, str(e), flush=True)
 
 for plot_name, plot_data in plots.items():
     print(f"\n--- Processing {plot_name} ---", flush=True)
