@@ -830,8 +830,8 @@ def run_monthly_backfill_for_plot(plot_name: str, plot_data: dict):
     django_id = props.get("django_id")
     plantation_date = props.get("plantation_date")
 
-    if not django_id or not plantation_date:
-        print("⚠ Missing django_id or plantation_date", flush=True)
+    if not plantation_date:
+        print("⚠ Missing plantation_date", flush=True)
         return
 
     # ---------------- Get plot_id ----------------
