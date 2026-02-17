@@ -727,6 +727,46 @@ async def get_plots():
     return list(plot_dict.keys())
 
 
+@app.get("/plots/{plot_name}/info", response_model=PlotInfo)
+async def get_plot_info_with_dates(plot_name: str):
+    """Get information about a specific plot including recent dates"""
+    if plot_name not in plot_dict:
+        raise HTTPException(status_code=404, detail="Plot not found")
+   
+    geom = plot_dict[plot_name]['geometry']
+    try:
+        area = geom.area().divide(10000).getInfo()
+    except Exception as e:
+        print(f"Error calculating area: {e}")
+        area = None
+   
+    recent_dates = get_recent_dates()
+   
+    return PlotInfo(
+        name=plot_name,
+        geometry_type=geom.type().getInfo(),
+        area_acre=round(area*2.47105, 2) if area else None,
+        recent_dates=recent_dates
+    )
+
+def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
+    res = supabase.table("analysis_results") \
+        .select("response_json, tile_url, sensor_used, analysis_date") \
+        .eq("plot_id", plot_id) \
+        .eq("analysis_type", analysis_type) \
+        .eq("analysis_date", analysis_date) \
+        .limit(1) \
+        .execute()
+
+    if res.data:
+        return res.data[0]
+
+    return None
+
+def verify_worker(token):
+    if not token or (token != WORKER_TOKEN and token != "local-dev"):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
 @app.post("/sync_plots_to_supabase", tags=["Admin"])
 def sync_plots_to_supabase():
     """
@@ -781,44 +821,7 @@ def sync_plots_to_supabase():
         "total": len(plot_dict)
     }
 
-
-
-@app.get("/plots/{plot_name}/info", response_model=PlotInfo)
-async def get_plot_info_with_dates(plot_name: str):
-    """Get information about a specific plot including recent dates"""
-    if plot_name not in plot_dict:
-        raise HTTPException(status_code=404, detail="Plot not found")
-   
-    geom = plot_dict[plot_name]['geometry']
-    try:
-        area = geom.area().divide(10000).getInfo()
-    except Exception as e:
-        print(f"Error calculating area: {e}")
-        area = None
-   
-    recent_dates = get_recent_dates()
-   
-    return PlotInfo(
-        name=plot_name,
-        geometry_type=geom.type().getInfo(),
-        area_acre=round(area*2.47105, 2) if area else None,
-        recent_dates=recent_dates
-    )
-
-def get_cached_analysis(plot_id: str, analysis_type: str, analysis_date: str):
-    res = supabase.table("analysis_results") \
-        .select("response_json, tile_url, sensor_used, analysis_date") \
-        .eq("plot_id", plot_id) \
-        .eq("analysis_type", analysis_type) \
-        .eq("analysis_date", analysis_date) \
-        .limit(1) \
-        .execute()
-
-    if res.data:
-        return res.data[0]
-
-    return None
-
+        
 def run_monthly_backfill_for_plot(plot_name: str, plot_data: dict):
 
     print(f"📦 Checking historical monthly backfill for {plot_name}", flush=True)
@@ -2067,90 +2070,8 @@ async def refresh_from_django():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to refresh from Django: {str(e)}")
-        
-
-def verify_worker(token):
-    if not token or (token != WORKER_TOKEN and token != "local-dev"):
-        raise HTTPException(status_code=403, detail="Unauthorized")
 
 
-@app.post("/internal/daily_satellite_sync", include_in_schema=False)
-async def daily_satellite_sync(x_worker_token: str = Header(None)):
-    verify_worker(x_worker_token)
-
-    results = {
-        "checked": 0,
-        "updated": 0,
-        "skipped": 0,
-        "errors": 0
-    }
-
-    plots = supabase.table("plots") \
-        .select("id, plot_name") \
-        .execute()
-
-    print(f"🛰 Found {len(plots.data)} plots")
-
-    for plot in plots.data:
-        plot_id = plot["id"]
-        plot_name = plot["plot_name"]
-
-        try:
-            results["checked"] += 1
-            print(f"→ Checking {plot_name}")
-
-            # -------------------- GEE CHECK --------------------
-            result = get_latest_satellite_date_by_plot_id(plot_id)
-
-            if not result:
-                print("  ⚠ No satellite image found")
-                results["skipped"] += 1
-                continue
-
-            # Always take only first 2 values safely
-            latest_date, satellite = result[:2]
-            print(f"  🛰 Latest image: {latest_date} ({satellite})")
-
-            # -------------------- DB CACHE CHECK --------------------
-            cached = supabase.table("analysis_results") \
-                .select("analysis_date") \
-                .eq("plot_id", plot_id) \
-                .eq("analysis_type", "growth") \
-                .order("analysis_date", desc=True) \
-                .limit(1) \
-                .execute()
-
-            if cached.data:
-                last_date = cached.data[0]["analysis_date"]
-                if str(last_date) >= str(latest_date):
-                    print("  ✓ Already cached")
-                    results["skipped"] += 1
-                    continue
-
-            # -------------------- RUN ANALYSIS --------------------
-            print("  ⚡ Running GEE analysis...")
-            result_json, tile_url, sensor, image_date = \
-                run_growth_analysis_by_plot_name(plot_name)
-
-            # -------------------- STORE --------------------
-            store_analysis_result(
-                plot_id=plot_id,
-                analysis_type="growth",
-                analysis_date=image_date,
-                sensor=sensor,
-                tile_url=tile_url,
-                response_json=result_json
-            )
-
-            print("  ✅ Stored")
-            results["updated"] += 1
-
-        except Exception as e:
-            print(f"  ❌ Error for {plot_name}: {e}")
-            results["errors"] += 1
-
-    print("📊 Daily Sync Summary:", results)
-    return result
 
 
 if __name__ == "__main__":
