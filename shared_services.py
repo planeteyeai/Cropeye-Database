@@ -219,12 +219,14 @@ def run_plot_sync():
 
             area_ha = float(geom.area().divide(10000).getInfo())
 
-            supabase.table("plots").insert({
+            supabase.table("plots").upsert({
                 "plot_name": name,
                 "geom": f"SRID=4326;{wkt}",
                 "geojson": geom_geojson,
-                "area_hectares": area_ha
-            }).execute()
+                "area_hectares": area_ha,
+                "plantation_date": props.get("plantation_date"),
+                "django_plot_id": props.get("django_id"),
+            }, on_conflict="plot_name").execute()
 
             inserted += 1
 
