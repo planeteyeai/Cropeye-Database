@@ -190,7 +190,7 @@ class PlotSyncService:
 # ✅ INTERNAL SUPABASE SYNC (NO HTTP CALL)
 # =====================================================
 
-def run_plot_sync(max_plots=50):
+def run_plot_sync(max_plots=10000):
 
     print("🔄 Starting internal plot sync...", flush=True)
 
