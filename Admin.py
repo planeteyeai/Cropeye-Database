@@ -865,7 +865,6 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         month_end_str = next_month.isoformat()
 
         # ✅ CHECK analysis_results TABLE (NOT satellite_images)
-
         existing = (
             supabase.table("analysis_results")
             .select("id")
@@ -898,22 +897,26 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                 sensor_used = properties["data_source"]
                 tile_url = properties["tile_url"]
 
-                supabase.table("analysis_results").upsert(
+                # ✅ SAFE UPSERT WITH ERROR CHECK
+                response = supabase.table("analysis_results").upsert(
                     {
                         "plot_id": plot_id,
                         "analysis_type": "growth",
                         "analysis_date": analysis_date,
                         "sensor_used": sensor_used,
                         "tile_url": tile_url,
-                        "response_json": geojson,
+                        "response_json": json.loads(json.dumps(geojson)),
                     },
                     on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
                 ).execute()
 
-                print(
-                    f"   ✅ Stored {sensor_used} ({analysis_date})",
-                    flush=True
-                )
+                if hasattr(response, "error") and response.error:
+                    print("❌ Supabase insert error:", response.error, flush=True)
+                else:
+                    print(
+                        f"   ✅ Stored {sensor_used} ({analysis_date})",
+                        flush=True
+                    )
 
         except Exception as e:
             print(f"❌ Monthly fetch failed: {e}", flush=True)
@@ -921,6 +924,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         current_month_start = next_month
 
     print(f"✅ Monthly backfill completed for {plot_name}", flush=True)
+
 
 def trigger_daily_growth_cron():
     print("🚀 DAILY GROWTH CRON TRIGGERED")
