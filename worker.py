@@ -38,6 +38,7 @@ for plot_name, plot_data in plots.items():
     except Exception as e:
         print("🔥 Backfill failed for", plot_name, str(e), flush=True)
 
+
 for plot_name, plot_data in plots.items():
     print(f"\n--- Processing {plot_name} ---", flush=True)
 
@@ -65,29 +66,6 @@ for plot_name, plot_data in plots.items():
         plot_id = plot_row.data[0]["id"]
         print("✔ Plot ID:", plot_id, flush=True)
 
-        if not django_id:
-            print("❌ Missing django_id", flush=True)
-            continue
-
-
-        # ---------------- SATELLITE CHECK ----------------
-
-        sat_row = (
-            supabase.table("satellite_images")
-            .select("id,satellite,satellite_date")
-            .eq("plot_id", plot_id)
-            .order("satellite_date", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if not sat_row.data:
-            print("❌ No satellite image found", flush=True)
-            continue
-
-        satellite_image = sat_row.data[0]
-        print("✔ Satellite found:", satellite_image["id"], flush=True)
-
         # ---------------- GEE ANALYSIS ----------------
 
         results = run_growth_analysis_by_plot(
@@ -98,41 +76,46 @@ for plot_name, plot_data in plots.items():
 
         print("✔ Growth analysis done", flush=True)
 
-        for result in results:
+        for geojson in results:
 
-    # ---------------- STORE SATELLITE METADATA ----------------
+            properties = geojson["features"][0]["properties"]
+
+            analysis_date = properties["latest_image_date"]
+            sensor_used = properties["data_source"]
+            tile_url = properties["tile_url"]
+
+            # ---------------- STORE SATELLITE METADATA ----------------
 
             supabase.table("satellite_images").upsert(
                 {
                     "plot_id": plot_id,
-                    "satellite": result["sensor"],
-                    "satellite_date": result["analysis_date"],
+                    "satellite": sensor_used,
+                    "satellite_date": analysis_date,
                 },
                 on_conflict="plot_id,satellite,satellite_date"
             ).execute()
 
-            print(f"   🛰 Satellite stored {result['sensor']} ({result['analysis_date']})", 
-                  flush=True
+            print(
+                f"   🛰 Satellite stored {sensor_used} ({analysis_date})",
+                flush=True
             )
-        
-        # ---------------- STORE RESULTS ----------------
 
-        for result in results:
+            # ---------------- STORE RESULTS ----------------
 
             supabase.table("analysis_results").upsert(
                 {
                     "plot_id": plot_id,
                     "analysis_type": "growth",
-                    "analysis_date": result["analysis_date"],
-                    "sensor_used": result["sensor"],
-                    "tile_url": result["tile_url"],
-                    "response_json": result["response_json"],
+                    "analysis_date": analysis_date,
+                    "sensor_used": sensor_used,
+                    "tile_url": tile_url,
+                    "response_json": geojson,
                 },
                 on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
             ).execute()
 
             print(
-                f"   ✅ Stored {result['sensor']} for {result['analysis_date']}",
+                f"   ✅ Stored {sensor_used} for {analysis_date}",
                 flush=True
             )
 
