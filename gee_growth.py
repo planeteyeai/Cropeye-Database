@@ -23,7 +23,7 @@ ee.Initialize(credentials, project=service_account_info["project_id"])
 # Growth Analysis (UNCHANGED CORE LOGIC)
 # ======================================================
 
-def run_growth_analysis_by_plot(plot_data, start_date, end_date):
+def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
     if not plot_data or "geometry" not in plot_data:
         raise ValueError("plot_data missing geometry")
