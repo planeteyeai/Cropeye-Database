@@ -218,6 +218,8 @@ def run_plot_sync():
             ) + "))"
 
             area_ha = float(geom.area().divide(10000).getInfo())
+            
+            props = data.get("properties", {})
 
             supabase.table("plots").upsert({
                 "plot_name": name,
