@@ -60,9 +60,10 @@ def run_growth_analysis_by_plot(plot_data, start_date, end_date):
 
         ndvi = latest_image.normalizedDifference(["B8", "B4"]).rename("NDVI")
 
-        weak_mask = ndvi.gte(0.2).And(ndvi.lt(0.4))
+        # ✅ PRIORITY FIXED (stress evaluated first)
         stress_mask = ndvi.gte(0.0).And(ndvi.lt(0.2))
-        moderate_mask = ndvi.gte(0.4).And(ndvi.lt(0.6))
+        weak_mask = ndvi.gte(0.2).And(ndvi.lt(0.35))
+        moderate_mask = ndvi.gte(0.35).And(ndvi.lt(0.6))
         healthy_mask = ndvi.gte(0.6)
 
         result = _build_response(
@@ -105,10 +106,11 @@ def run_growth_analysis_by_plot(plot_data, start_date, end_date):
 
         vh = latest_image.select("VH")
 
-        weak_mask = vh.gte(-11)
-        stress_mask = vh.lt(-11).And(vh.gt(-13))
-        moderate_mask = vh.lte(-13).And(vh.gt(-15))
-        healthy_mask = vh.lte(-15)
+        # ✅ PRIORITY FIXED (stress stronger band separation)
+        stress_mask = vh.gt(-13)
+        weak_mask = vh.lte(-13).And(vh.gt(-15))
+        moderate_mask = vh.lte(-15).And(vh.gt(-17))
+        healthy_mask = vh.lte(-17)
 
         result = _build_response(
             geometry,
@@ -152,10 +154,11 @@ def _build_response(
     image_count
 ):
 
+    # ✅ PRIORITY ORDER FIXED
     combined = (
         ee.Image(0)
-        .where(weak_mask, 1)
         .where(stress_mask, 2)
+        .where(weak_mask, 1)
         .where(moderate_mask, 3)
         .where(healthy_mask, 4)
         .clip(geometry)
@@ -180,22 +183,6 @@ def _build_response(
             .get("constant")
         )
 
-    def pixel_coords(mask):
-        vectors = (
-            mask.selfMask()
-            .reduceToVectors(
-                geometry=geometry,
-                scale=10,
-                geometryType="centroid",
-                bestEffort=True
-            )
-            .getInfo()
-        )
-        coords = []
-        for f in vectors["features"]:
-            coords.append(f["geometry"]["coordinates"])
-        return coords
-
     healthy = pixel_count(healthy_mask).getInfo() or 0
     moderate = pixel_count(moderate_mask).getInfo() or 0
     weak = pixel_count(weak_mask).getInfo() or 0
@@ -205,13 +192,21 @@ def _build_response(
     def percent(val):
         return (val / total * 100) if total > 0 else 0
 
+    # ✅ FIXED plot_name fallback logic
+    plot_name = (
+        props.get("plot_name")
+        or props.get("name")
+        or props.get("django_id")
+        or "Unknown Plot"
+    )
+
     geojson = {
         "type": "FeatureCollection",
         "features": [{
             "type": "Feature",
             "geometry": geometry.getInfo(),
             "properties": {
-                "plot_name": props.get("plot_name"),
+                "plot_name": plot_name,
                 "area_acres": area_acres,
                 "start_date": start_date,
                 "end_date": end_date,
@@ -227,19 +222,15 @@ def _build_response(
 
             "healthy_pixel_count": healthy,
             "healthy_pixel_percentage": percent(healthy),
-            "healthy_pixel_coordinates": pixel_coords(healthy_mask),
 
             "moderate_pixel_count": moderate,
             "moderate_pixel_percentage": percent(moderate),
-            "moderate_pixel_coordinates": pixel_coords(moderate_mask),
 
             "weak_pixel_count": weak,
             "weak_pixel_percentage": percent(weak),
-            "weak_pixel_coordinates": pixel_coords(weak_mask),
 
             "stress_pixel_count": stress,
             "stress_pixel_percentage": percent(stress),
-            "stress_pixel_coordinates": pixel_coords(stress_mask),
 
             "analysis_start_date": start_date,
             "analysis_end_date": end_date,
