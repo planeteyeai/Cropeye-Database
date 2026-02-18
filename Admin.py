@@ -822,102 +822,103 @@ def sync_plots_to_supabase():
     }
 
         
-def run_monthly_backfill_for_plot(plot_name: str, plot_data: dict):
+def run_monthly_backfill_for_plot(plot_name, plot_data):
 
     print(f"📦 Checking historical monthly backfill for {plot_name}", flush=True)
 
     props = plot_data.get("properties") or {}
-    django_id = props.get("django_id")
     plantation_date = props.get("plantation_date")
+    django_id = props.get("django_id")
 
     if not plantation_date:
         print("⚠ Missing plantation_date", flush=True)
         return
 
-    # ---------------- Get plot_id ----------------
+    if not django_id:
+        print("⚠ Missing django_id", flush=True)
+        return
 
+    # Get plot_id from DB
     plot_row = (
         supabase.table("plots")
         .select("id")
-        .eq("plot_name", plot_name)
+        .eq("django_plot_id", django_id)
         .execute()
     )
 
     if not plot_row.data:
-        print("❌ Plot not found in DB", flush=True)
+        print("⚠ Plot not found in DB", flush=True)
         return
 
     plot_id = plot_row.data[0]["id"]
 
-    # ---------------- Find latest stored satellite date ----------------
+    start = datetime.strptime(plantation_date, "%Y-%m-%d").date()
+    today = date.today()
 
-    existing_analysis = (
-        supabase.table("analysis_results")
-        .select("id")
-        .eq("plot_id", plot_id)
-        .eq("analysis_type", "growth")
-        .eq("analysis_date", month_date)
-        .limit(1)
-        .execute()
-    )
+    current_month_start = start.replace(day=1)
 
-    if existing_analysis.data:
-        print("✔ Historical data already up to date")
-        return
+    while current_month_start < today:
 
-    current = start_date.replace(day=1)
+        next_month = current_month_start + relativedelta(months=1)
 
-    while current < today:
+        month_start_str = current_month_start.isoformat()
+        month_end_str = next_month.isoformat()
 
-        month_start = current
-        month_end = current + relativedelta(months=1)
+        # ✅ CHECK analysis_results TABLE (NOT satellite_images)
 
-        print(
-            f"🛰 Fetching monthly data {month_start.date()} → {month_end.date()}",
-            flush=True
+        existing = (
+            supabase.table("analysis_results")
+            .select("id")
+            .eq("plot_id", plot_id)
+            .eq("analysis_type", "growth")
+            .gte("analysis_date", month_start_str)
+            .lt("analysis_date", month_end_str)
+            .limit(1)
+            .execute()
         )
+
+        if existing.data:
+            print("✔ Historical data already up to date", flush=True)
+            current_month_start = next_month
+            continue
+
+        print(f"🛰 Fetching monthly data {month_start_str} → {month_end_str}", flush=True)
 
         try:
             results = run_growth_analysis_by_plot(
                 plot_data=plot_data,
-                start_date=month_start.date().isoformat(),
-                end_date=month_end.date().isoformat()
+                start_date=month_start_str,
+                end_date=month_end_str
             )
 
-            for result in results:
+            for geojson in results:
 
-                # Store satellite metadata
-                supabase.table("satellite_images").upsert(
-                    {
-                        "plot_id": plot_id,
-                        "satellite": result["sensor"],
-                        "satellite_date": result["analysis_date"],
-                    },
-                    on_conflict="plot_id,satellite,satellite_date"
-                ).execute()
+                properties = geojson["features"][0]["properties"]
+                analysis_date = properties["latest_image_date"]
+                sensor_used = properties["data_source"]
+                tile_url = properties["tile_url"]
 
-                # Store analysis
                 supabase.table("analysis_results").upsert(
                     {
                         "plot_id": plot_id,
                         "analysis_type": "growth",
-                        "analysis_date": result["analysis_date"],
-                        "sensor_used": result["sensor"],
-                        "tile_url": result["tile_url"],
-                        "response_json": result["response_json"],
+                        "analysis_date": analysis_date,
+                        "sensor_used": sensor_used,
+                        "tile_url": tile_url,
+                        "response_json": geojson,
                     },
                     on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
                 ).execute()
 
                 print(
-                    f"   ✅ Stored {result['sensor']} ({result['analysis_date']})",
+                    f"   ✅ Stored {sensor_used} ({analysis_date})",
                     flush=True
                 )
 
         except Exception as e:
-            print("🔥 Monthly backfill error:", str(e), flush=True)
+            print(f"❌ Monthly fetch failed: {e}", flush=True)
 
-        current += relativedelta(months=1)
+        current_month_start = next_month
 
     print(f"✅ Monthly backfill completed for {plot_name}", flush=True)
 
