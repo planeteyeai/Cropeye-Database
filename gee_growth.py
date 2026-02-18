@@ -20,7 +20,7 @@ credentials = ee.ServiceAccountCredentials(
 ee.Initialize(credentials, project=service_account_info["project_id"])
 
 # ======================================================
-# Growth Analysis (UNCHANGED LOGIC – MULTI SENSOR RETURN)
+# Growth Analysis (UNCHANGED CORE LOGIC)
 # ======================================================
 
 def run_growth_analysis_by_plot(plot_data, start_date, end_date):
@@ -32,6 +32,7 @@ def run_growth_analysis_by_plot(plot_data, start_date, end_date):
     props = plot_data.get("properties", {})
 
     area_hectares = geometry.area().divide(10000).getInfo()
+    area_acres = round(area_hectares * 2.47105, 2)
 
     analysis_start = ee.Date(start_date)
     analysis_end = ee.Date(end_date)
@@ -39,7 +40,7 @@ def run_growth_analysis_by_plot(plot_data, start_date, end_date):
     results = []
 
     # ======================================================
-    # SENTINEL-2 (UNCHANGED)
+    # SENTINEL-2
     # ======================================================
 
     s2_collection = (
@@ -53,39 +54,36 @@ def run_growth_analysis_by_plot(plot_data, start_date, end_date):
 
     if s2_collection.size().getInfo() > 0:
 
-        latest_s2_image = ee.Image(s2_collection.first())
-        latest_s2_date = ee.Date(latest_s2_image.get("system:time_start"))
-        latest_image_date = latest_s2_date.format("YYYY-MM-dd").getInfo()
+        latest_image = ee.Image(s2_collection.first())
+        latest_date = ee.Date(latest_image.get("system:time_start"))
+        latest_image_date = latest_date.format("YYYY-MM-dd").getInfo()
 
-        ndvi = latest_s2_image.normalizedDifference(["B8", "B4"]).rename("NDVI")
+        ndvi = latest_image.normalizedDifference(["B8", "B4"]).rename("NDVI")
 
         weak_mask = ndvi.gte(0.2).And(ndvi.lt(0.4))
         stress_mask = ndvi.gte(0.0).And(ndvi.lt(0.2))
         moderate_mask = ndvi.gte(0.4).And(ndvi.lt(0.6))
         healthy_mask = ndvi.gte(0.6)
 
-        data_source = "Sentinel-2 NDVI"
-        sensor = "Sentinel-2"
-
         result = _build_response(
             geometry,
             props,
-            area_hectares,
+            area_acres,
             weak_mask,
             stress_mask,
             moderate_mask,
             healthy_mask,
             latest_image_date,
-            data_source,
-            sensor,
+            "Sentinel-2 NDVI",
             start_date,
-            end_date
+            end_date,
+            s2_collection.size().getInfo()
         )
 
         results.append(result)
 
     # ======================================================
-    # SENTINEL-1 (UNCHANGED)
+    # SENTINEL-1
     # ======================================================
 
     s1_collection = (
@@ -101,33 +99,30 @@ def run_growth_analysis_by_plot(plot_data, start_date, end_date):
 
     if s1_collection.size().getInfo() > 0:
 
-        latest_s1_image = ee.Image(s1_collection.first())
-        latest_s1_date = ee.Date(latest_s1_image.get("system:time_start"))
-        latest_image_date = latest_s1_date.format("YYYY-MM-dd").getInfo()
+        latest_image = ee.Image(s1_collection.first())
+        latest_date = ee.Date(latest_image.get("system:time_start"))
+        latest_image_date = latest_date.format("YYYY-MM-dd").getInfo()
 
-        vh = latest_s1_image.select("VH")
+        vh = latest_image.select("VH")
 
         weak_mask = vh.gte(-11)
         stress_mask = vh.lt(-11).And(vh.gt(-13))
         moderate_mask = vh.lte(-13).And(vh.gt(-15))
         healthy_mask = vh.lte(-15)
 
-        data_source = "Sentinel-1 VH"
-        sensor = "Sentinel-1"
-
         result = _build_response(
             geometry,
             props,
-            area_hectares,
+            area_acres,
             weak_mask,
             stress_mask,
             moderate_mask,
             healthy_mask,
             latest_image_date,
-            data_source,
-            sensor,
+            "Sentinel-1 VH",
             start_date,
-            end_date
+            end_date,
+            s1_collection.size().getInfo()
         )
 
         results.append(result)
@@ -139,25 +134,25 @@ def run_growth_analysis_by_plot(plot_data, start_date, end_date):
 
 
 # ======================================================
-# SHARED RESPONSE BUILDER (NO LOGIC CHANGED)
+# STANDARDIZED RESPONSE BUILDER (FRONTEND SAFE)
 # ======================================================
 
 def _build_response(
     geometry,
     props,
-    area_hectares,
+    area_acres,
     weak_mask,
     stress_mask,
     moderate_mask,
     healthy_mask,
     latest_image_date,
     data_source,
-    sensor,
     start_date,
-    end_date
+    end_date,
+    image_count
 ):
 
-    combined_class = (
+    combined = (
         ee.Image(0)
         .where(weak_mask, 1)
         .where(stress_mask, 2)
@@ -166,13 +161,11 @@ def _build_response(
         .clip(geometry)
     )
 
-    combined_smooth = combined_class.focal_mean(radius=10, units="meters")
-
     tile_url = (
-        combined_smooth.visualize(
+        combined.visualize(
             min=0,
             max=4,
-            palette=["#bc1e29", "#58cf54", "#28ae31", "#056c3e"]
+            palette=["#bc1e29", "#f39c12", "#58cf54", "#056c3e"]
         )
         .getMapId()["tile_fetcher"]
         .url_format
@@ -187,11 +180,30 @@ def _build_response(
             .get("constant")
         )
 
+    def pixel_coords(mask):
+        vectors = (
+            mask.selfMask()
+            .reduceToVectors(
+                geometry=geometry,
+                scale=10,
+                geometryType="centroid",
+                bestEffort=True
+            )
+            .getInfo()
+        )
+        coords = []
+        for f in vectors["features"]:
+            coords.append(f["geometry"]["coordinates"])
+        return coords
+
     healthy = pixel_count(healthy_mask).getInfo() or 0
     moderate = pixel_count(moderate_mask).getInfo() or 0
     weak = pixel_count(weak_mask).getInfo() or 0
     stress = pixel_count(stress_mask).getInfo() or 0
     total = healthy + moderate + weak + stress
+
+    def percent(val):
+        return (val / total * 100) if total > 0 else 0
 
     geojson = {
         "type": "FeatureCollection",
@@ -200,7 +212,11 @@ def _build_response(
             "geometry": geometry.getInfo(),
             "properties": {
                 "plot_name": props.get("plot_name"),
-                "area_hectares": round(area_hectares, 2),
+                "area_acres": area_acres,
+                "start_date": start_date,
+                "end_date": end_date,
+                "image_count": image_count,
+                "tile_url": tile_url,
                 "data_source": data_source,
                 "latest_image_date": latest_image_date,
                 "last_updated": datetime.utcnow().isoformat()
@@ -208,19 +224,27 @@ def _build_response(
         }],
         "pixel_summary": {
             "total_pixel_count": total,
+
             "healthy_pixel_count": healthy,
+            "healthy_pixel_percentage": percent(healthy),
+            "healthy_pixel_coordinates": pixel_coords(healthy_mask),
+
             "moderate_pixel_count": moderate,
+            "moderate_pixel_percentage": percent(moderate),
+            "moderate_pixel_coordinates": pixel_coords(moderate_mask),
+
             "weak_pixel_count": weak,
+            "weak_pixel_percentage": percent(weak),
+            "weak_pixel_coordinates": pixel_coords(weak_mask),
+
             "stress_pixel_count": stress,
+            "stress_pixel_percentage": percent(stress),
+            "stress_pixel_coordinates": pixel_coords(stress_mask),
+
             "analysis_start_date": start_date,
             "analysis_end_date": end_date,
             "latest_image_date": latest_image_date
         }
     }
 
-    return {
-        "analysis_date": latest_image_date,
-        "sensor": sensor,
-        "tile_url": tile_url,
-        "response_json": geojson
-    }
+    return geojson
