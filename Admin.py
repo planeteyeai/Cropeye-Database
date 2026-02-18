@@ -865,21 +865,35 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         month_end_str = next_month.isoformat()
 
         # ✅ CHECK analysis_results TABLE (NOT satellite_images)
-        existing = (
+        existing_s1 = (
             supabase.table("analysis_results")
             .select("id")
             .eq("plot_id", plot_id)
             .eq("analysis_type", "growth")
+            .eq("sensor_used", "Sentinel-1 VH")
             .gte("analysis_date", month_start_str)
             .lt("analysis_date", month_end_str)
             .limit(1)
             .execute()
         )
 
-        if existing.data:
-            print("✔ Historical data already up to date", flush=True)
+        existing_s2 = (
+            supabase.table("analysis_results")
+            .select("id")
+            .eq("plot_id", plot_id)
+            .eq("analysis_type", "growth")
+            .eq("sensor_used", "Sentinel-2 NDVI")
+            .gte("analysis_date", month_start_str)
+            .lt("analysis_date", month_end_str)
+            .limit(1)
+            .execute()
+        )
+
+        if existing_s1.data and existing_s2.data:
+            print("✔ Both sensors already stored for this month", flush=True)
             current_month_start = next_month
             continue
+
 
         print(f"🛰 Fetching monthly data {month_start_str} → {month_end_str}", flush=True)
 
