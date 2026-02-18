@@ -838,7 +838,10 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         print("⚠ Missing django_id", flush=True)
         return
 
+    # --------------------------------------------------
     # Get plot_id from DB
+    # --------------------------------------------------
+
     plot_row = (
         supabase.table("plots")
         .select("id")
@@ -857,6 +860,10 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
 
     current_month_start = start.replace(day=1)
 
+    # --------------------------------------------------
+    # MONTH LOOP
+    # --------------------------------------------------
+
     while current_month_start < today:
 
         next_month = current_month_start + relativedelta(months=1)
@@ -864,7 +871,10 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         month_start_str = current_month_start.isoformat()
         month_end_str = next_month.isoformat()
 
-        # ✅ CHECK analysis_results TABLE (NOT satellite_images)
+        # --------------------------------------------------
+        # Check existing sensor-wise
+        # --------------------------------------------------
+
         existing_s1 = (
             supabase.table("analysis_results")
             .select("id")
@@ -894,15 +904,24 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
             current_month_start = next_month
             continue
 
-
         print(f"🛰 Fetching monthly data {month_start_str} → {month_end_str}", flush=True)
+
+        # --------------------------------------------------
+        # RUN GROWTH ANALYSIS (FIXED CALL)
+        # --------------------------------------------------
 
         try:
             results = run_growth_analysis_by_plot(
+                plot_name=plot_name,   # ✅ FIXED
                 plot_data=plot_data,
                 start_date=month_start_str,
                 end_date=month_end_str
             )
+
+            if not results:
+                print("⚠ No results returned", flush=True)
+                current_month_start = next_month
+                continue
 
             for geojson in results:
 
@@ -911,7 +930,6 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                 sensor_used = properties["data_source"]
                 tile_url = properties["tile_url"]
 
-                # ✅ SAFE UPSERT WITH ERROR CHECK
                 response = supabase.table("analysis_results").upsert(
                     {
                         "plot_id": plot_id,
@@ -927,10 +945,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                 if hasattr(response, "error") and response.error:
                     print("❌ Supabase insert error:", response.error, flush=True)
                 else:
-                    print(
-                        f"   ✅ Stored {sensor_used} ({analysis_date})",
-                        flush=True
-                    )
+                    print(f"   ✅ Stored {sensor_used} ({analysis_date})", flush=True)
 
         except Exception as e:
             print(f"❌ Monthly fetch failed: {e}", flush=True)
