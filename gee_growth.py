@@ -193,12 +193,7 @@ def _build_response(
         return (val / total * 100) if total > 0 else 0
 
     # ✅ FIXED plot_name fallback logic
-    plot_name = (
-        props.get("plot_name")
-        or props.get("name")
-        or props.get("django_id")
-        or "Unknown Plot"
-    )
+    properties["plot_name"] = plot_name
 
     geojson = {
         "type": "FeatureCollection",
