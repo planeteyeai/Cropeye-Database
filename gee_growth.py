@@ -20,7 +20,7 @@ credentials = ee.ServiceAccountCredentials(
 ee.Initialize(credentials, project=service_account_info["project_id"])
 
 # ======================================================
-# Growth Analysis (UNCHANGED CORE LOGIC)
+# Growth Analysis
 # ======================================================
 
 def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
@@ -60,13 +60,13 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
         ndvi = latest_image.normalizedDifference(["B8", "B4"]).rename("NDVI")
 
-        # ✅ PRIORITY FIXED (stress evaluated first)
         stress_mask = ndvi.gte(0.0).And(ndvi.lt(0.2))
         weak_mask = ndvi.gte(0.2).And(ndvi.lt(0.35))
         moderate_mask = ndvi.gte(0.35).And(ndvi.lt(0.6))
         healthy_mask = ndvi.gte(0.6)
 
         result = _build_response(
+            plot_name,
             geometry,
             props,
             area_acres,
@@ -106,13 +106,13 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
         vh = latest_image.select("VH")
 
-        # ✅ PRIORITY FIXED (stress stronger band separation)
         stress_mask = vh.gt(-13)
         weak_mask = vh.lte(-13).And(vh.gt(-15))
         moderate_mask = vh.lte(-15).And(vh.gt(-17))
         healthy_mask = vh.lte(-17)
 
         result = _build_response(
+            plot_name,
             geometry,
             props,
             area_acres,
@@ -136,10 +136,11 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
 
 # ======================================================
-# STANDARDIZED RESPONSE BUILDER (FRONTEND SAFE)
+# RESPONSE BUILDER
 # ======================================================
 
 def _build_response(
+    plot_name,
     geometry,
     props,
     area_acres,
@@ -154,7 +155,6 @@ def _build_response(
     image_count
 ):
 
-    # ✅ PRIORITY ORDER FIXED
     combined = (
         ee.Image(0)
         .where(stress_mask, 2)
@@ -191,9 +191,6 @@ def _build_response(
 
     def percent(val):
         return (val / total * 100) if total > 0 else 0
-
-    # ✅ FIXED plot_name fallback logic
-    properties["plot_name"] = plot_name
 
     geojson = {
         "type": "FeatureCollection",
