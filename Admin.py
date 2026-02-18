@@ -851,25 +851,18 @@ def run_monthly_backfill_for_plot(plot_name: str, plot_data: dict):
 
     # ---------------- Find latest stored satellite date ----------------
 
-    sat_row = (
-        supabase.table("satellite_images")
-        .select("satellite_date")
+    existing_analysis = (
+        supabase.table("analysis_results")
+        .select("id")
         .eq("plot_id", plot_id)
-        .order("satellite_date", desc=True)
+        .eq("analysis_type", "growth")
+        .eq("analysis_date", month_date)
         .limit(1)
         .execute()
     )
 
-    if sat_row.data:
-        last_date = sat_row.data[0]["satellite_date"]
-        start_date = datetime.fromisoformat(last_date) + relativedelta(months=1)
-    else:
-        start_date = datetime.fromisoformat(plantation_date)
-
-    today = datetime.utcnow()
-
-    if start_date >= today:
-        print("✔ Historical data already up to date", flush=True)
+    if existing_analysis.data:
+        print("✔ Historical data already up to date")
         return
 
     current = start_date.replace(day=1)
