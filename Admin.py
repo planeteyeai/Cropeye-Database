@@ -767,60 +767,6 @@ def verify_worker(token):
     if not token or (token != WORKER_TOKEN and token != "local-dev"):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-@app.post("/sync_plots_to_supabase", tags=["Admin"])
-def sync_plots_to_supabase():
-    """
-    Sync all plots from Django/GEE memory into Supabase PostGIS plots table
-    """
-    inserted = 0
-    skipped = 0
-    errors = 0
-
-    for name, data in plot_dict.items():
-        try:
-            geom = data["geometry"]
-            geom_geojson = geom.getInfo()
-
-            # Check if exists
-            res = supabase.table("plots") \
-                .select("id") \
-                .eq("plot_name", name) \
-                .limit(1) \
-                .execute()
-
-            if res.data:
-                skipped += 1
-                continue
-
-            # Convert GeoJSON → WKT
-            coords = geom_geojson["coordinates"][0]
-            wkt = "POLYGON((" + ",".join(
-                [f"{lng} {lat}" for lng, lat in coords]
-            ) + "))"
-
-            area_ha = float(geom.area().divide(10000).getInfo())
-
-            # Insert
-            supabase.table("plots").insert({
-                "plot_name": name,
-                "geom": f"SRID=4326;{wkt}",
-                "geojson": geom_geojson,
-                "area_hectares": area_ha
-            }).execute()
-
-            inserted += 1
-
-        except Exception as e:
-            print(f"❌ Error inserting {name}: {e}")
-            errors += 1
-
-    return {
-        "inserted": inserted,
-        "skipped": skipped,
-        "errors": errors,
-        "total": len(plot_dict)
-    }
-
         
 def run_monthly_backfill_for_plot(plot_name, plot_data):
 
@@ -925,14 +871,13 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
 
             # ✅ LOOP through Sentinel-1 & Sentinel-2 results
             for geojson in results:
-
                 properties = geojson["features"][0]["properties"]
 
                 analysis_date = properties["latest_image_date"]
                 sensor_used = properties["data_source"]
                 tile_url = properties["tile_url"]
 
-                response = supabase.table("analysis_results").upsert(
+                supabase.table("analysis_results").upsert(
                     {
                         "plot_id": plot_id,
                         "analysis_type": "growth",
@@ -943,6 +888,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                     },
                     on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
                 ).execute()
+
 
                 if hasattr(response, "error") and response.error:
                     print("❌ Supabase insert error:", response.error, flush=True)
