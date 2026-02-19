@@ -23,211 +23,171 @@ ee.Initialize(credentials, project=service_account_info["project_id"])
 # Growth Analysis
 # ======================================================
 
-def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
-
-    if not plot_data or "geometry" not in plot_data:
-        raise ValueError("plot_data missing geometry")
+def run_growth_analysis_by_plot(plot_data, start_date, end_date):
 
     geometry = plot_data["geometry"]
-    props = plot_data.get("properties", {})
+    properties = plot_data.get("properties", {})
+    plot_name = properties.get("plot_name", "Unknown")
+    area_acres = properties.get("area_acres", 0)
 
-    area_hectares = geometry.area().divide(10000).getInfo()
-    area_acres = round(area_hectares * 2.47105, 2)
+    polygon = ee.Geometry(geometry)
 
-    analysis_start = ee.Date(start_date)
-    analysis_end = ee.Date(end_date)
+    # ==============================
+    # Sentinel-2 NDVI
+    # ==============================
 
-    results = []
-
-    # ======================================================
-    # SENTINEL-2
-    # ======================================================
-
-    s2_collection = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-        .filterBounds(geometry)
-        .filterDate(analysis_start, analysis_end)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
-        .map(lambda img: img.clip(geometry))
-        .sort("system:time_start", False)
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR")
+        .filterBounds(polygon)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+        .map(lambda img: img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
     )
 
-    if s2_collection.size().getInfo() > 0:
+    image_count = s2.size().getInfo()
 
-        latest_image = ee.Image(s2_collection.first())
-        latest_date = ee.Date(latest_image.get("system:time_start"))
-        latest_image_date = latest_date.format("YYYY-MM-dd").getInfo()
+    if image_count == 0:
+        return []
 
-        ndvi = latest_image.normalizedDifference(["B8", "B4"]).rename("NDVI")
+    latest_image = s2.sort("system:time_start", False).first()
+    latest_date = datetime.utcfromtimestamp(
+        latest_image.get("system:time_start").getInfo() / 1000
+    ).strftime("%Y-%m-%d")
 
-        stress_mask = ndvi.gte(0.0).And(ndvi.lt(0.2))
-        weak_mask = ndvi.gte(0.2).And(ndvi.lt(0.35))
-        moderate_mask = ndvi.gte(0.35).And(ndvi.lt(0.6))
-        healthy_mask = ndvi.gte(0.6)
+    ndvi = latest_image.select("NDVI")
 
-        result = _build_response(
-            plot_name,
-            geometry,
-            props,
-            area_acres,
-            weak_mask,
-            stress_mask,
-            moderate_mask,
-            healthy_mask,
-            latest_image_date,
-            "Sentinel-2 NDVI",
-            start_date,
-            end_date,
-            s2_collection.size().getInfo()
+    # ==============================
+    # Pixel classification
+    # ==============================
+
+    healthy = ndvi.gte(0.6)
+    moderate = ndvi.gte(0.4).And(ndvi.lt(0.6))
+    weak = ndvi.gte(0.2).And(ndvi.lt(0.4))
+    stress = ndvi.lt(0.2)
+
+    scale = 10
+
+    total_pixels = ndvi.reduceRegion(
+        reducer=ee.Reducer.count(),
+        geometry=polygon,
+        scale=scale,
+        maxPixels=1e13,
+    ).get("NDVI")
+
+    healthy_pixels = healthy.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=polygon,
+        scale=scale,
+        maxPixels=1e13,
+    ).get("NDVI")
+
+    moderate_pixels = moderate.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=polygon,
+        scale=scale,
+        maxPixels=1e13,
+    ).get("NDVI")
+
+    weak_pixels = weak.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=polygon,
+        scale=scale,
+        maxPixels=1e13,
+    ).get("NDVI")
+
+    stress_pixels = stress.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=polygon,
+        scale=scale,
+        maxPixels=1e13,
+    ).get("NDVI")
+
+    total = total_pixels.getInfo() or 0
+    healthy_count = healthy_pixels.getInfo() or 0
+    moderate_count = moderate_pixels.getInfo() or 0
+    weak_count = weak_pixels.getInfo() or 0
+    stress_count = stress_pixels.getInfo() or 0
+
+    # ==============================
+    # Pixel coordinates extraction
+    # ==============================
+
+    def extract_coordinates(mask_image):
+        vectors = mask_image.selfMask().reduceToVectors(
+            geometry=polygon,
+            scale=scale,
+            geometryType="centroid",
+            maxPixels=1e13,
         )
+        features = vectors.getInfo()["features"]
+        return [
+            f["geometry"]["coordinates"]
+            for f in features
+        ]
 
-        results.append(result)
+    healthy_coords = extract_coordinates(healthy)
+    moderate_coords = extract_coordinates(moderate)
+    weak_coords = extract_coordinates(weak)
+    stress_coords = extract_coordinates(stress)
 
-    # ======================================================
-    # SENTINEL-1
-    # ======================================================
+    # ==============================
+    # Tile URL
+    # ==============================
 
-    s1_collection = (
-        ee.ImageCollection("COPERNICUS/S1_GRD")
-        .filterBounds(geometry)
-        .filterDate(analysis_start, analysis_end)
-        .filter(ee.Filter.eq("instrumentMode", "IW"))
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
-        .select(["VH"])
-        .map(lambda img: img.clip(geometry))
-        .sort("system:time_start", False)
-    )
+    vis = {"min": 0, "max": 1, "palette": ["red", "yellow", "green"]}
 
-    if s1_collection.size().getInfo() > 0:
+    map_id = ndvi.getMapId(vis)
+    tile_url = map_id["tile_fetcher"].url_format
 
-        latest_image = ee.Image(s1_collection.first())
-        latest_date = ee.Date(latest_image.get("system:time_start"))
-        latest_image_date = latest_date.format("YYYY-MM-dd").getInfo()
-
-        vh = latest_image.select("VH")
-
-        stress_mask = vh.gt(-13)
-        weak_mask = vh.lte(-13).And(vh.gt(-15))
-        moderate_mask = vh.lte(-15).And(vh.gt(-17))
-        healthy_mask = vh.lte(-17)
-
-        result = _build_response(
-            plot_name,
-            geometry,
-            props,
-            area_acres,
-            weak_mask,
-            stress_mask,
-            moderate_mask,
-            healthy_mask,
-            latest_image_date,
-            "Sentinel-1 VH",
-            start_date,
-            end_date,
-            s1_collection.size().getInfo()
-        )
-
-        results.append(result)
-
-    if not results:
-        raise Exception("No Sentinel-1 or Sentinel-2 images found")
-
-    return results
-
-
-# ======================================================
-# RESPONSE BUILDER
-# ======================================================
-
-def _build_response(
-    plot_name,
-    geometry,
-    props,
-    area_acres,
-    weak_mask,
-    stress_mask,
-    moderate_mask,
-    healthy_mask,
-    latest_image_date,
-    data_source,
-    start_date,
-    end_date,
-    image_count
-):
-
-    combined = (
-        ee.Image(0)
-        .where(stress_mask, 2)
-        .where(weak_mask, 1)
-        .where(moderate_mask, 3)
-        .where(healthy_mask, 4)
-        .clip(geometry)
-    )
-
-    tile_url = (
-        combined.visualize(
-            min=0,
-            max=4,
-            palette=["#bc1e29", "#f39c12", "#58cf54", "#056c3e"]
-        )
-        .getMapId()["tile_fetcher"]
-        .url_format
-    )
-
-    count_img = ee.Image.constant(1)
-
-    def pixel_count(mask):
-        return (
-            count_img.updateMask(mask)
-            .reduceRegion(ee.Reducer.count(), geometry, 10, bestEffort=True)
-            .get("constant")
-        )
-
-    healthy = pixel_count(healthy_mask).getInfo() or 0
-    moderate = pixel_count(moderate_mask).getInfo() or 0
-    weak = pixel_count(weak_mask).getInfo() or 0
-    stress = pixel_count(stress_mask).getInfo() or 0
-    total = healthy + moderate + weak + stress
-
-    def percent(val):
-        return (val / total * 100) if total > 0 else 0
+    # ==============================
+    # Final Response (MATCHES ADMIN)
+    # ==============================
 
     geojson = {
         "type": "FeatureCollection",
-        "features": [{
-            "type": "Feature",
-            "geometry": geometry.getInfo(),
-            "properties": {
-                "plot_name": plot_name,
-                "area_acres": area_acres,
-                "start_date": start_date,
-                "end_date": end_date,
-                "image_count": image_count,
-                "tile_url": tile_url,
-                "data_source": data_source,
-                "latest_image_date": latest_image_date,
-                "last_updated": datetime.utcnow().isoformat()
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": geometry,
+                "properties": {
+                    "plot_name": plot_name,
+                    "area_acres": area_acres,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "image_count": image_count,
+                    "tile_url": tile_url,
+                    "data_source": "Sentinel-2 NDVI",
+                    "latest_image_date": latest_date,
+                    "last_updated": datetime.utcnow().isoformat(),
+                },
             }
-        }],
+        ],
         "pixel_summary": {
             "total_pixel_count": total,
-
-            "healthy_pixel_count": healthy,
-            "healthy_pixel_percentage": percent(healthy),
-
-            "moderate_pixel_count": moderate,
-            "moderate_pixel_percentage": percent(moderate),
-
-            "weak_pixel_count": weak,
-            "weak_pixel_percentage": percent(weak),
-
-            "stress_pixel_count": stress,
-            "stress_pixel_percentage": percent(stress),
-
+            "healthy_pixel_count": healthy_count,
+            "healthy_pixel_percentage": (healthy_count / total * 100)
+            if total
+            else 0,
+            "healthy_pixel_coordinates": healthy_coords,
+            "moderate_pixel_count": moderate_count,
+            "moderate_pixel_percentage": (moderate_count / total * 100)
+            if total
+            else 0,
+            "moderate_pixel_coordinates": moderate_coords,
+            "weak_pixel_count": weak_count,
+            "weak_pixel_percentage": (weak_count / total * 100)
+            if total
+            else 0,
+            "weak_pixel_coordinates": weak_coords,
+            "stress_pixel_count": stress_count,
+            "stress_pixel_percentage": (stress_count / total * 100)
+            if total
+            else 0,
+            "stress_pixel_coordinates": stress_coords,
             "analysis_start_date": start_date,
             "analysis_end_date": end_date,
-            "latest_image_date": latest_image_date
-        }
+            "latest_image_date": latest_date,
+        },
     }
 
-    return geojson
+    return [geojson]
