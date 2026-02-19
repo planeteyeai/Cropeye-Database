@@ -437,7 +437,12 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         if s1_size == 0 and s2_size == 0:
             return None
 
-        image = s1_collection.median().clip(polygon)
+        image = (
+            s1_collection
+            .select("VH")
+            .median()
+            .clip(polygon)
+        )
 
         less = image.lt(-15)
         adequate = image.gte(-15).And(image.lt(-5))
@@ -557,7 +562,13 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
         if s1.size().getInfo() == 0:
             return None
 
-        image = s1.median().clip(polygon)
+        image = (
+            s1
+            .select("VH")
+            .median()
+            .clip(polygon)
+        )
+
 
         chewing_mask = image.lt(-18)
 
