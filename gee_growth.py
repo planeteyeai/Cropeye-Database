@@ -136,7 +136,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                     "tile_url": tile_url,
                     "data_source": "Sentinel-2 NDVI",
                     "latest_image_date": latest_date,
-                    "last_updated": datetime.datetime.utcnow().isoformat()
+                    "last_updated": datetime.utcnow().isoformat()
                 }
             }],
             "pixel_summary": {
