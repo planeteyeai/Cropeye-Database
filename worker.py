@@ -1,5 +1,10 @@
 from datetime import date, timedelta
-from gee_growth import run_growth_analysis_by_plot
+from gee_growth import (
+    run_growth_analysis_by_plot,
+    run_water_uptake_analysis_by_plot,
+    run_soil_moisture_analysis_by_plot,
+    run_pest_detection_analysis_by_plot
+)
 from shared_services import PlotSyncService, run_plot_sync
 from db import supabase
 from Admin import run_monthly_backfill_for_plot
@@ -9,7 +14,7 @@ from Admin import run_monthly_backfill_for_plot
 # STEP 1 — RUN INTERNAL PLOT SYNC
 # =====================================================
 
-print("🔄 Running internal plot sync before growth...", flush=True)
+print("🔄 Running internal plot sync before analysis...", flush=True)
 
 try:
     sync_result = run_plot_sync()
@@ -19,10 +24,10 @@ except Exception as e:
 
 
 # =====================================================
-# STEP 2 — RUN DAILY GROWTH WORKER
+# STEP 2 — DATE RANGE
 # =====================================================
 
-print("🚀 DAILY GROWTH WORKER STARTED", flush=True)
+print("🚀 DAILY ANALYSIS WORKER STARTED", flush=True)
 
 today = date.today().isoformat()
 start_date = (date.today() - timedelta(days=30)).isoformat()
@@ -39,7 +44,12 @@ for plot_name, plot_data in plots.items():
         print("🔥 Backfill failed for", plot_name, str(e), flush=True)
 
 
+# =====================================================
+# STEP 3 — MAIN LOOP
+# =====================================================
+
 for plot_name, plot_data in plots.items():
+
     print(f"\n--- Processing {plot_name} ---", flush=True)
 
     try:
@@ -66,9 +76,71 @@ for plot_name, plot_data in plots.items():
         plot_id = plot_row.data[0]["id"]
         print("✔ Plot ID:", plot_id, flush=True)
 
-        # ---------------- GEE ANALYSIS ----------------
+        # =====================================================
+        # FUNCTION TO STORE RESULTS (Reusable)
+        # =====================================================
 
-        results = run_growth_analysis_by_plot(
+        def store_results(results, analysis_type):
+
+            if not results:
+                return
+
+            for geojson in results:
+
+                properties = geojson["features"][0]["properties"]
+
+                # Growth structure
+                if analysis_type == "growth":
+                    analysis_date = properties["latest_image_date"]
+                    sensor_used = properties["data_source"]
+
+                # Other endpoints structure
+                else:
+                    analysis_date = properties["analysis_dates"]["latest_image_date"]
+                    sensor_used = properties.get("sensor")
+
+                tile_url = properties["tile_url"]
+
+                # ---------------- SATELLITE TABLE ----------------
+
+                supabase.table("satellite_images").upsert(
+                    {
+                        "plot_id": plot_id,
+                        "satellite": sensor_used,
+                        "satellite_date": analysis_date,
+                    },
+                    on_conflict="plot_id,satellite,satellite_date"
+                ).execute()
+
+                print(
+                    f"   🛰 Satellite stored {sensor_used} ({analysis_date})",
+                    flush=True
+                )
+
+                # ---------------- ANALYSIS TABLE ----------------
+
+                supabase.table("analysis_results").upsert(
+                    {
+                        "plot_id": plot_id,
+                        "analysis_type": analysis_type,
+                        "analysis_date": analysis_date,
+                        "sensor_used": sensor_used,
+                        "tile_url": tile_url,
+                        "response_json": geojson,
+                    },
+                    on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
+                ).execute()
+
+                print(
+                    f"   ✅ Stored {analysis_type} ({sensor_used}) for {analysis_date}",
+                    flush=True
+                )
+
+        # =====================================================
+        # GROWTH
+        # =====================================================
+
+        growth_results = run_growth_analysis_by_plot(
             plot_name,
             plot_data=plot_data,
             start_date=start_date,
@@ -76,49 +148,49 @@ for plot_name, plot_data in plots.items():
         )
 
         print("✔ Growth analysis done", flush=True)
+        store_results(growth_results, "growth")
 
-        for geojson in results:
+        # =====================================================
+        # WATER UPTAKE
+        # =====================================================
 
-            properties = geojson["features"][0]["properties"]
+        water_results = run_water_uptake_analysis_by_plot(
+            plot_name,
+            plot_data=plot_data,
+            start_date=start_date,
+            end_date=end_date
+        )
 
-            analysis_date = properties["latest_image_date"]
-            sensor_used = properties["data_source"]
-            tile_url = properties["tile_url"]
+        print("✔ Water uptake analysis done", flush=True)
+        store_results(water_results, "water_uptake")
 
-            # ---------------- STORE SATELLITE METADATA ----------------
+        # =====================================================
+        # SOIL MOISTURE
+        # =====================================================
 
-            supabase.table("satellite_images").upsert(
-                {
-                    "plot_id": plot_id,
-                    "satellite": sensor_used,
-                    "satellite_date": analysis_date,
-                },
-                on_conflict="plot_id,satellite,satellite_date"
-            ).execute()
+        soil_results = run_soil_moisture_analysis_by_plot(
+            plot_name,
+            plot_data=plot_data,
+            start_date=start_date,
+            end_date=end_date
+        )
 
-            print(
-                f"   🛰 Satellite stored {sensor_used} ({analysis_date})",
-                flush=True
-            )
+        print("✔ Soil moisture analysis done", flush=True)
+        store_results(soil_results, "soil_moisture")
 
-            # ---------------- STORE RESULTS ----------------
+        # =====================================================
+        # PEST DETECTION
+        # =====================================================
 
-            supabase.table("analysis_results").upsert(
-                {
-                    "plot_id": plot_id,
-                    "analysis_type": "growth",
-                    "analysis_date": analysis_date,
-                    "sensor_used": sensor_used,
-                    "tile_url": tile_url,
-                    "response_json": geojson,
-                },
-                on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
-            ).execute()
+        pest_results = run_pest_detection_analysis_by_plot(
+            plot_name,
+            plot_data=plot_data,
+            start_date=start_date,
+            end_date=end_date
+        )
 
-            print(
-                f"   ✅ Stored {sensor_used} for {analysis_date}",
-                flush=True
-            )
+        print("✔ Pest detection analysis done", flush=True)
+        store_results(pest_results, "pest_detection")
 
     except Exception as e:
         print("🔥 ERROR:", str(e), flush=True)
