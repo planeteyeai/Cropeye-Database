@@ -23,7 +23,7 @@ ee.Initialize(credentials, project=service_account_info["project_id"])
 # Growth Analysis
 # ======================================================
 
-def run_growth_analysis_by_plot(plot_name, geometry, start_date, end_date, area_acres=None):
+def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
 
     geometry = plot_data["geometry"]
