@@ -907,45 +907,47 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         print(f"🛰 Fetching monthly data {month_start_str} → {month_end_str}", flush=True)
 
         # --------------------------------------------------
-        # RUN GROWTH ANALYSIS (FIXED)
+        # RUN GROWTH ANALYSIS (FIXED FOR LIST RESPONSE)
         # --------------------------------------------------
 
         try:
-            geojson = run_growth_analysis_by_plot(
+            results = run_growth_analysis_by_plot(
                 plot_name=plot_name,
                 plot_data=plot_data,
                 start_date=month_start_str,
                 end_date=month_end_str
             )
 
-            if not geojson:
+            if not results:
                 print("⚠ No results returned", flush=True)
                 current_month_start = next_month
                 continue
 
-            # ✅ NO LOOP — single object
-            properties = geojson["features"][0]["properties"]
+            # ✅ LOOP through Sentinel-1 & Sentinel-2 results
+            for geojson in results:
 
-            analysis_date = properties["latest_image_date"]
-            sensor_used = properties["data_source"]
-            tile_url = properties["tile_url"]
+                properties = geojson["features"][0]["properties"]
 
-            response = supabase.table("analysis_results").upsert(
-                {
-                    "plot_id": plot_id,
-                    "analysis_type": "growth",
-                    "analysis_date": analysis_date,
-                    "sensor_used": sensor_used,
-                    "tile_url": tile_url,
-                    "response_json": geojson,  # no json.loads/json.dumps needed
-                },
-                on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
-            ).execute()
+                analysis_date = properties["latest_image_date"]
+                sensor_used = properties["data_source"]
+                tile_url = properties["tile_url"]
 
-            if hasattr(response, "error") and response.error:
-                print("❌ Supabase insert error:", response.error, flush=True)
-            else:
-                print(f"   ✅ Stored {sensor_used} ({analysis_date})", flush=True)
+                response = supabase.table("analysis_results").upsert(
+                    {
+                        "plot_id": plot_id,
+                        "analysis_type": "growth",
+                        "analysis_date": analysis_date,
+                        "sensor_used": sensor_used,
+                        "tile_url": tile_url,
+                        "response_json": geojson,
+                    },
+                    on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
+                ).execute()
+
+                if hasattr(response, "error") and response.error:
+                    print("❌ Supabase insert error:", response.error, flush=True)
+                else:
+                    print(f"   ✅ Stored {sensor_used} ({analysis_date})", flush=True)
 
         except Exception as e:
             print(f"❌ Monthly fetch failed: {e}", flush=True)
@@ -953,6 +955,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         current_month_start = next_month
 
     print(f"✅ Monthly backfill completed for {plot_name}", flush=True)
+
 
 
 
