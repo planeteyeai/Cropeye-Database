@@ -25,8 +25,6 @@ ee.Initialize(credentials, project=service_account_info["project_id"])
 
 def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
-    import ee
-    import datetime
 
     try:
         geometry = plot_data.get("geometry")
@@ -41,7 +39,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
         polygon = ee.Geometry(geometry)
 
         s2_collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR")
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
             .filterBounds(polygon)
             .filterDate(start_date, end_date)
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
@@ -128,7 +126,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
             "type": "FeatureCollection",
             "features": [{
                 "type": "Feature",
-                "geometry": geometry,
+                "geometry": geometry.getInfo(),
                 "properties": {
                     "plot_name": plot_name,
                     "area_acres": area_acres,
