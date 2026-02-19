@@ -69,6 +69,7 @@ for plot_name, plot_data in plots.items():
         # ---------------- GEE ANALYSIS ----------------
 
         results = run_growth_analysis_by_plot(
+            plot_name,
             plot_data=plot_data,
             start_date=start_date,
             end_date=end_date
