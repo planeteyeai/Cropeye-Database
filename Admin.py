@@ -21,16 +21,11 @@ from shapely.geometry import shape, Point, Polygon
 from geopy.distance import geodesic
 from shared_services import PlotSyncService
 from db import supabase
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 import httpx
 import traceback
 from gee_growth import run_growth_analysis_by_plot
-from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import timezone
 from dateutil.relativedelta import relativedelta
-UTC = timezone.utc
-scheduler = BackgroundScheduler(timezone=UTC)
 
 
 # Initialize Earth Engine - move this to the top
@@ -853,7 +848,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         print(f"🛰 Fetching monthly data {month_start_str} → {month_end_str}", flush=True)
 
         # --------------------------------------------------
-        # RUN GROWTH ANALYSIS (FIXED FOR LIST RESPONSE)
+        # RUN GROWTH ANALYSIS
         # --------------------------------------------------
 
         try:
@@ -869,7 +864,6 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                 current_month_start = next_month
                 continue
 
-            # ✅ LOOP through Sentinel-1 & Sentinel-2 results
             for geojson in results:
                 properties = geojson["features"][0]["properties"]
 
@@ -877,7 +871,8 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                 sensor_used = properties["data_source"]
                 tile_url = properties["tile_url"]
 
-                supabase.table("analysis_results").upsert(
+                # ✅ FIX IS HERE — assign to response
+                response = supabase.table("analysis_results").upsert(
                     {
                         "plot_id": plot_id,
                         "analysis_type": "growth",
@@ -889,7 +884,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                     on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
                 ).execute()
 
-
+                # ✅ Now this works correctly
                 if hasattr(response, "error") and response.error:
                     print("❌ Supabase insert error:", response.error, flush=True)
                 else:
@@ -901,176 +896,6 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         current_month_start = next_month
 
     print(f"✅ Monthly backfill completed for {plot_name}", flush=True)
-
-
-
-
-def trigger_daily_growth_cron():
-    print("🚀 DAILY GROWTH CRON TRIGGERED")
-
-    try:
-        port = os.environ.get("PORT", "8080")
-        url = f"http://127.0.0.1:{port}/internal/run-daily-cron"
-        r = requests.post(url, params={"dry_run": False, "force": False}, timeout=600)
-        print("[CRON RESPONSE]", r.status_code)
-    except Exception as e:
-        print("[CRON ERROR]", str(e))
-
-
-@app.on_event("startup")
-async def start_crons():
-    print("🔥🔥🔥 FASTAPI STARTUP EVENT FIRED 🔥🔥🔥", flush=True)
-
-    scheduler.add_job(
-        trigger_daily_growth_cron,
-        CronTrigger(minute="*/1"),  # every 1 minute for testing
-        id="daily_growth_cron",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-
-    scheduler.start()
-    print("✅ APSCHEDULER STARTED", flush=True)
-
-
-
-
-@app.post("/internal/run-daily-cron")
-async def run_daily_cron(
-    dry_run: bool = Query(False),
-    force: bool = Query(False),
-):
-    today = date.today().isoformat()
-    start_date = (date.today() - timedelta(days=30)).isoformat()
-    end_date = today
-
-    counters = {
-        "total_plots": 0,
-        "processed": 0,
-        "skipped": 0,
-        "errors": 0
-    }
-
-    logs = {
-        "processed": [],
-        "skipped": [],
-        "errors": []
-    }
-
-    print("🚀 DAILY FULL GROWTH RUN STARTED")
-
-    # ---------------- LOAD PLOTS ----------------
-    plot_service = PlotSyncService()
-    plots = plot_service.get_plots_dict(force_refresh=True)
-    counters["total_plots"] = len(plots)
-
-    for plot_name, plot_data in plots.items():
-        try:
-            props = plot_data.get("properties") or {}
-            django_id = props.get("django_id")
-
-            if not django_id:
-                counters["skipped"] += 1
-                logs["skipped"].append({
-                    "plot": plot_name,
-                    "reason": "missing django_id"
-                })
-                continue
-
-            plot_row = (
-                supabase.table("plots")
-                .select("id")
-                .eq("django_plot_id", django_id)
-                .single()
-                .execute()
-            )
-
-            plot_id = plot_row.data["id"]
-
-            # ---------------- LATEST SAT IMAGE ----------------
-            sat_row = (
-                supabase.table("satellite_images")
-                .select("id,satellite,satellite_date")
-                .eq("plot_id", plot_id)
-                .order("satellite_date", desc=True)
-                .limit(1)
-                .execute()
-            )
-
-            if not sat_row.data:
-                counters["skipped"] += 1
-                logs["skipped"].append({
-                    "plot": plot_name,
-                    "reason": "no satellite image"
-                })
-                continue
-
-            satellite_image = sat_row.data[0]
-
-            # ---------------- DUPLICATE CHECK ----------------
-            exists = (
-                supabase.table("analysis_results")
-                .select("id")
-                .eq("plot_id", plot_id)
-                .eq("satellite_image_id", satellite_image["id"])
-                .eq("analysis_type", "growth")
-                .limit(1)
-                .execute()
-            )
-
-            if exists.data and not force:
-                counters["skipped"] += 1
-                logs["skipped"].append({
-                    "plot": plot_name,
-                    "reason": "already analyzed"
-                })
-                continue
-
-            # ---------------- RUN ANALYSIS ----------------
-            result = run_growth_analysis_by_plot(
-                plot_data=plot_data,
-                start_date=start_date,
-                end_date=end_date
-            )
-
-            if not dry_run:
-                supabase.table("analysis_results").upsert(
-                    {
-                        "plot_id": plot_id,
-                        "satellite_image_id": satellite_image["id"],
-                        "analysis_type": "growth",
-                        "analysis_date": result["analysis_date"],
-                        "sensor_used": result["sensor"],
-                        "tile_url": result["tile_url"],
-                        "response_json": result["response_json"],
-                    },
-                    on_conflict="plot_id,satellite_image_id,analysis_type"
-                ).execute()
-
-            counters["processed"] += 1
-            logs["processed"].append({
-                "plot": plot_name,
-                "satellite": satellite_image["satellite"],
-                "date": today
-            })
-
-        except Exception as e:
-            counters["errors"] += 1
-            logs["errors"].append({
-                "plot": plot_name,
-                "error": str(e)
-            })
-
-    print("✅ DAILY FULL GROWTH RUN COMPLETED", counters)
-
-    return {
-        "status": "done",
-        "date": today,
-        "mode": {"dry_run": dry_run, "force": force},
-        "counters": counters,
-        "details": logs
-    }
 
 
 @app.post("/analyze_Growth")
