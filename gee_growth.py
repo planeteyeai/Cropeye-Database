@@ -46,7 +46,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
             ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
             .filterBounds(polygon)
             .filterDate(start_date, end_date)
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
             .map(lambda img: img.addBands(
                 img.normalizedDifference(["B8", "B4"]).rename("NDVI")
             ))
@@ -71,7 +71,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                 "type": "FeatureCollection",
                 "features": [{
                     "type": "Feature",
-                    "geometry": geometry,
+                    "geometry": geometry.info(),
                     "properties": {
                         "plot_name": plot_name,
                         "area_acres": area_acres,
@@ -123,7 +123,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                 "type": "FeatureCollection",
                 "features": [{
                     "type": "Feature",
-                    "geometry": geometry,
+                    "geometry": geometry.info(),
                     "properties": {
                         "plot_name": plot_name,
                         "area_acres": area_acres,
