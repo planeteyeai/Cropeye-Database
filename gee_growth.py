@@ -36,6 +36,9 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
         polygon = ee.Geometry(geometry)
 
+        # ✅ Convert once here
+        geometry_geojson = polygon.getInfo()
+
         results = []
 
         # =====================================================
@@ -71,7 +74,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                 "type": "FeatureCollection",
                 "features": [{
                     "type": "Feature",
-                    "geometry": geometry,
+                    "geometry": geometry_geojson,   # ✅ FIXED
                     "properties": {
                         "plot_name": plot_name,
                         "area_acres": area_acres,
@@ -123,7 +126,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                 "type": "FeatureCollection",
                 "features": [{
                     "type": "Feature",
-                    "geometry": geometry,
+                    "geometry": geometry_geojson,   # ✅ FIXED
                     "properties": {
                         "plot_name": plot_name,
                         "area_acres": area_acres,
