@@ -23,7 +23,7 @@ from shared_services import PlotSyncService
 from db import supabase
 import httpx
 import traceback
-from gee_growth import run_growth_analysis_by_plot
+from gee_growth import run_growth_analysis_by_plot, run_water_uptake_analysis_by_plot, run_soil_moisture_analysis_by_plot, run_pest_detection_analysis_by_plot
 from datetime import timezone
 from dateutil.relativedelta import relativedelta
 
@@ -801,9 +801,9 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
 
     current_month_start = start.replace(day=1)
 
-    # --------------------------------------------------
+    # ==================================================
     # MONTH LOOP
-    # --------------------------------------------------
+    # ==================================================
 
     while current_month_start < today:
 
@@ -812,90 +812,91 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         month_start_str = current_month_start.isoformat()
         month_end_str = next_month.isoformat()
 
-        # --------------------------------------------------
-        # Check existing sensor-wise
-        # --------------------------------------------------
+        print(f"\n🛰 Processing {month_start_str} → {month_end_str}", flush=True)
 
-        existing_s1 = (
-            supabase.table("analysis_results")
-            .select("id")
-            .eq("plot_id", plot_id)
-            .eq("analysis_type", "growth")
-            .eq("sensor_used", "Sentinel-1 VH")
-            .gte("analysis_date", month_start_str)
-            .lt("analysis_date", month_end_str)
-            .limit(1)
-            .execute()
-        )
+        # ==================================================
+        # HELPER FUNCTION FOR ALL ANALYSIS TYPES
+        # ==================================================
 
-        existing_s2 = (
-            supabase.table("analysis_results")
-            .select("id")
-            .eq("plot_id", plot_id)
-            .eq("analysis_type", "growth")
-            .eq("sensor_used", "Sentinel-2 NDVI")
-            .gte("analysis_date", month_start_str)
-            .lt("analysis_date", month_end_str)
-            .limit(1)
-            .execute()
-        )
+        def process_analysis(analysis_type, analysis_function):
 
-        if existing_s1.data and existing_s2.data:
-            print("✔ Both sensors already stored for this month", flush=True)
-            current_month_start = next_month
-            continue
-
-        print(f"🛰 Fetching monthly data {month_start_str} → {month_end_str}", flush=True)
-
-        # --------------------------------------------------
-        # RUN GROWTH ANALYSIS
-        # --------------------------------------------------
-
-        try:
-            results = run_growth_analysis_by_plot(
-                plot_name=plot_name,
-                plot_data=plot_data,
-                start_date=month_start_str,
-                end_date=month_end_str
+            existing = (
+                supabase.table("analysis_results")
+                .select("id")
+                .eq("plot_id", plot_id)
+                .eq("analysis_type", analysis_type)
+                .gte("analysis_date", month_start_str)
+                .lt("analysis_date", month_end_str)
+                .limit(1)
+                .execute()
             )
 
-            if not results:
-                print("⚠ No results returned", flush=True)
-                current_month_start = next_month
-                continue
+            if existing.data:
+                print(f"✔ {analysis_type} already stored", flush=True)
+                return
 
-            for geojson in results:
-                properties = geojson["features"][0]["properties"]
+            print(f"🔎 Running {analysis_type}", flush=True)
 
-                analysis_date = properties["latest_image_date"]
-                sensor_used = properties["data_source"]
-                tile_url = properties["tile_url"]
+            try:
+                results = analysis_function(
+                    plot_name=plot_name,
+                    plot_data=plot_data,
+                    start_date=month_start_str,
+                    end_date=month_end_str
+                )
 
-                # ✅ FIX IS HERE — assign to response
-                response = supabase.table("analysis_results").upsert(
-                    {
-                        "plot_id": plot_id,
-                        "analysis_type": "growth",
-                        "analysis_date": analysis_date,
-                        "sensor_used": sensor_used,
-                        "tile_url": tile_url,
-                        "response_json": geojson,
-                    },
-                    on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
-                ).execute()
+                if not results:
+                    print(f"⚠ No {analysis_type} results", flush=True)
+                    return
 
-                # ✅ Now this works correctly
-                if hasattr(response, "error") and response.error:
-                    print("❌ Supabase insert error:", response.error, flush=True)
-                else:
-                    print(f"   ✅ Stored {sensor_used} ({analysis_date})", flush=True)
+                for geojson in results:
+                    properties = geojson["features"][0]["properties"]
 
-        except Exception as e:
-            print(f"❌ Monthly fetch failed: {e}", flush=True)
+                    analysis_date = (
+                        properties.get("latest_image_date")
+                        or properties.get("analysis_dates", {}).get("latest_image_date")
+                    )
+
+                    sensor_used = (
+                        properties.get("data_source")
+                        or properties.get("sensor")
+                        or properties.get("sensor_used")
+                    )
+
+                    tile_url = properties.get("tile_url")
+
+                    response = supabase.table("analysis_results").upsert(
+                        {
+                            "plot_id": plot_id,
+                            "analysis_type": analysis_type,
+                            "analysis_date": analysis_date,
+                            "sensor_used": sensor_used,
+                            "tile_url": tile_url,
+                            "response_json": geojson,
+                        },
+                        on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
+                    ).execute()
+
+                    if hasattr(response, "error") and response.error:
+                        print(f"❌ {analysis_type} insert error:", response.error, flush=True)
+                    else:
+                        print(f"   ✅ Stored {analysis_type} ({analysis_date})", flush=True)
+
+            except Exception as e:
+                print(f"🔥 {analysis_type} failed: {e}", flush=True)
+
+        # ==================================================
+        # RUN ALL ANALYSIS TYPES
+        # ==================================================
+
+        process_analysis("growth", run_growth_analysis_by_plot)
+        process_analysis("water_uptake", run_water_uptake_analysis_by_plot)
+        process_analysis("soil_moisture", run_soil_moisture_analysis_by_plot)
+        process_analysis("pest_detection", run_pest_detection_analysis_by_plot)
 
         current_month_start = next_month
 
-    print(f"✅ Monthly backfill completed for {plot_name}", flush=True)
+    print(f"\n✅ Monthly backfill completed for {plot_name}", flush=True)
 
 
 @app.post("/analyze_Growth")
