@@ -255,7 +255,9 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
         analysis_start = ee.Date(start_date)
         analysis_end = ee.Date(end_date)
 
-        # Sentinel-2 NDMI
+        results = []
+
+        # ======================= SENTINEL-2 NDMI =======================
         s2_collection = (
             ee.ImageCollection("COPERNICUS/S2_SR")
             .filterBounds(polygon)
@@ -266,7 +268,44 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             .sort("system:time_start", False)
         )
 
-        # Sentinel-1
+        s2_count = s2_collection.size().getInfo()
+
+        if s2_count > 0:
+
+            ndmi_image = s2_collection.median().clip(polygon)
+
+            deficient = ndmi_image.lt(-0.21)
+            less = ndmi_image.gte(-0.21).And(ndmi_image.lt(-0.031))
+            adequate = ndmi_image.gte(-0.031).And(ndmi_image.lt(0.142))
+            excellent = ndmi_image.gte(0.14).And(ndmi_image.lt(0.22))
+            excess = ndmi_image.gte(0.22)
+
+            combined = (
+                ee.Image(0)
+                .where(deficient, 1)
+                .where(less, 2)
+                .where(adequate, 3)
+                .where(excellent, 4)
+                .where(excess, 5)
+                .clip(polygon)
+            )
+
+            tile_url = combined.getMapId()["tile_fetcher"].url_format
+
+            latest_s2_image = ee.Image(s2_collection.first())
+            latest_s2_date = ee.Date(
+                latest_s2_image.get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
+
+            results.append(build_water_result(
+                plot_name, geom_type, original_coords,
+                combined, polygon, tile_url,
+                "s2", s2_count,
+                start_date, end_date,
+                latest_s2_date, None
+            ))
+
+        # ======================= SENTINEL-1 =======================
         s1_collection = (
             ee.ImageCollection("COPERNICUS/S1_GRD")
             .filterBounds(polygon)
@@ -277,131 +316,147 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             .sort("system:time_start", False)
         )
 
-        s2_count = s2_collection.size().getInfo()
         s1_count = s1_collection.size().getInfo()
 
-        if s2_count == 0 and s1_count == 0:
-            return None
+        if s1_count >= 2:
 
-        # Use Sentinel-1 logic for classification (same as your sample)
-        image_list = s1_collection.toList(2)
-        latest_image = ee.Image(image_list.get(0))
-        previous_image = ee.Image(image_list.get(1)) if s1_count > 1 else latest_image
+            image_list = s1_collection.toList(2)
+            latest_image = ee.Image(image_list.get(0))
+            previous_image = ee.Image(image_list.get(1))
 
-        delta_vh = latest_image.subtract(previous_image).rename("deltaVH").clip(polygon)
+            delta_vh = latest_image.subtract(previous_image).rename("deltaVH").clip(polygon)
 
-        deficient = delta_vh.lt(-3.13)
-        less = delta_vh.gte(-3.13).And(delta_vh.lte(-0.1))
-        adequate = delta_vh.gt(-0.1).And(delta_vh.lt(4))
-        excellent = delta_vh.gte(4).And(delta_vh.lt(6))
-        excess = delta_vh.gte(6)
+            deficient = delta_vh.lt(-3.13)
+            less = delta_vh.gte(-3.13).And(delta_vh.lte(-0.1))
+            adequate = delta_vh.gt(-0.1).And(delta_vh.lt(4))
+            excellent = delta_vh.gte(4).And(delta_vh.lt(6))
+            excess = delta_vh.gte(6)
 
-        combined = (
-            ee.Image(0)
-            .where(deficient, 1)
-            .where(less, 2)
-            .where(adequate, 3)
-            .where(excellent, 4)
-            .where(excess, 5)
-            .clip(polygon)
-        )
-
-        tile_url = combined.getMapId()["tile_fetcher"].url_format
-
-        def get_mask_data(mask):
-            count = (
-                ee.Image.constant(1)
-                .updateMask(mask)
-                .reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
-                .get("constant")
-                .getInfo() or 0
+            combined = (
+                ee.Image(0)
+                .where(deficient, 1)
+                .where(less, 2)
+                .where(adequate, 3)
+                .where(excellent, 4)
+                .where(excess, 5)
+                .clip(polygon)
             )
 
-            samples = (
-                mask.selfMask()
-                .addBands(ee.Image.pixelLonLat())
-                .sample(region=polygon, scale=10, geometries=True)
-                .getInfo()
-            )
+            tile_url = combined.getMapId()["tile_fetcher"].url_format
 
-            coords = [f["geometry"]["coordinates"] for f in samples.get("features", [])]
-            return count, coords
+            latest_date = ee.Date(
+                latest_image.get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
 
-        total_pixels = (
-            ee.Image.constant(1)
-            .reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
-            .get("constant")
-            .getInfo()
-        )
+            previous_date = ee.Date(
+                previous_image.get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
 
-        deficient_count, deficient_coords = get_mask_data(combined.eq(1))
-        less_count, less_coords = get_mask_data(combined.eq(2))
-        adequate_count, adequate_coords = get_mask_data(combined.eq(3))
-        excellent_count, excellent_coords = get_mask_data(combined.eq(4))
-        excess_count, excess_coords = get_mask_data(combined.eq(5))
+            results.append(build_water_result(
+                plot_name, geom_type, original_coords,
+                combined, polygon, tile_url,
+                "s1", s1_count,
+                start_date, end_date,
+                latest_date, previous_date
+            ))
 
-        def percent(x):
-            return (x / total_pixels * 100) if total_pixels else 0
-
-        feature = {
-            "type": "Feature",
-            "geometry": {"type": geom_type, "coordinates": original_coords},
-            "properties": {
-                "plot_name": plot_name,
-                "tile_url": tile_url,
-                "sensor": "s1",
-                "image_count_in_range": s1_count,
-                "analysis_dates": {
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "latest_image_date": ee.Date(
-                        latest_image.get("system:time_start")
-                    ).format("YYYY-MM-dd").getInfo(),
-                    "previous_image_date": ee.Date(
-                        previous_image.get("system:time_start")
-                    ).format("YYYY-MM-dd").getInfo()
-                },
-                "last_updated": datetime.utcnow().isoformat(),
-            },
-        }
-
-        result = {
-            "type": "FeatureCollection",
-            "features": [feature],
-            "pixel_summary": {
-                "total_pixel_count": total_pixels,
-
-                "deficient_pixel_count": deficient_count,
-                "deficient_pixel_percentage": percent(deficient_count),
-                "deficient_pixel_coordinates": deficient_coords,
-
-                "less_pixel_count": less_count,
-                "less_pixel_percentage": percent(less_count),
-                "less_pixel_coordinates": less_coords,
-
-                "adequat_pixel_count": adequate_count,
-                "adequat_pixel_percentage": percent(adequate_count),
-                "adequat_pixel_coordinates": adequate_coords,
-
-                "excellent_pixel_count": excellent_count,
-                "excellent_pixel_percentage": percent(excellent_count),
-                "excellent_pixel_coordinates": excellent_coords,
-
-                "excess_pixel_count": excess_count,
-                "excess_pixel_percentage": percent(excess_count),
-                "excess_pixel_coordinates": excess_coords,
-
-                "analysis_start_date": start_date,
-                "analysis_end_date": end_date,
-            }
-        }
-
-        return [result]
+        return results if results else None
 
     except Exception as e:
         print("❌ Water uptake failed:", e, flush=True)
         return None
 
+def build_water_result(
+    plot_name, geom_type, original_coords,
+    combined, polygon, tile_url,
+    sensor, image_count,
+    start_date, end_date,
+    latest_image_date, previous_image_date
+):
+
+    count_image = ee.Image.constant(1)
+
+    def get_mask_data(mask):
+        count = (
+            count_image.updateMask(mask)
+            .reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
+            .get("constant")
+            .getInfo() or 0
+        )
+
+        samples = (
+            mask.selfMask()
+            .addBands(ee.Image.pixelLonLat())
+            .sample(region=polygon, scale=10, geometries=True)
+            .getInfo()
+        )
+
+        coords = [f["geometry"]["coordinates"] for f in samples.get("features", [])]
+        return count, coords
+
+    total_pixels = (
+        count_image.reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
+        .get("constant")
+        .getInfo()
+    )
+
+    deficient_count, deficient_coords = get_mask_data(combined.eq(1))
+    less_count, less_coords = get_mask_data(combined.eq(2))
+    adequate_count, adequate_coords = get_mask_data(combined.eq(3))
+    excellent_count, excellent_coords = get_mask_data(combined.eq(4))
+    excess_count, excess_coords = get_mask_data(combined.eq(5))
+
+    def percent(x):
+        return (x / total_pixels * 100) if total_pixels else 0
+
+    feature = {
+        "type": "Feature",
+        "geometry": {"type": geom_type, "coordinates": original_coords},
+        "properties": {
+            "plot_name": plot_name,
+            "tile_url": tile_url,
+            "sensor": sensor,
+            "image_count_in_range": image_count,
+            "analysis_dates": {
+                "start_date": start_date,
+                "end_date": end_date,
+                "latest_image_date": latest_image_date,
+                "previous_image_date": previous_image_date
+            },
+            "last_updated": datetime.utcnow().isoformat(),
+        },
+    }
+
+    return {
+        "type": "FeatureCollection",
+        "features": [feature],
+        "pixel_summary": {
+            "total_pixel_count": total_pixels,
+
+            "deficient_pixel_count": deficient_count,
+            "deficient_pixel_percentage": percent(deficient_count),
+            "deficient_pixel_coordinates": deficient_coords,
+
+            "less_pixel_count": less_count,
+            "less_pixel_percentage": percent(less_count),
+            "less_pixel_coordinates": less_coords,
+
+            "adequat_pixel_count": adequate_count,
+            "adequat_pixel_percentage": percent(adequate_count),
+            "adequat_pixel_coordinates": adequate_coords,
+
+            "excellent_pixel_count": excellent_count,
+            "excellent_pixel_percentage": percent(excellent_count),
+            "excellent_pixel_coordinates": excellent_coords,
+
+            "excess_pixel_count": excess_count,
+            "excess_pixel_percentage": percent(excess_count),
+            "excess_pixel_coordinates": excess_coords,
+
+            "analysis_start_date": start_date,
+            "analysis_end_date": end_date,
+        }
+    }
 
 # ==========================================================
 # SOIL MOISTURE (FULL PIXEL STRUCTURE MATCHING YOUR SAMPLE)
@@ -414,20 +469,21 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         geom_type = plot_data["geom_type"]
         original_coords = plot_data["original_coords"]
 
-        polygon = ee.Geometry(geometry)
-
         # ==================== SENTINEL-1 ====================
         s1_collection = (
-            ee.ImageCollection("COPERNICUS/S1_GRD")
-            .filterBounds(polygon)
-            .filterDate(start_date, end_date)
+            filter_s1(
+                ee.ImageCollection("COPERNICUS/S1_GRD"),
+                start_date, end_date, geometry
+            )
+            .map(addIndices)
         )
 
         s1_size = s1_collection.size().getInfo()
         s1_latest_date = None
 
         if s1_size > 0:
-            s1_latest_img = s1_collection.sort("system:time_start", False).first()
+            s1_sorted = s1_collection.sort("system:time_start", False)
+            s1_latest_img = ee.Image(s1_sorted.first())
             s1_latest_date = ee.Date(
                 s1_latest_img.get("system:time_start")
             ).format("YYYY-MM-dd").getInfo()
@@ -435,46 +491,49 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         # ==================== SENTINEL-2 ====================
         s2_collection = (
             ee.ImageCollection("COPERNICUS/S2_SR")
-            .filterBounds(polygon)
+            .filterBounds(geometry)
             .filterDate(start_date, end_date)
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
+            .map(lambda img: img.clip(geometry))
         )
 
         s2_size = s2_collection.size().getInfo()
         s2_latest_date = None
 
         if s2_size > 0:
-            s2_latest_img = s2_collection.sort("system:time_start", False).first()
+            s2_sorted = s2_collection.sort("system:time_start", False)
+            s2_latest_img = ee.Image(s2_sorted.first())
             s2_latest_date = ee.Date(
                 s2_latest_img.get("system:time_start")
             ).format("YYYY-MM-dd").getInfo()
 
+        # ==================== SENSOR SELECTION ====================
         if s1_size == 0 and s2_size == 0:
             return None
 
-        # ==================== SENSOR SELECTION ====================
         if s1_latest_date and s2_latest_date:
             if s2_latest_date >= s1_latest_date:
+                use_sentinel2 = True
                 sensor_used = "Sentinel-2"
                 latest_date = s2_latest_date
-                use_s2 = True
             else:
+                use_sentinel2 = False
                 sensor_used = "Sentinel-1"
                 latest_date = s1_latest_date
-                use_s2 = False
         elif s2_latest_date:
+            use_sentinel2 = True
             sensor_used = "Sentinel-2"
             latest_date = s2_latest_date
-            use_s2 = True
         else:
+            use_sentinel2 = False
             sensor_used = "Sentinel-1"
             latest_date = s1_latest_date
-            use_s2 = False
 
         # ==================== CLASSIFICATION ====================
-        if use_s2:
-            composite = s2_collection.median().clip(polygon)
-            ndwi = composite.normalizedDifference(["B3", "B8"])
+        if use_sentinel2:
+
+            s2_composite = s2_collection.median().clip(geometry)
+            ndwi = s2_composite.normalizedDifference(["B3", "B8"]).rename("NDWI")
 
             classified = (
                 ndwi.where(ndwi.lte(-0.4), 1)
@@ -482,43 +541,83 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
                 .where(ndwi.gt(-0.3).And(ndwi.lte(0)), 3)
                 .where(ndwi.gt(0).And(ndwi.lte(0.2)), 4)
                 .where(ndwi.gt(0.2), 5)
-            )
+            ).clip(geometry)
 
             image_count = s2_size
 
         else:
-            composite = s1_collection.select("VV").median().clip(polygon)
-            vv = composite.select("VV")
+
+            vv_composite = safe_median(
+                s1_collection.select(["VV"])
+            ).clip(geometry)
+
+            vv_band = vv_composite.select("VV")
 
             classified = (
-                vv.where(vv.gt(-6), 5)
-                .where(vv.gt(-8).And(vv.lte(-6)), 4)
-                .where(vv.gt(-10).And(vv.lte(-8)), 3)
-                .where(vv.gt(-12).And(vv.lte(-10)), 2)
-                .where(vv.lte(-12), 1)
-            )
+                vv_band.where(vv_band.gt(-6), 5)
+                .where(vv_band.gt(-8).And(vv_band.lte(-6)), 4)
+                .where(vv_band.gt(-10).And(vv_band.lte(-8)), 3)
+                .where(vv_band.gt(-12).And(vv_band.lte(-10)), 2)
+                .where(vv_band.lte(-12), 1)
+            ).clip(geometry)
 
             image_count = s1_size
 
-        # ==================== PIXEL COUNTS ====================
-        one = ee.Image.constant(1)
-
-        total_pixels = int(
-            one.reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
-            .get("constant")
-            .getInfo()
-        )
-
+        # ==================== VISUALIZATION ====================
         labels = {
             1: "less",
             2: "adequate",
             3: "excellent",
             4: "excess",
-            5: "shallow_water",
+            5: "shallow water",
         }
 
+        palette = [
+            "#2FC0D3",
+            "#4365D4",
+            "#473CDF",
+            "#2116BF",
+            "#000475",
+        ]
+
+        vis_params = {"min": 1, "max": 5, "palette": palette}
+
+        smoothed = classified.focal_mean(radius=20, units="meters")
+        visual = smoothed.visualize(**vis_params).clip(geometry)
+        tile_url = visual.getMapId()["tile_fetcher"].url_format
+
+        # ==================== PIXEL COUNTING ====================
+        count_image = ee.Image.constant(1)
+
+        total_pixel_count = (
+            count_image.reduceRegion(
+                ee.Reducer.count(), geometry, 10, bestEffort=True
+            ).get("constant").getInfo()
+        )
+
+        def get_pixel_count(mask):
+            return (
+                count_image.updateMask(mask)
+                .reduceRegion(
+                    ee.Reducer.count(), geometry, 10, bestEffort=True
+                ).get("constant").getInfo() or 0
+            )
+
+        def mask_to_coords(mask):
+            points = (
+                mask.selfMask()
+                .addBands(ee.Image.pixelLonLat())
+                .sample(region=geometry, scale=10, geometries=True, tileScale=4)
+                .getInfo()
+            )
+            coords = [
+                f["geometry"]["coordinates"]
+                for f in points.get("features", [])
+            ]
+            return [list(x) for x in {tuple(c) for c in coords}]
+
         pixel_summary = {
-            "total_pixel_count": total_pixels,
+            "total_pixel_count": total_pixel_count,
             "start_date": start_date,
             "end_date": end_date,
             "latest_image_date": latest_date,
@@ -530,36 +629,25 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         }
 
         for class_id in range(1, 6):
+
+            label = labels[class_id]
             mask = classified.eq(class_id)
 
-            count = int(
-                one.updateMask(mask)
-                .reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
-                .get("constant")
-                .getInfo()
-                or 0
+            count = get_pixel_count(mask)
+            percent = (
+                (count / total_pixel_count) * 100
+                if total_pixel_count else 0
             )
 
-            coords = (
-                mask.selfMask()
-                .addBands(ee.Image.pixelLonLat())
-                .sample(polygon, 10, geometries=True, tileScale=4)
-                .getInfo()
-            )
+            coords = mask_to_coords(mask)
 
-            coord_list = [
-                f["geometry"]["coordinates"]
-                for f in coords.get("features", [])
-            ]
+            key_base = label.lower().replace(" ", "_")
 
-            key = labels[class_id]
+            pixel_summary[f"{key_base}_pixel_count"] = count
+            pixel_summary[f"{key_base}_pixel_percentage"] = round(percent, 2)
+            pixel_summary[f"{key_base}_pixel_coordinates"] = coords
 
-            pixel_summary[f"{key}_pixel_count"] = count
-            pixel_summary[f"{key}_pixel_percentage"] = (
-                (count / total_pixels) * 100 if total_pixels else 0
-            )
-            pixel_summary[f"{key}_pixel_coordinates"] = coord_list
-
+        # ==================== FEATURE ====================
         feature = {
             "type": "Feature",
             "geometry": {
@@ -573,21 +661,26 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
                 "sensor_used": sensor_used,
                 "latest_image_date": latest_date,
                 "image_count": image_count,
-                "tile_url": classified.visualize(min=1, max=5).getMapId()["tile_fetcher"].url_format,
+                "analysis_dates": {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "latest_image_date": latest_date,
+                },
+                "tile_url": tile_url,
                 "last_updated": datetime.utcnow().isoformat(),
             },
         }
 
-        return [{
+        # ==================== FINAL RESPONSE ====================
+        return {
             "type": "FeatureCollection",
             "features": [feature],
             "pixel_summary": pixel_summary,
-        }]
+        }
 
     except Exception as e:
         print("❌ Soil moisture failed:", e)
         return None
-
 # ==========================================================
 # PEST DETECTION (FIXED)
 # ==========================================================
