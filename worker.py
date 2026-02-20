@@ -65,7 +65,7 @@ for plot_name, plot_data in plots.items():
         plot_row = (
             supabase.table("plots")
             .select("id")
-            .eq("django_plot_id", django_id)  # ⚠ Change if column name differs
+            .eq("plot_name", plot_name)  # ⚠ Change if column name differs
             .execute()
         )
 
