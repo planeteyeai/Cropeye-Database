@@ -1,0 +1,42 @@
+name: Night Access Alert
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  check-time-and-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Time
+        id: check
+        run: |
+          HOUR=$(date +'%H')
+          echo "Current hour: $HOUR"
+          TIME_NOW=$(date +"%H:%M")
+          echo "TIME_NOW=$TIME_NOW" >> $GITHUB_ENV
+          if [ $HOUR -ge 19 ]; then
+            echo "after_7_pm=true" >> $GITHUB_ENV
+          else
+            echo "after_7_pm=false" >> $GITHUB_ENV
+
+      - name: Send Email Alert
+        if: env.after_7_pm == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "GitHub Alert: Push after 7 PM"
+          to: admin@example.com
+          body: |
+            Attention Admin,
+
+            User: ${{ github.actor }}
+            Repository: ${{ github.repository }}
+            Event: ${{ github.event_name }}
+            Time: ${{ env.TIME_NOW }}
+
+            This action occurred after 7 PM.
