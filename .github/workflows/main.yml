@@ -2,8 +2,9 @@ name: Night Access Alert
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   check-time-and-alert:
@@ -13,7 +14,6 @@ jobs:
         id: check
         run: |
           HOUR=$(date +'%H')
-          echo "Current hour: $HOUR"
           TIME_NOW=$(date +"%H:%M")
           echo "TIME_NOW=$TIME_NOW" >> $GITHUB_ENV
           if [ $HOUR -ge 19 ]; then
@@ -29,8 +29,8 @@ jobs:
           server_port: 587
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "GitHub Alert: Push after 7 PM"
-          to: admin@example.com
+          subject: "GitHub Alert: Repo Activity After 7 PM"
+          to: ${{ secrets.ADMIN_EMAIL }}
           body: |
             Attention Admin,
 
