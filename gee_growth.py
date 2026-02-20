@@ -410,166 +410,198 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
 def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
     try:
-        geometry = plot_data.get("geometry")
-        geom_type = plot_data.get("geom_type")
-        original_coords = plot_data.get("original_coords")
-
-        if not geometry:
-            return None
+        geometry = plot_data["geometry"]
+        geom_type = plot_data["geom_type"]
+        original_coords = plot_data["original_coords"]
 
         polygon = ee.Geometry(geometry)
 
+        # ==================== SENTINEL-1 ====================
         s1_collection = (
             ee.ImageCollection("COPERNICUS/S1_GRD")
             .filterBounds(polygon)
             .filterDate(start_date, end_date)
         )
 
+        s1_size = s1_collection.size().getInfo()
+        s1_latest_date = None
+
+        if s1_size > 0:
+            s1_latest_img = s1_collection.sort("system:time_start", False).first()
+            s1_latest_date = ee.Date(
+                s1_latest_img.get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
+
+        # ==================== SENTINEL-2 ====================
         s2_collection = (
             ee.ImageCollection("COPERNICUS/S2_SR")
             .filterBounds(polygon)
             .filterDate(start_date, end_date)
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
         )
 
-        s1_size = s1_collection.size().getInfo()
         s2_size = s2_collection.size().getInfo()
+        s2_latest_date = None
+
+        if s2_size > 0:
+            s2_latest_img = s2_collection.sort("system:time_start", False).first()
+            s2_latest_date = ee.Date(
+                s2_latest_img.get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
 
         if s1_size == 0 and s2_size == 0:
             return None
 
-        if s1_size == 0:
-            return None
+        # ==================== SENSOR SELECTION ====================
+        if s1_latest_date and s2_latest_date:
+            if s2_latest_date >= s1_latest_date:
+                sensor_used = "Sentinel-2"
+                latest_date = s2_latest_date
+                use_s2 = True
+            else:
+                sensor_used = "Sentinel-1"
+                latest_date = s1_latest_date
+                use_s2 = False
+        elif s2_latest_date:
+            sensor_used = "Sentinel-2"
+            latest_date = s2_latest_date
+            use_s2 = True
+        else:
+            sensor_used = "Sentinel-1"
+            latest_date = s1_latest_date
+            use_s2 = False
 
-        image = (
-            s1_collection
-            .select("VH")
-            .sort("system:time_start", False)
-            .median()
-            .clip(polygon)
-        )
+        # ==================== CLASSIFICATION ====================
+        if use_s2:
+            composite = s2_collection.median().clip(polygon)
+            ndwi = composite.normalizedDifference(["B3", "B8"])
 
-        latest_date = (
-            s1_collection
-            .sort("system:time_start", False)
-            .first()
-            .date()
-            .format("YYYY-MM-dd")
-            .getInfo()
-        )
-
-        # ===============================
-        # Moisture Classification
-        # ===============================
-
-        shallow_water = image.lt(-20)  # very low backscatter → standing/shallow water
-        less = image.gte(-20).And(image.lt(-15))
-        adequate = image.gte(-15).And(image.lt(-5))
-        excellent = image.gte(-5).And(image.lt(2))
-        excess = image.gte(2)
-
-        def extract(mask):
-            count = (
-                ee.Image.constant(1)
-                .updateMask(mask)
-                .reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
-                .get("constant")
-                .getInfo() or 0
+            classified = (
+                ndwi.where(ndwi.lte(-0.4), 1)
+                .where(ndwi.gt(-0.4).And(ndwi.lte(-0.3)), 2)
+                .where(ndwi.gt(-0.3).And(ndwi.lte(0)), 3)
+                .where(ndwi.gt(0).And(ndwi.lte(0.2)), 4)
+                .where(ndwi.gt(0.2), 5)
             )
 
-            samples = (
-                mask.selfMask()
-                .addBands(ee.Image.pixelLonLat())
-                .sample(region=polygon, scale=10, geometries=True)
-                .getInfo()
+            image_count = s2_size
+
+        else:
+            composite = s1_collection.select("VV").median().clip(polygon)
+            vv = composite.select("VV")
+
+            classified = (
+                vv.where(vv.gt(-6), 5)
+                .where(vv.gt(-8).And(vv.lte(-6)), 4)
+                .where(vv.gt(-10).And(vv.lte(-8)), 3)
+                .where(vv.gt(-12).And(vv.lte(-10)), 2)
+                .where(vv.lte(-12), 1)
             )
 
-            coords = [f["geometry"]["coordinates"] for f in samples.get("features", [])]
-            return count, coords
+            image_count = s1_size
 
-        total_pixels = (
-            ee.Image.constant(1)
-            .reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
+        # ==================== PIXEL COUNTS ====================
+        one = ee.Image.constant(1)
+
+        total_pixels = int(
+            one.reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
             .get("constant")
             .getInfo()
         )
 
-        shallow_count, shallow_coords = extract(shallow_water)
-        less_count, less_coords = extract(less)
-        adequate_count, adequate_coords = extract(adequate)
-        excellent_count, excellent_coords = extract(excellent)
-        excess_count, excess_coords = extract(excess)
+        labels = {
+            1: "less",
+            2: "adequate",
+            3: "excellent",
+            4: "excess",
+            5: "shallow_water",
+        }
 
-        def percent(x):
-            return round((x / total_pixels * 100), 2) if total_pixels else 0
+        pixel_summary = {
+            "total_pixel_count": total_pixels,
+            "start_date": start_date,
+            "end_date": end_date,
+            "latest_image_date": latest_date,
+            "sensor_used": sensor_used,
+            "s1_available": s1_size > 0,
+            "s2_available": s2_size > 0,
+            "s1_latest_date": s1_latest_date,
+            "s2_latest_date": s2_latest_date,
+        }
+
+        for class_id in range(1, 6):
+            mask = classified.eq(class_id)
+
+            count = int(
+                one.updateMask(mask)
+                .reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
+                .get("constant")
+                .getInfo()
+                or 0
+            )
+
+            coords = (
+                mask.selfMask()
+                .addBands(ee.Image.pixelLonLat())
+                .sample(polygon, 10, geometries=True, tileScale=4)
+                .getInfo()
+            )
+
+            coord_list = [
+                f["geometry"]["coordinates"]
+                for f in coords.get("features", [])
+            ]
+
+            key = labels[class_id]
+
+            pixel_summary[f"{key}_pixel_count"] = count
+            pixel_summary[f"{key}_pixel_percentage"] = (
+                (count / total_pixels) * 100 if total_pixels else 0
+            )
+            pixel_summary[f"{key}_pixel_coordinates"] = coord_list
 
         feature = {
             "type": "Feature",
-            "geometry": {"type": geom_type, "coordinates": original_coords},
+            "geometry": {
+                "type": geom_type,
+                "coordinates": original_coords,
+            },
             "properties": {
                 "plot_name": plot_name,
                 "start_date": start_date,
                 "end_date": end_date,
-                "sensor_used": "Sentinel-1",
+                "sensor_used": sensor_used,
                 "latest_image_date": latest_date,
-                "image_count": s1_size,
-                "tile_url": image.getMapId()["tile_fetcher"].url_format,
+                "image_count": image_count,
+                "tile_url": classified.visualize(min=1, max=5).getMapId()["tile_fetcher"].url_format,
                 "last_updated": datetime.utcnow().isoformat(),
-            }
+            },
         }
 
-        result = {
+        return [{
             "type": "FeatureCollection",
             "features": [feature],
-            "pixel_summary": {
-                "total_pixel_count": total_pixels,
-                "start_date": start_date,
-                "end_date": end_date,
-                "latest_image_date": latest_date,
-                "sensor_used": "Sentinel-1",
-                "s1_available": s1_size > 0,
-                "s2_available": s2_size > 0,
-                "s1_latest_date": latest_date,
-                "s2_latest_date": None,
-
-                # Shallow Water (NEW)
-                "shallow_water_pixel_count": shallow_count,
-                "shallow_water_pixel_percentage": percent(shallow_count),
-                "shallow_water_pixel_coordinates": shallow_coords,
-
-                "less_pixel_count": less_count,
-                "less_pixel_percentage": percent(less_count),
-                "less_pixel_coordinates": less_coords,
-
-                "adequate_pixel_count": adequate_count,
-                "adequate_pixel_percentage": percent(adequate_count),
-                "adequate_pixel_coordinates": adequate_coords,
-
-                "excellent_pixel_count": excellent_count,
-                "excellent_pixel_percentage": percent(excellent_count),
-                "excellent_pixel_coordinates": excellent_coords,
-
-                "excess_pixel_count": excess_count,
-                "excess_pixel_percentage": percent(excess_count),
-                "excess_pixel_coordinates": excess_coords,
-            }
-        }
-
-        return [result]
+            "pixel_summary": pixel_summary,
+        }]
 
     except Exception as e:
-        print("❌ Soil moisture failed:", e, flush=True)
+        print("❌ Soil moisture failed:", e)
         return None
 
 # ==========================================================
 # PEST DETECTION (FIXED)
 # ==========================================================
 
-def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date):
-
+def run_pest_detection_analysis_by_plot(
+    plot_name: str,
+    plot_data: dict,
+    start_date: str,
+    end_date: str,
+):
     try:
-        geometry = plot_data.get("geometry")
-        geom_type = plot_data.get("geom_type")
-        original_coords = plot_data.get("original_coords")
+        geometry = plot_data["geometry"]
+        geom_type = plot_data["geom_type"]
+        original_coords = plot_data["original_coords"]
 
         props = plot_data.get("properties", {})
         crop_type = (
@@ -578,16 +610,10 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
             or props.get("crop")
             or ""
         )
-
         crop_type = str(crop_type).lower().strip()
 
-        if not geometry:
-            return None
-
         if not crop_type:
-            return None
-
-        polygon = ee.Geometry(geometry)
+            raise ValueError("Crop type missing in plot metadata")
 
         analysis_start = ee.Date(start_date)
         analysis_end = ee.Date(end_date)
@@ -595,7 +621,7 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
         baseline_year = analysis_end.get("year").subtract(1)
 
         # ========================================================
-        # ======================= GRAPES =========================
+        # GRAPES LOGIC
         # ========================================================
         if "grape" in crop_type:
 
@@ -607,7 +633,7 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
 
             s1 = (
                 ee.ImageCollection("COPERNICUS/S1_GRD")
-                .filterBounds(polygon)
+                .filterBounds(geometry)
                 .filterDate(start_date, end_date)
                 .filter(ee.Filter.eq("instrumentMode", "IW"))
                 .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
@@ -618,17 +644,17 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
             if image_count == 0:
                 return None
 
-            cur = s1.median().clip(polygon)
+            cur = s1.median().clip(geometry)
 
             base = (
                 ee.ImageCollection("COPERNICUS/S1_GRD")
-                .filterBounds(polygon)
+                .filterBounds(geometry)
                 .filterDate(baseline_start, baseline_end)
                 .filter(ee.Filter.eq("instrumentMode", "IW"))
                 .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
                 .select(["VV", "VH"])
                 .median()
-                .clip(polygon)
+                .clip(geometry)
             )
 
             vv_cur = db_to_linear(cur.select("VV"))
@@ -660,12 +686,13 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
                 .And(vhvv_base.subtract(vhvv_cur).gt(0.10))
             )
 
+            wilt_mask = ee.Image(0)
             soilborne_mask = chewing_mask
 
-            pest_order = ["chewing", "fungi", "sucking", "soilborne"]
+            tile_image = cur.select("VV")
 
         # ========================================================
-        # ===================== SUGARCANE =========================
+        # SUGARCANE LOGIC
         # ========================================================
         elif "sugar" in crop_type:
 
@@ -674,16 +701,17 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
 
             s1 = (
                 ee.ImageCollection("COPERNICUS/S1_GRD")
-                .filterBounds(polygon)
+                .filterBounds(geometry)
                 .filterDate(start_date, end_date)
                 .filter(ee.Filter.eq("instrumentMode", "IW"))
+                .select(["VV", "VH"])
             )
 
             image_count = int(s1.size().getInfo())
             if image_count == 0:
                 return None
 
-            img = s1.median().clip(polygon)
+            img = s1.median().clip(geometry)
 
             vv = img.select("VV")
             vh = img.select("VH")
@@ -692,72 +720,84 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
             chewing_mask = ratio.lte(0.01)
             fungi_mask = chewing_mask
             sucking_mask = ratio.gte(1)
+            wilt_mask = ratio.gte(1)
             soilborne_mask = chewing_mask
 
-            pest_order = ["chewing", "fungi", "sucking", "soilborne"]
+            tile_image = img.select("VV")
 
         else:
-            return None
+            raise ValueError(f"Pest detection not supported for crop type: {crop_type}")
 
-        # ===================== PIXEL COUNTS =====================
+        # ========================================================
+        # TILE URL
+        # ========================================================
+        tile_url = tile_image.getMapId()["tile_fetcher"].url_format
 
+        # ========================================================
+        # PIXEL COUNT
+        # ========================================================
         one = ee.Image.constant(1)
 
         def count(mask):
-            return int(
-                one.updateMask(mask)
-                .reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
-                .get("constant")
-                .getInfo()
-                or 0
-            )
+            value = one.updateMask(mask).reduceRegion(
+                ee.Reducer.count(), geometry, 10, bestEffort=True
+            ).get("constant")
+            return int(value.getInfo() or 0)
 
-        def coords(mask):
-            pts = (
-                mask.selfMask()
-                .addBands(ee.Image.pixelLonLat())
-                .sample(polygon, 10, geometries=True, tileScale=4)
-                .getInfo()
-            )
-            return list(
-                {tuple(f["geometry"]["coordinates"]) for f in pts.get("features", [])}
-            )
-
-        pixel_counts = {p: count(locals()[f"{p}_mask"]) for p in pest_order}
-        pixel_coords = {p: coords(locals()[f"{p}_mask"]) for p in pest_order}
-
-        total_pixels = int(
-            one.reduceRegion(ee.Reducer.count(), polygon, 10, bestEffort=True)
-            .get("constant")
-            .getInfo()
+        total_pixel_count = int(
+            one.reduceRegion(
+                ee.Reducer.count(), geometry, 10, bestEffort=True
+            ).get("constant").getInfo()
         )
 
-        healthy_pixels = total_pixels - sum(pixel_counts.values())
+        chewing_pixel_count = count(chewing_mask)
+        fungi_pixel_count = count(fungi_mask)
+        sucking_pixel_count = count(sucking_mask)
+        wilt_pixel_count = count(wilt_mask)
+        soilborne_pixel_count = count(soilborne_mask)
 
-        # ===================== VISUALIZATION =====================
+        healthy_pixel_count = total_pixel_count - (
+            chewing_pixel_count
+            + fungi_pixel_count
+            + sucking_pixel_count
+            + wilt_pixel_count
+            + soilborne_pixel_count
+        )
 
-        combined = ee.Image(0)
-        class_map = {"chewing": 1, "fungi": 2, "sucking": 3, "soilborne": 4}
+        def percent(x):
+            return (x / total_pixel_count) * 100 if total_pixel_count else 0
 
-        for pest in pest_order:
-            combined = combined.where(locals()[f"{pest}_mask"], class_map[pest])
+        # ========================================================
+        # PIXEL COORDINATES
+        # ========================================================
+        def mask_to_coords(mask):
+            points = (
+                mask.selfMask()
+                .addBands(ee.Image.pixelLonLat())
+                .sample(region=geometry, scale=10, geometries=True, tileScale=4)
+                .getInfo()
+            )
+            coords = [f["geometry"]["coordinates"] for f in points.get("features", [])]
+            return [list(x) for x in {tuple(c) for c in coords}]
 
-        combined = combined.clip(polygon).focal_mean(10, units="meters")
+        chewing_coords = mask_to_coords(chewing_mask)
+        fungi_coords = mask_to_coords(fungi_mask)
+        sucking_coords = mask_to_coords(sucking_mask)
+        wilt_coords = mask_to_coords(wilt_mask)
+        soilborne_coords = mask_to_coords(soilborne_mask)
 
-        tile_url = combined.visualize(
-            min=0,
-            max=max(class_map.values()),
-            palette=["#00FF00"] + ["#FF0000"] * max(class_map.values()),
-        ).getMapId()["tile_fetcher"].url_format
-
-        # ===================== RESPONSE =====================
-
+        # ========================================================
+        # RESPONSE (MATCHES YOUR REQUIRED STRUCTURE)
+        # ========================================================
         feature = {
             "type": "Feature",
-            "geometry": {"type": geom_type, "coordinates": original_coords},
+            "geometry": {
+                "type": geom_type,
+                "coordinates": original_coords,
+            },
             "properties": {
                 "plot_name": plot_name,
-                "crop": crop_type,
+                "crop_type": crop_type,  # ✅ ADDED AS REQUESTED
                 "start_date": start_date,
                 "end_date": end_date,
                 "image_count": image_count,
@@ -767,28 +807,39 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
             },
         }
 
-        return [{
+        return {
             "type": "FeatureCollection",
             "features": [feature],
             "pixel_summary": {
-                "total_pixel_count": total_pixels,
-                "healthy_pixel_count": healthy_pixels,
-                **{f"{p}_affected_pixel_count": pixel_counts[p] for p in pest_order},
-                **{
-                    f"{p}_affected_pixel_percentage":
-                    (pixel_counts[p] / total_pixels) * 100 if total_pixels else 0
-                    for p in pest_order
-                },
-                **{
-                    f"{p}_affected_pixel_coordinates": pixel_coords[p]
-                    for p in pest_order
-                },
+                "total_pixel_count": total_pixel_count,
+                "healthy_pixel_count": healthy_pixel_count,
+
+                "chewing_affected_pixel_count": chewing_pixel_count,
+                "chewing_affected_pixel_percentage": percent(chewing_pixel_count),
+                "chewing_affected_pixel_coordinates": chewing_coords,
+
+                "fungi_affected_pixel_count": fungi_pixel_count,
+                "fungi_affected_pixel_percentage": percent(fungi_pixel_count),
+                "fungi_affected_pixel_coordinates": fungi_coords,
+
+                "sucking_affected_pixel_count": sucking_pixel_count,
+                "sucking_affected_pixel_percentage": percent(sucking_pixel_count),
+                "sucking_affected_pixel_coordinates": sucking_coords,
+
+                "wilt_affected_pixel_count": wilt_pixel_count,
+                "wilt_affected_pixel_percentage": percent(wilt_pixel_count),
+                "wilt_affected_pixel_coordinates": wilt_coords,
+
+                "SoilBorn_pixel_count": soilborne_pixel_count,
+                "SoilBorn_affected_pixel_percentage": percent(soilborne_pixel_count),
+                "SoilBorn_affected_pixel_coordinates": soilborne_coords,
+
                 "baseline_start_date": baseline_start.format("YYYY-MM-dd").getInfo(),
                 "baseline_end_date": baseline_end.format("YYYY-MM-dd").getInfo(),
-                "analysis_start_date": start_date,
-                "analysis_end_date": end_date,
-            }
-        }]
+                "analysis_start_date": analysis_start.format("YYYY-MM-dd").getInfo(),
+                "analysis_end_date": analysis_end.format("YYYY-MM-dd").getInfo(),
+            },
+        }
 
     except Exception as e:
         print("❌ Pest detection failed:", e, flush=True)
