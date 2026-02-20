@@ -762,7 +762,7 @@ def verify_worker(token):
     if not token or (token != WORKER_TOKEN and token != "local-dev"):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-        
+
 def run_monthly_backfill_for_plot(plot_name, plot_data):
 
     print(f"📦 Checking historical monthly backfill for {plot_name}", flush=True)
@@ -849,24 +849,50 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                     print(f"⚠ No {analysis_type} results", flush=True)
                     return
 
+                # ==================================================
+                # 🔥 CRITICAL FIX: Normalize result format
+                # ==================================================
+
+                if isinstance(results, dict):
+                    results = [results]   # convert single dict → list
+
+                if not isinstance(results, list):
+                    print(f"⚠ Unexpected result format for {analysis_type}", flush=True)
+                    return
+
+                # ==================================================
+                # STORE RESULTS
+                # ==================================================
+
                 for geojson in results:
+
+                    if not isinstance(geojson, dict):
+                        continue
+
+                    if not geojson.get("features"):
+                        continue
+
                     properties = geojson["features"][0]["properties"]
 
                     analysis_date = (
                         properties.get("latest_image_date")
                         or properties.get("analysis_dates", {}).get("latest_image_date")
+                        or properties.get("analysis_dates", {}).get("analysis_end_date")
                     )
 
                     sensor_used = (
                         properties.get("data_source")
                         or properties.get("sensor")
                         or properties.get("sensor_used")
+                        or "unknown"
                     )
 
                     tile_url = properties.get("tile_url")
+
                     if not analysis_date:
                         print(f"⚠ Skipping {analysis_type} — missing analysis_date", flush=True)
                         continue
+
                     response = supabase.table("analysis_results").upsert(
                         {
                             "plot_id": plot_id,
