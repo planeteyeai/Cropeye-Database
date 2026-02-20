@@ -864,7 +864,9 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                     )
 
                     tile_url = properties.get("tile_url")
-
+                    if not analysis_date:
+                        print(f"⚠ Skipping {analysis_type} — missing analysis_date", flush=True)
+                        continue
                     response = supabase.table("analysis_results").upsert(
                         {
                             "plot_id": plot_id,
