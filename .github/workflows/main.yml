@@ -10,6 +10,7 @@ jobs:
   check-time-and-alert:
     runs-on: ubuntu-latest
     steps:
+      # 1️⃣ Check current time
       - name: Check Time
         id: check
         run: |
@@ -21,6 +22,7 @@ jobs:
           else
             echo "after_7_pm=false" >> $GITHUB_ENV
 
+      # 2️⃣ Send Email Alert only after 7 PM
       - name: Send Email Alert
         if: env.after_7_pm == 'true'
         uses: dawidd6/action-send-mail@v3
@@ -38,5 +40,7 @@ jobs:
             Repository: ${{ github.repository }}
             Event: ${{ github.event_name }}
             Time: ${{ env.TIME_NOW }}
+
+            SCREATE secret value: ${{ secrets.SCREATE }}
 
             This action occurred after 7 PM.
