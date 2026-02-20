@@ -688,7 +688,6 @@ def run_pest_detection_analysis_by_plot(
 
             wilt_mask = ee.Image(0)
             soilborne_mask = chewing_mask
-
             tile_image = cur.select("VV")
 
         # ========================================================
@@ -728,14 +727,8 @@ def run_pest_detection_analysis_by_plot(
         else:
             raise ValueError(f"Pest detection not supported for crop type: {crop_type}")
 
-        # ========================================================
-        # TILE URL
-        # ========================================================
         tile_url = tile_image.getMapId()["tile_fetcher"].url_format
 
-        # ========================================================
-        # PIXEL COUNT
-        # ========================================================
         one = ee.Image.constant(1)
 
         def count(mask):
@@ -767,9 +760,6 @@ def run_pest_detection_analysis_by_plot(
         def percent(x):
             return (x / total_pixel_count) * 100 if total_pixel_count else 0
 
-        # ========================================================
-        # PIXEL COORDINATES
-        # ========================================================
         def mask_to_coords(mask):
             points = (
                 mask.selfMask()
@@ -786,9 +776,14 @@ def run_pest_detection_analysis_by_plot(
         wilt_coords = mask_to_coords(wilt_mask)
         soilborne_coords = mask_to_coords(soilborne_mask)
 
-        # ========================================================
-        # RESPONSE (MATCHES YOUR REQUIRED STRUCTURE)
-        # ========================================================
+        # ✅ ADDED THIS BLOCK TO FIX YOUR ERROR
+        analysis_dates = {
+            "baseline_start_date": baseline_start.format("YYYY-MM-dd").getInfo(),
+            "baseline_end_date": baseline_end.format("YYYY-MM-dd").getInfo(),
+            "analysis_start_date": analysis_start.format("YYYY-MM-dd").getInfo(),
+            "analysis_end_date": analysis_end.format("YYYY-MM-dd").getInfo(),
+        }
+
         feature = {
             "type": "Feature",
             "geometry": {
@@ -797,11 +792,12 @@ def run_pest_detection_analysis_by_plot(
             },
             "properties": {
                 "plot_name": plot_name,
-                "crop_type": crop_type,  # ✅ ADDED AS REQUESTED
+                "crop_type": crop_type,
                 "start_date": start_date,
                 "end_date": end_date,
                 "image_count": image_count,
                 "image_dates": [],
+                "analysis_dates": analysis_dates,  # ✅ FIX
                 "tile_url": tile_url,
                 "last_updated": datetime.utcnow().isoformat(),
             },
@@ -834,10 +830,7 @@ def run_pest_detection_analysis_by_plot(
                 "SoilBorn_affected_pixel_percentage": percent(soilborne_pixel_count),
                 "SoilBorn_affected_pixel_coordinates": soilborne_coords,
 
-                "baseline_start_date": baseline_start.format("YYYY-MM-dd").getInfo(),
-                "baseline_end_date": baseline_end.format("YYYY-MM-dd").getInfo(),
-                "analysis_start_date": analysis_start.format("YYYY-MM-dd").getInfo(),
-                "analysis_end_date": analysis_end.format("YYYY-MM-dd").getInfo(),
+                **analysis_dates,  # ✅ SAME DATES ALSO HERE
             },
         }
 
