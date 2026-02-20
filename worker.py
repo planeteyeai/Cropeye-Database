@@ -65,7 +65,7 @@ for plot_name, plot_data in plots.items():
         plot_row = (
             supabase.table("plots")
             .select("id")
-            .eq("django_plot_id", django_id)
+            .eq("django_plot_id", django_id)  # ⚠ Change if column name differs
             .execute()
         )
 
@@ -77,7 +77,7 @@ for plot_name, plot_data in plots.items():
         print("✔ Plot ID:", plot_id, flush=True)
 
         # =====================================================
-        # FUNCTION TO STORE RESULTS (Reusable)
+        # SAFE STORE FUNCTION
         # =====================================================
 
         def store_results(results, analysis_type):
@@ -85,21 +85,44 @@ for plot_name, plot_data in plots.items():
             if not results:
                 return
 
+            # 🔥 Normalize dict → list
+            if isinstance(results, dict):
+                results = [results]
+
+            if not isinstance(results, list):
+                print(f"⚠ Unexpected format for {analysis_type}", flush=True)
+                return
+
             for geojson in results:
+
+                if not isinstance(geojson, dict):
+                    continue
+
+                if not geojson.get("features"):
+                    continue
 
                 properties = geojson["features"][0]["properties"]
 
-                # Growth structure
-                if analysis_type == "growth":
-                    analysis_date = properties["latest_image_date"]
-                    sensor_used = properties["data_source"]
+                # ---------------- DATE EXTRACTION ----------------
 
-                # Other endpoints structure
-                else:
-                    analysis_date = properties["analysis_dates"]["latest_image_date"]
-                    sensor_used = properties.get("sensor")
+                analysis_date = (
+                    properties.get("latest_image_date")
+                    or properties.get("analysis_dates", {}).get("latest_image_date")
+                    or properties.get("analysis_dates", {}).get("analysis_end_date")
+                )
 
-                tile_url = properties["tile_url"]
+                sensor_used = (
+                    properties.get("data_source")
+                    or properties.get("sensor")
+                    or properties.get("sensor_used")
+                    or "unknown"
+                )
+
+                tile_url = properties.get("tile_url")
+
+                if not analysis_date:
+                    print(f"⚠ Skipping {analysis_type} — no date", flush=True)
+                    continue
 
                 # ---------------- SATELLITE TABLE ----------------
 
@@ -137,7 +160,7 @@ for plot_name, plot_data in plots.items():
                 )
 
         # =====================================================
-        # GROWTH
+        # RUN ANALYSES
         # =====================================================
 
         growth_results = run_growth_analysis_by_plot(
@@ -146,13 +169,8 @@ for plot_name, plot_data in plots.items():
             start_date=start_date,
             end_date=end_date
         )
-
         print("✔ Growth analysis done", flush=True)
         store_results(growth_results, "growth")
-
-        # =====================================================
-        # WATER UPTAKE
-        # =====================================================
 
         water_results = run_water_uptake_analysis_by_plot(
             plot_name,
@@ -160,13 +178,8 @@ for plot_name, plot_data in plots.items():
             start_date=start_date,
             end_date=end_date
         )
-
         print("✔ Water uptake analysis done", flush=True)
         store_results(water_results, "water_uptake")
-
-        # =====================================================
-        # SOIL MOISTURE
-        # =====================================================
 
         soil_results = run_soil_moisture_analysis_by_plot(
             plot_name,
@@ -174,13 +187,8 @@ for plot_name, plot_data in plots.items():
             start_date=start_date,
             end_date=end_date
         )
-
         print("✔ Soil moisture analysis done", flush=True)
         store_results(soil_results, "soil_moisture")
-
-        # =====================================================
-        # PEST DETECTION
-        # =====================================================
 
         pest_results = run_pest_detection_analysis_by_plot(
             plot_name,
@@ -188,7 +196,6 @@ for plot_name, plot_data in plots.items():
             start_date=start_date,
             end_date=end_date
         )
-
         print("✔ Pest detection analysis done", flush=True)
         store_results(pest_results, "pest_detection")
 
