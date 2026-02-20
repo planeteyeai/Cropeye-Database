@@ -444,6 +444,15 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
             .clip(polygon)
         )
 
+       latest_date = (
+            s1_collection
+            .sort("system:time_start", False)
+            .first()
+            .date()
+            .format("YYYY-MM-dd")
+            .getInfo()
+        )
+        
         less = image.lt(-15)
         adequate = image.gte(-15).And(image.lt(-5))
         excellent = image.gte(-5).And(image.lt(2))
@@ -491,7 +500,7 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
                 "start_date": start_date,
                 "end_date": end_date,
                 "sensor_used": "Sentinel-1",
-                "latest_image_date": None,
+                "latest_image_date": latest_date,
                 "image_count": s1_size,
                 "tile_url": image.getMapId()["tile_fetcher"].url_format,
                 "last_updated": datetime.utcnow().isoformat(),
@@ -568,7 +577,14 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
             .median()
             .clip(polygon)
         )
-
+        latest_date = (
+            s1_collection
+            .sort("system:time_start", False)
+            .first()
+            .date()
+            .format("YYYY-MM-dd")
+            .getInfo()
+        )
 
         chewing_mask = image.lt(-18)
 
@@ -612,6 +628,7 @@ def run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_da
                 "end_date": end_date,
                 "image_count": s1.size().getInfo(),
                 "image_dates": [],
+                "latest_image_date": latest_date,
                 "tile_url": image.getMapId()["tile_fetcher"].url_format,
                 "last_updated": datetime.utcnow().isoformat(),
             }
