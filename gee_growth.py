@@ -243,12 +243,17 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
     try:
-        geometry = ee.Geometry(plot_data.get("geometry"))
+        # ===============================
+        # GEOMETRY SAFE LOAD
+        # ===============================
+        geometry = plot_data.get("geometry")
         geom_type = plot_data.get("geom_type")
         original_coords = plot_data.get("original_coords")
 
-        if not geometry:
+        if geometry is None:
             return None
+
+        geometry = ee.Geometry(geometry)
 
         analysis_start = ee.Date(start_date)
         analysis_end = ee.Date(end_date)
@@ -260,22 +265,25 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             ee.ImageCollection("COPERNICUS/S2_SR")
             .filterBounds(geometry)
             .filterDate(analysis_start, analysis_end)
+            .filter(ee.Filter.notNull(["system:time_start"]))
             .map(lambda img:
                 img.normalizedDifference(['B8A', 'B11'])
                    .rename('NDMI')
                    .clip(geometry)
+                   .copyProperties(img, ["system:time_start"])
             )
             .sort("system:time_start", False)
         )
 
-        s2_count = s2_collection.size().getInfo()
+        s2_count = int(s2_collection.size().getInfo() or 0)
         latest_s2_date = None
+        latest_s2_img = None
 
         if s2_count > 0:
             latest_s2_img = ee.Image(s2_collection.first())
-            latest_s2_date = ee.Date(
-                latest_s2_img.get("system:time_start")
-            )
+            ts = latest_s2_img.get("system:time_start")
+            if ts:
+                latest_s2_date = ee.Date(ts)
 
         # ===============================
         # SENTINEL-1 VH
@@ -286,22 +294,29 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             .filterDate(analysis_start, analysis_end)
             .filter(ee.Filter.eq("instrumentMode", "IW"))
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+            .filter(ee.Filter.notNull(["system:time_start"]))
             .select(["VH"])
-            .map(lambda img: img.clip(geometry))
+            .map(lambda img: img.clip(geometry)
+                 .copyProperties(img, ["system:time_start"]))
             .sort("system:time_start", False)
         )
 
-        s1_count = s1_collection.size().getInfo()
+        s1_count = int(s1_collection.size().getInfo() or 0)
         latest_s1_date = None
+        latest_image = None
+        previous_image = None
 
         if s1_count >= 2:
             image_list = s1_collection.toList(2)
             latest_image = ee.Image(image_list.get(0))
             previous_image = ee.Image(image_list.get(1))
-            latest_s1_date = ee.Date(latest_image.get("system:time_start"))
+
+            ts1 = latest_image.get("system:time_start")
+            if ts1:
+                latest_s1_date = ee.Date(ts1)
 
         # ===============================
-        # SENSOR DECISION (Same as endpoint)
+        # SENSOR DECISION (UNCHANGED LOGIC)
         # ===============================
         use_s2 = False
         use_s1 = False
@@ -317,12 +332,18 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             return None
 
         # ===============================
-        # CLASSIFICATION
+        # CLASSIFICATION (UNCHANGED)
         # ===============================
         if use_s2:
 
             sensor = "s2"
-            ndmi_image = s2_collection.median().rename("NDMI").clip(geometry)
+
+            ndmi_image = (
+                s2_collection
+                .median()
+                .rename("NDMI")
+                .clip(geometry)
+            )
 
             deficient = ndmi_image.lt(-0.21)
             less = ndmi_image.gte(-0.21).And(ndmi_image.lt(-0.031))
@@ -330,14 +351,24 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             excellent = ndmi_image.gte(0.14).And(ndmi_image.lt(0.22))
             excess = ndmi_image.gte(0.22)
 
-            latest_date_str = latest_s2_date.format("YYYY-MM-dd").getInfo()
+            latest_date_str = (
+                latest_s2_date.format("YYYY-MM-dd").getInfo()
+                if latest_s2_date else None
+            )
+
             previous_date_str = None
             image_count = s2_count
 
         else:
 
             sensor = "s1"
-            delta_vh = latest_image.subtract(previous_image).rename("deltaVH").clip(geometry)
+
+            delta_vh = (
+                latest_image
+                .subtract(previous_image)
+                .rename("deltaVH")
+                .clip(geometry)
+            )
 
             deficient = delta_vh.lt(-3.13)
             less = delta_vh.gte(-3.13).And(delta_vh.lte(-0.1))
@@ -345,13 +376,17 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             excellent = delta_vh.gte(4).And(delta_vh.lt(6))
             excess = delta_vh.gte(6)
 
-            latest_date_str = ee.Date(
-                latest_image.get("system:time_start")
-            ).format("YYYY-MM-dd").getInfo()
+            latest_date_str = (
+                latest_s1_date.format("YYYY-MM-dd").getInfo()
+                if latest_s1_date else None
+            )
 
-            previous_date_str = ee.Date(
-                previous_image.get("system:time_start")
-            ).format("YYYY-MM-dd").getInfo()
+            previous_date_str = (
+                ee.Date(previous_image.get("system:time_start"))
+                .format("YYYY-MM-dd")
+                .getInfo()
+                if previous_image else None
+            )
 
             image_count = s1_count
 
@@ -369,9 +404,6 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             .clip(geometry)
         )
 
-        # ===============================
-        # SMOOTHING + VISUAL
-        # ===============================
         smoothed_class = combined_class.focal_mean(radius=7, units="meters")
 
         vis_params = {
@@ -395,27 +427,31 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
         count_image = ee.Image.constant(1)
 
         def get_pixel_count(mask):
-            return count_image.updateMask(mask).reduceRegion(
+            value = count_image.updateMask(mask).reduceRegion(
                 ee.Reducer.count(),
                 geometry,
                 10,
                 bestEffort=True
-            ).get("constant").getInfo() or 0
-
-        def mask_to_coords(mask):
-            sampled = mask.selfMask().addBands(
-                ee.Image.pixelLonLat()
-            ).sample(
-                region=geometry,
-                scale=10,
-                geometries=True,
-                tileScale=4
-            ).getInfo()
-
-            coords = [f["geometry"]["coordinates"] for f in sampled.get("features", [])]
-            return [list(x) for x in {tuple(c) for c in coords}]
+            ).get("constant")
+            return int(value.getInfo() or 0)
 
         total_pixel_count = get_pixel_count(count_image)
+
+        def mask_to_coords(mask):
+            try:
+                sampled = mask.selfMask().addBands(
+                    ee.Image.pixelLonLat()
+                ).sample(
+                    region=geometry,
+                    scale=10,
+                    geometries=True,
+                    tileScale=4
+                ).getInfo()
+
+                coords = [f["geometry"]["coordinates"] for f in sampled.get("features", [])]
+                return [list(x) for x in {tuple(c) for c in coords}]
+            except Exception:
+                return []
 
         deficient_count = get_pixel_count(combined_class.eq(1))
         less_count = get_pixel_count(combined_class.eq(2))
@@ -430,7 +466,7 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
         excess_coords = mask_to_coords(combined_class.eq(5))
 
         # ===============================
-        # BUILD RESPONSE
+        # RESPONSE (UNCHANGED)
         # ===============================
         feature = {
             "type": "Feature",
@@ -729,7 +765,6 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
 # ==========================================================
 # PEST DETECTION (FIXED)
 # ==========================================================
-
 def run_pest_detection_analysis_by_plot(
     plot_name: str,
     plot_data: dict,
@@ -737,8 +772,9 @@ def run_pest_detection_analysis_by_plot(
     end_date: str,
 ):
     try:
+
         # ==============================
-        # BASIC VALIDATION
+        # SAFE INPUT VALIDATION
         # ==============================
 
         if not isinstance(plot_data, dict):
@@ -753,7 +789,9 @@ def run_pest_detection_analysis_by_plot(
             print(f"❌ Missing geometry for {plot_name}")
             return None
 
-        props = plot_data.get("properties", {}) or {}
+        geometry = ee.Geometry(geometry)
+
+        props = plot_data.get("properties") or {}
 
         crop_type = (
             props.get("crop_type_name")
@@ -769,16 +807,21 @@ def run_pest_detection_analysis_by_plot(
             return None
 
         # ==============================
-        # DATE SETUP
+        # SAFE DATE CREATION
         # ==============================
+
+        if not start_date or not end_date:
+            print(f"❌ Invalid date range for {plot_name}")
+            return None
 
         analysis_start = ee.Date(start_date)
         analysis_end = ee.Date(end_date)
+
         baseline_year = analysis_end.get("year").subtract(1)
 
-        # ==============================
-        # GRAPES LOGIC
-        # ==============================
+        # ========================================================
+        # GRAPES LOGIC (UNCHANGED)
+        # ========================================================
 
         if "grape" in crop_type:
 
@@ -798,6 +841,7 @@ def run_pest_detection_analysis_by_plot(
             )
 
             image_count = int(s1.size().getInfo() or 0)
+
             if image_count == 0:
                 print(f"⚠ No Sentinel-1 images for {plot_name}")
                 return None
@@ -844,13 +888,13 @@ def run_pest_detection_analysis_by_plot(
                 .And(vhvv_base.subtract(vhvv_cur).gt(0.10))
             )
 
-            wilt_mask = ee.Image(0)
+            wilt_mask = ee.Image.constant(0)
             soilborne_mask = chewing_mask
             tile_image = cur.select("VV")
 
-        # ==============================
-        # SUGARCANE LOGIC
-        # ==============================
+        # ========================================================
+        # SUGARCANE LOGIC (UNCHANGED)
+        # ========================================================
 
         elif "sugar" in crop_type:
 
@@ -866,6 +910,7 @@ def run_pest_detection_analysis_by_plot(
             )
 
             image_count = int(s1.size().getInfo() or 0)
+
             if image_count == 0:
                 print(f"⚠ No Sentinel-1 images for {plot_name}")
                 return None
@@ -889,7 +934,7 @@ def run_pest_detection_analysis_by_plot(
             return None
 
         # ==============================
-        # TILE URL SAFE FETCH
+        # SAFE TILE URL
         # ==============================
 
         try:
@@ -897,31 +942,35 @@ def run_pest_detection_analysis_by_plot(
         except Exception:
             tile_url = None
 
+        # ==============================
+        # SAFE PIXEL COUNTING
+        # ==============================
+
         one = ee.Image.constant(1)
 
-        def count(mask):
+        def safe_count(mask):
             try:
                 value = one.updateMask(mask).reduceRegion(
-                    ee.Reducer.count(), geometry, 10, bestEffort=True
+                    ee.Reducer.count(),
+                    geometry,
+                    10,
+                    bestEffort=True
                 ).get("constant")
+
                 return int(value.getInfo() or 0)
             except Exception:
                 return 0
 
         try:
-            total_pixel_count = int(
-                one.reduceRegion(
-                    ee.Reducer.count(), geometry, 10, bestEffort=True
-                ).get("constant").getInfo() or 0
-            )
+            total_pixel_count = safe_count(one)
         except Exception:
             total_pixel_count = 0
 
-        chewing_pixel_count = count(chewing_mask)
-        fungi_pixel_count = count(fungi_mask)
-        sucking_pixel_count = count(sucking_mask)
-        wilt_pixel_count = count(wilt_mask)
-        soilborne_pixel_count = count(soilborne_mask)
+        chewing_pixel_count = safe_count(chewing_mask)
+        fungi_pixel_count = safe_count(fungi_mask)
+        sucking_pixel_count = safe_count(sucking_mask)
+        wilt_pixel_count = safe_count(wilt_mask)
+        soilborne_pixel_count = safe_count(soilborne_mask)
 
         healthy_pixel_count = max(
             total_pixel_count
@@ -944,16 +993,30 @@ def run_pest_detection_analysis_by_plot(
 
         def mask_to_coords(mask):
             try:
-                points = (
+                sampled = (
                     mask.selfMask()
                     .addBands(ee.Image.pixelLonLat())
-                    .sample(region=geometry, scale=10, geometries=True, tileScale=4)
+                    .sample(
+                        region=geometry,
+                        scale=10,
+                        geometries=True,
+                        tileScale=4
+                    )
                     .getInfo()
                 )
+
+                if not isinstance(sampled, dict):
+                    return []
+
+                features = sampled.get("features", [])
                 coords = [
                     f["geometry"]["coordinates"]
-                    for f in points.get("features", [])
+                    for f in features
+                    if isinstance(f, dict)
+                    and "geometry" in f
+                    and "coordinates" in f["geometry"]
                 ]
+
                 return [list(x) for x in {tuple(c) for c in coords}]
             except Exception:
                 return []
@@ -965,7 +1028,7 @@ def run_pest_detection_analysis_by_plot(
         soilborne_coords = mask_to_coords(soilborne_mask)
 
         # ==============================
-        # DATE STRINGS
+        # SAFE DATE STRINGS
         # ==============================
 
         analysis_dates = {
@@ -974,6 +1037,10 @@ def run_pest_detection_analysis_by_plot(
             "analysis_start_date": analysis_start.format("YYYY-MM-dd").getInfo(),
             "analysis_end_date": analysis_end.format("YYYY-MM-dd").getInfo(),
         }
+
+        # ==============================
+        # RESPONSE (UNCHANGED STRUCTURE)
+        # ==============================
 
         feature = {
             "type": "Feature",
