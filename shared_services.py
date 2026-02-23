@@ -226,8 +226,9 @@ def run_plot_sync():
                 "geom": f"SRID=4326;{wkt}",
                 "geojson": geom_geojson,
                 "area_hectares": area_ha,
-                "plantation_date": props.get("plantation_date"),
                 "django_plot_id": props.get("django_id"),
+                "plantation_date": plot.get("plantation_date"),
+                "crop_type": plot.get("crop_type"),
             }, on_conflict="plot_name").execute()
 
             inserted += 1
