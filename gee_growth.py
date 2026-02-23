@@ -765,6 +765,7 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
 # ==========================================================
 # PEST DETECTION (FIXED)
 # ==========================================================
+
 def run_pest_detection_analysis_by_plot(
     plot_name: str,
     plot_data: dict,
@@ -846,6 +847,13 @@ def run_pest_detection_analysis_by_plot(
                 print(f"⚠ No Sentinel-1 images for {plot_name}")
                 return None
 
+            # ✅ SAFE ADD — IMAGE DATES
+            image_dates = (
+                s1.aggregate_array("system:time_start")
+                .map(lambda d: ee.Date(d).format("YYYY-MM-dd"))
+                .getInfo()
+            )
+
             cur = s1.median().clip(geometry)
 
             base = (
@@ -915,6 +923,13 @@ def run_pest_detection_analysis_by_plot(
                 print(f"⚠ No Sentinel-1 images for {plot_name}")
                 return None
 
+            # ✅ SAFE ADD — IMAGE DATES
+            image_dates = (
+                s1.aggregate_array("system:time_start")
+                .map(lambda d: ee.Date(d).format("YYYY-MM-dd"))
+                .getInfo()
+            )
+
             img = s1.median().clip(geometry)
 
             vv = img.select("VV")
@@ -943,7 +958,7 @@ def run_pest_detection_analysis_by_plot(
             tile_url = None
 
         # ==============================
-        # SAFE PIXEL COUNTING
+        # PIXEL COUNTING (UNCHANGED)
         # ==============================
 
         one = ee.Image.constant(1)
@@ -956,15 +971,11 @@ def run_pest_detection_analysis_by_plot(
                     10,
                     bestEffort=True
                 ).get("constant")
-
                 return int(value.getInfo() or 0)
             except Exception:
                 return 0
 
-        try:
-            total_pixel_count = safe_count(one)
-        except Exception:
-            total_pixel_count = 0
+        total_pixel_count = safe_count(one)
 
         chewing_pixel_count = safe_count(chewing_mask)
         fungi_pixel_count = safe_count(fungi_mask)
@@ -988,47 +999,7 @@ def run_pest_detection_analysis_by_plot(
             return (x / total_pixel_count) * 100 if total_pixel_count else 0
 
         # ==============================
-        # SAFE COORD EXTRACTION
-        # ==============================
-
-        def mask_to_coords(mask):
-            try:
-                sampled = (
-                    mask.selfMask()
-                    .addBands(ee.Image.pixelLonLat())
-                    .sample(
-                        region=geometry,
-                        scale=10,
-                        geometries=True,
-                        tileScale=4
-                    )
-                    .getInfo()
-                )
-
-                if not isinstance(sampled, dict):
-                    return []
-
-                features = sampled.get("features", [])
-                coords = [
-                    f["geometry"]["coordinates"]
-                    for f in features
-                    if isinstance(f, dict)
-                    and "geometry" in f
-                    and "coordinates" in f["geometry"]
-                ]
-
-                return [list(x) for x in {tuple(c) for c in coords}]
-            except Exception:
-                return []
-
-        chewing_coords = mask_to_coords(chewing_mask)
-        fungi_coords = mask_to_coords(fungi_mask)
-        sucking_coords = mask_to_coords(sucking_mask)
-        wilt_coords = mask_to_coords(wilt_mask)
-        soilborne_coords = mask_to_coords(soilborne_mask)
-
-        # ==============================
-        # SAFE DATE STRINGS
+        # RESPONSE
         # ==============================
 
         analysis_dates = {
@@ -1037,10 +1008,6 @@ def run_pest_detection_analysis_by_plot(
             "analysis_start_date": analysis_start.format("YYYY-MM-dd").getInfo(),
             "analysis_end_date": analysis_end.format("YYYY-MM-dd").getInfo(),
         }
-
-        # ==============================
-        # RESPONSE (UNCHANGED STRUCTURE)
-        # ==============================
 
         feature = {
             "type": "Feature",
@@ -1053,8 +1020,9 @@ def run_pest_detection_analysis_by_plot(
                 "crop_type": crop_type,
                 "start_date": start_date,
                 "end_date": end_date,
+                "sensor": "Sentinel-1",
                 "image_count": image_count,
-                "image_dates": [],
+                "image_dates": image_dates,   # ✅ FIX APPLIED
                 "analysis_dates": analysis_dates,
                 "tile_url": tile_url,
                 "last_updated": datetime.utcnow().isoformat(),
@@ -1070,23 +1038,18 @@ def run_pest_detection_analysis_by_plot(
 
                 "chewing_affected_pixel_count": chewing_pixel_count,
                 "chewing_affected_pixel_percentage": percent(chewing_pixel_count),
-                "chewing_affected_pixel_coordinates": chewing_coords,
 
                 "fungi_affected_pixel_count": fungi_pixel_count,
                 "fungi_affected_pixel_percentage": percent(fungi_pixel_count),
-                "fungi_affected_pixel_coordinates": fungi_coords,
 
                 "sucking_affected_pixel_count": sucking_pixel_count,
                 "sucking_affected_pixel_percentage": percent(sucking_pixel_count),
-                "sucking_affected_pixel_coordinates": sucking_coords,
 
                 "wilt_affected_pixel_count": wilt_pixel_count,
                 "wilt_affected_pixel_percentage": percent(wilt_pixel_count),
-                "wilt_affected_pixel_coordinates": wilt_coords,
 
                 "SoilBorn_pixel_count": soilborne_pixel_count,
                 "SoilBorn_affected_pixel_percentage": percent(soilborne_pixel_count),
-                "SoilBorn_affected_pixel_coordinates": soilborne_coords,
 
                 **analysis_dates,
             },
