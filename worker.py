@@ -190,7 +190,7 @@ for plot_name, plot_data in plots.items():
         print("✔ Soil moisture analysis done", flush=True)
         store_results(soil_results, "soil_moisture")
 
-       pest_start = (date.today() - timedelta(days=15)).isoformat()
+        pest_start = (date.today() - timedelta(days=15)).isoformat()
 
         pest_results = run_pest_detection_analysis_by_plot(
             plot_name,
