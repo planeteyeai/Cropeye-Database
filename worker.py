@@ -1,20 +1,31 @@
 from datetime import date, timedelta
+import time
+
 from gee_growth import (
     run_growth_analysis_by_plot,
     run_water_uptake_analysis_by_plot,
     run_soil_moisture_analysis_by_plot,
     run_pest_detection_analysis_by_plot
 )
+
 from shared_services import PlotSyncService, run_plot_sync
 from db import supabase
 from Admin import run_monthly_backfill_for_plot
 
 
 # =====================================================
-# STEP 1 — RUN INTERNAL PLOT SYNC
+# CONFIG
 # =====================================================
 
-print("🔄 Running internal plot sync before analysis...", flush=True)
+BATCH_SIZE = 20
+SLEEP_TIME = 10
+
+
+# =====================================================
+# STEP 1 — INTERNAL PLOT SYNC
+# =====================================================
+
+print("🔄 Running plot sync...", flush=True)
 
 try:
     sync_result = run_plot_sync()
@@ -23,185 +34,249 @@ except Exception as e:
     print("❌ Plot sync failed:", str(e), flush=True)
 
 
-# =====================================================
-# STEP 2 — DATE RANGE
-# =====================================================
-
-print("🚀 DAILY ANALYSIS WORKER STARTED", flush=True)
-
-today = date.today().isoformat()
-start_date = (date.today() - timedelta(days=30)).isoformat()
-end_date = today
-
 plots = PlotSyncService().get_plots_dict(force_refresh=True)
 
-print("🔁 Running monthly historical backfill check...", flush=True)
+
+# =====================================================
+# STEP 2 — CREATE ANALYSIS QUEUE (CRON SCHEDULER)
+# =====================================================
+
+print("📦 Creating analysis queue...", flush=True)
+
+analysis_types = [
+    "growth",
+    "water_uptake",
+    "soil_moisture",
+    "pest_detection"
+]
+
+for plot_name, plot_data in plots.items():
+
+    plot_row = (
+        supabase.table("plots")
+        .select("id")
+        .eq("plot_name", plot_name)
+        .execute()
+    )
+
+    if not plot_row.data:
+        continue
+
+    plot_id = plot_row.data[0]["id"]
+
+    for analysis in analysis_types:
+
+        supabase.table("analysis_queue").upsert(
+            {
+                "plot_id": plot_id,
+                "plot_name": plot_name,
+                "analysis_type": analysis,
+                "status": "pending"
+            },
+            on_conflict="plot_id,analysis_type"
+        ).execute()
+
+print("✅ Queue created", flush=True)
+
+
+# =====================================================
+# STEP 3 — MONTHLY BACKFILL CHECK
+# =====================================================
+
+print("🔁 Running monthly backfill...", flush=True)
 
 for plot_name, plot_data in plots.items():
     try:
         run_monthly_backfill_for_plot(plot_name, plot_data)
     except Exception as e:
-        print("🔥 Backfill failed for", plot_name, str(e), flush=True)
+        print("🔥 Backfill failed:", plot_name, str(e), flush=True)
 
 
 # =====================================================
-# STEP 3 — MAIN LOOP
+# DATE RANGE
 # =====================================================
 
-for plot_name, plot_data in plots.items():
+today = date.today().isoformat()
+start_date = (date.today() - timedelta(days=30)).isoformat()
+pest_start = (date.today() - timedelta(days=15)).isoformat()
 
-    print(f"\n--- Processing {plot_name} ---", flush=True)
 
-    try:
-        props = plot_data.get("properties") or {}
-        django_id = props.get("django_id")
+# =====================================================
+# QUEUE HELPERS
+# =====================================================
 
-        if not django_id:
-            print("❌ Missing django_id", flush=True)
+def fetch_jobs():
+    jobs = (
+        supabase.table("analysis_queue")
+        .select("*")
+        .eq("status", "pending")
+        .limit(BATCH_SIZE)
+        .execute()
+    )
+    return jobs.data or []
+
+
+def mark_processing(job_id):
+    supabase.table("analysis_queue").update(
+        {
+            "status": "processing"
+        }
+    ).eq("id", job_id).execute()
+
+
+def mark_completed(job_id):
+    supabase.table("analysis_queue").update(
+        {
+            "status": "completed"
+        }
+    ).eq("id", job_id).execute()
+
+
+def mark_failed(job_id):
+    supabase.table("analysis_queue").update(
+        {
+            "status": "failed"
+        }
+    ).eq("id", job_id).execute()
+
+
+# =====================================================
+# SAFE STORE FUNCTION
+# =====================================================
+
+def store_results(results, analysis_type, plot_id):
+
+    if not results:
+        return
+
+    if isinstance(results, dict):
+        results = [results]
+
+    for geojson in results:
+
+        if not isinstance(geojson, dict):
             continue
 
-        # ---------------- DB CHECK ----------------
-
-        plot_row = (
-            supabase.table("plots")
-            .select("id")
-            .eq("plot_name", plot_name)
-            .execute()
-        )
-
-        if not plot_row.data:
-            print("❌ Plot not found in DB", flush=True)
+        if not geojson.get("features"):
             continue
 
-        plot_id = plot_row.data[0]["id"]
-        print("✔ Plot ID:", plot_id, flush=True)
+        properties = geojson["features"][0]["properties"]
 
-        # =====================================================
-        # SAFE STORE FUNCTION (✅ FIX APPLIED HERE)
-        # =====================================================
+        analysis_date = (
+            properties.get("latest_image_date")
+            or properties.get("analysis_dates", {}).get("latest_image_date")
+            or properties.get("analysis_dates", {}).get("analysis_end_date")
+        )
 
-        def store_results(results, analysis_type):
+        sensor_used = (
+            properties.get("data_source")
+            or properties.get("sensor")
+            or properties.get("sensor_used")
+            or "unknown"
+        )
 
-            if not results:
-                return
+        tile_url = properties.get("tile_url")
 
-            if isinstance(results, dict):
-                results = [results]
+        if not analysis_date:
+            continue
 
-            if not isinstance(results, list):
-                print(f"⚠ Unexpected format for {analysis_type}", flush=True)
-                return
+        # ---------- Satellite ----------
 
-            for geojson in results:
+        supabase.table("satellite_images").upsert(
+            {
+                "plot_id": plot_id,
+                "satellite": sensor_used,
+                "satellite_date": analysis_date,
+            },
+            on_conflict="plot_id,satellite,satellite_date"
+        ).execute()
 
-                if not isinstance(geojson, dict):
-                    continue
+        # ---------- Analysis ----------
 
-                if not geojson.get("features"):
-                    continue
+        supabase.table("analysis_results").upsert(
+            {
+                "plot_id": plot_id,
+                "analysis_type": analysis_type,
+                "analysis_date": analysis_date,
+                "sensor_used": sensor_used,
+                "tile_url": tile_url,
+                "response_json": geojson,
+            },
+            on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
+        ).execute()
 
-                properties = geojson["features"][0]["properties"]
+        print(
+            f"✅ Stored {analysis_type} ({sensor_used}) {analysis_date}",
+            flush=True
+        )
 
-                # =====================================================
-                # ✅ FIX — USE REAL SATELLITE IMAGE DATE
-                # =====================================================
 
-                analysis_date = (
-                    properties.get("analysis_image_date")   # ✅ NEW PRIMARY
-                    or properties.get("latest_image_date")
-                    or properties.get("analysis_dates", {}).get("latest_image_date")
-                    or properties.get("analysis_dates", {}).get("analysis_end_date")
+# =====================================================
+# STEP 4 — QUEUE WORKER LOOP
+# =====================================================
+
+print("🚀 QUEUE WORKER STARTED", flush=True)
+
+while True:
+
+    jobs = fetch_jobs()
+
+    if not jobs:
+        print("😴 No pending jobs. Sleeping...", flush=True)
+        time.sleep(SLEEP_TIME)
+        continue
+
+    for job in jobs:
+
+        job_id = job["id"]
+        plot_name = job["plot_name"]
+        analysis_type = job["analysis_type"]
+        plot_id = job["plot_id"]
+
+        print(f"\n⚙ Processing {plot_name} → {analysis_type}", flush=True)
+
+        mark_processing(job_id)
+
+        try:
+
+            plot_data = plots.get(plot_name)
+
+            if not plot_data:
+                mark_failed(job_id)
+                continue
+
+            if analysis_type == "growth":
+                results = run_growth_analysis_by_plot(
+                    plot_name, plot_data,
+                    start_date, today
                 )
 
-                sensor_used = (
-                    properties.get("data_source")
-                    or properties.get("sensor")
-                    or properties.get("sensor_used")
-                    or "unknown"
+            elif analysis_type == "water_uptake":
+                results = run_water_uptake_analysis_by_plot(
+                    plot_name, plot_data,
+                    start_date, today
                 )
 
-                tile_url = properties.get("tile_url")
-
-                if not analysis_date:
-                    print(f"⚠ Skipping {analysis_type} — no date", flush=True)
-                    continue
-
-                # ---------------- SATELLITE TABLE ----------------
-
-                supabase.table("satellite_images").upsert(
-                    {
-                        "plot_id": plot_id,
-                        "satellite": sensor_used,
-                        "satellite_date": analysis_date,
-                    },
-                    on_conflict="plot_id,satellite,satellite_date"
-                ).execute()
-
-                print(
-                    f"   🛰 Satellite stored {sensor_used} ({analysis_date})",
-                    flush=True
+            elif analysis_type == "soil_moisture":
+                results = run_soil_moisture_analysis_by_plot(
+                    plot_name, plot_data,
+                    start_date, today
                 )
 
-                # ---------------- ANALYSIS TABLE ----------------
-
-                supabase.table("analysis_results").upsert(
-                    {
-                        "plot_id": plot_id,
-                        "analysis_type": analysis_type,
-                        "analysis_date": analysis_date,
-                        "sensor_used": sensor_used,
-                        "tile_url": tile_url,
-                        "response_json": geojson,
-                    },
-                    on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
-                ).execute()
-
-                print(
-                    f"   ✅ Stored {analysis_type} ({sensor_used}) for {analysis_date}",
-                    flush=True
+            elif analysis_type == "pest_detection":
+                results = run_pest_detection_analysis_by_plot(
+                    plot_name, plot_data,
+                    pest_start, today
                 )
 
-        # =====================================================
-        # RUN ANALYSES
-        # =====================================================
+            else:
+                mark_failed(job_id)
+                continue
 
-        growth_results = run_growth_analysis_by_plot(
-            plot_name,
-            plot_data=plot_data,
-            start_date=start_date,
-            end_date=end_date
-        )
-        print("✔ Growth analysis done", flush=True)
-        store_results(growth_results, "growth")
+            store_results(results, analysis_type, plot_id)
 
-        water_results = run_water_uptake_analysis_by_plot(
-            plot_name,
-            plot_data=plot_data,
-            start_date=start_date,
-            end_date=end_date
-        )
-        print("✔ Water uptake analysis done", flush=True)
-        store_results(water_results, "water_uptake")
+            mark_completed(job_id)
 
-        soil_results = run_soil_moisture_analysis_by_plot(
-            plot_name,
-            plot_data=plot_data,
-            start_date=start_date,
-            end_date=end_date
-        )
-        print("✔ Soil moisture analysis done", flush=True)
-        store_results(soil_results, "soil_moisture")
-
-        pest_start = (date.today() - timedelta(days=15)).isoformat()
-
-        pest_results = run_pest_detection_analysis_by_plot(
-            plot_name,
-            plot_data=plot_data,
-            start_date=pest_start,
-            end_date=end_date
-        )
-        print("✔ Pest detection analysis done", flush=True)
-        store_results(pest_results, "pest_detection")
-
-    except Exception as e:
-        print("🔥 ERROR:", str(e), flush=True)
+        except Exception as e:
+            print("🔥 Job failed:", str(e), flush=True)
+            mark_failed(job_id)
