@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from gee_growth import (
     run_growth_analysis_by_plot,
@@ -19,6 +20,9 @@ from Admin import run_monthly_backfill_for_plot
 
 BATCH_SIZE = 20
 SLEEP_TIME = 10
+REQUEST_DELAY = 3
+MAX_WORKERS = 5
+MAX_RETRY = 3
 
 
 # =====================================================
@@ -33,12 +37,11 @@ try:
 except Exception as e:
     print("❌ Plot sync failed:", str(e), flush=True)
 
-
 plots = PlotSyncService().get_plots_dict(force_refresh=True)
 
 
 # =====================================================
-# STEP 2 — CREATE ANALYSIS QUEUE (CRON SCHEDULER)
+# STEP 2 — CREATE ANALYSIS QUEUE
 # =====================================================
 
 print("📦 Creating analysis queue...", flush=True)
@@ -65,13 +68,13 @@ for plot_name, plot_data in plots.items():
     plot_id = plot_row.data[0]["id"]
 
     for analysis in analysis_types:
-
         supabase.table("analysis_queue").upsert(
             {
                 "plot_id": plot_id,
                 "plot_name": plot_name,
                 "analysis_type": analysis,
-                "status": "pending"
+                "status": "pending",
+                "priority": 1
             },
             on_conflict="plot_id,analysis_type"
         ).execute()
@@ -80,7 +83,7 @@ print("✅ Queue created", flush=True)
 
 
 # =====================================================
-# STEP 3 — MONTHLY BACKFILL CHECK
+# STEP 3 — MONTHLY BACKFILL
 # =====================================================
 
 print("🔁 Running monthly backfill...", flush=True)
@@ -110,38 +113,82 @@ def fetch_jobs():
         supabase.table("analysis_queue")
         .select("*")
         .eq("status", "pending")
+        .order("priority", desc=True)
         .limit(BATCH_SIZE)
         .execute()
     )
     return jobs.data or []
 
 
-def mark_processing(job_id):
-    supabase.table("analysis_queue").update(
-        {
-            "status": "processing"
-        }
-    ).eq("id", job_id).execute()
+def lock_job(job_id):
+    res = (
+        supabase.table("analysis_queue")
+        .update({"status": "processing"})
+        .eq("id", job_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    return len(res.data) > 0
 
 
 def mark_completed(job_id):
     supabase.table("analysis_queue").update(
-        {
-            "status": "completed"
-        }
+        {"status": "completed"}
     ).eq("id", job_id).execute()
 
 
-def mark_failed(job_id):
-    supabase.table("analysis_queue").update(
-        {
-            "status": "failed"
-        }
-    ).eq("id", job_id).execute()
+def mark_failed(job_id, error="Unknown"):
+
+    job = (
+        supabase.table("analysis_queue")
+        .select("retry_count")
+        .eq("id", job_id)
+        .single()
+        .execute()
+    )
+
+    retry = job.data.get("retry_count", 0)
+
+    if retry < MAX_RETRY:
+        supabase.table("analysis_queue").update({
+            "status": "pending",
+            "retry_count": retry + 1,
+            "last_error": str(error)
+        }).eq("id", job_id).execute()
+
+        print("🔁 Retrying job", flush=True)
+
+    else:
+        supabase.table("analysis_queue").update({
+            "status": "failed",
+            "last_error": str(error)
+        }).eq("id", job_id).execute()
 
 
 # =====================================================
-# SAFE STORE FUNCTION
+# SCENE SKIP CHECK ⭐
+# =====================================================
+
+def is_scene_unchanged(plot_id, new_date):
+
+    latest = (
+        supabase.table("satellite_images")
+        .select("satellite_date")
+        .eq("plot_id", plot_id)
+        .order("satellite_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not latest.data:
+        return False
+
+    old_date = latest.data[0]["satellite_date"]
+    return str(old_date) == str(new_date)
+
+
+# =====================================================
+# STORE RESULTS
 # =====================================================
 
 def store_results(results, analysis_type, plot_id):
@@ -154,33 +201,26 @@ def store_results(results, analysis_type, plot_id):
 
     for geojson in results:
 
-        if not isinstance(geojson, dict):
-            continue
-
         if not geojson.get("features"):
             continue
 
-        properties = geojson["features"][0]["properties"]
+        props = geojson["features"][0]["properties"]
 
         analysis_date = (
-            properties.get("latest_image_date")
-            or properties.get("analysis_dates", {}).get("latest_image_date")
-            or properties.get("analysis_dates", {}).get("analysis_end_date")
+            props.get("analysis_image_date")
+            or props.get("latest_image_date")
         )
 
-        sensor_used = (
-            properties.get("data_source")
-            or properties.get("sensor")
-            or properties.get("sensor_used")
-            or "unknown"
-        )
-
-        tile_url = properties.get("tile_url")
+        sensor_used = props.get("sensor", "unknown")
+        tile_url = props.get("tile_url")
 
         if not analysis_date:
             continue
 
-        # ---------- Satellite ----------
+        # ✅ SKIP unchanged satellite
+        if is_scene_unchanged(plot_id, analysis_date):
+            print("⏭ Scene unchanged — skipping")
+            return
 
         supabase.table("satellite_images").upsert(
             {
@@ -190,8 +230,6 @@ def store_results(results, analysis_type, plot_id):
             },
             on_conflict="plot_id,satellite,satellite_date"
         ).execute()
-
-        # ---------- Analysis ----------
 
         supabase.table("analysis_results").upsert(
             {
@@ -205,14 +243,75 @@ def store_results(results, analysis_type, plot_id):
             on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
         ).execute()
 
-        print(
-            f"✅ Stored {analysis_type} ({sensor_used}) {analysis_date}",
-            flush=True
-        )
+        print(f"✅ Stored {analysis_type} {analysis_date}", flush=True)
 
 
 # =====================================================
-# STEP 4 — QUEUE WORKER LOOP
+# JOB PROCESSOR ⭐⭐⭐
+# =====================================================
+
+def process_job(job):
+
+    job_id = job["id"]
+    plot_name = job["plot_name"]
+    analysis_type = job["analysis_type"]
+    plot_id = job["plot_id"]
+
+    if not lock_job(job_id):
+        return
+
+    print(f"⚙ Processing {plot_name} → {analysis_type}", flush=True)
+
+    try:
+
+        plot_data = plots.get(plot_name)
+
+        if not plot_data:
+            mark_failed(job_id, "Plot missing")
+            return
+
+        if analysis_type == "growth":
+            results = run_growth_analysis_by_plot(
+                plot_name, plot_data, start_date, today
+            )
+
+        elif analysis_type == "water_uptake":
+            results = run_water_uptake_analysis_by_plot(
+                plot_name, plot_data, start_date, today
+            )
+
+        elif analysis_type == "soil_moisture":
+            results = run_soil_moisture_analysis_by_plot(
+                plot_name, plot_data, start_date, today
+            )
+
+        elif analysis_type == "pest_detection":
+            results = run_pest_detection_analysis_by_plot(
+                plot_name, plot_data, pest_start, today
+            )
+
+        else:
+            mark_failed(job_id, "Unknown analysis")
+            return
+
+        store_results(results, analysis_type, plot_id)
+
+        mark_completed(job_id)
+
+        time.sleep(REQUEST_DELAY)
+
+    except Exception as e:
+
+        if "Quota exceeded" in str(e):
+            print("🧊 Cooling GEE 5 mins...")
+            time.sleep(300)
+
+        print("🔥 Job failed:", str(e), flush=True)
+        mark_failed(job_id, str(e))
+
+
+# =====================================================
+# WORKER LOOP ⭐ PARALLEL
 # =====================================================
 
 print("🚀 QUEUE WORKER STARTED", flush=True)
@@ -222,61 +321,9 @@ while True:
     jobs = fetch_jobs()
 
     if not jobs:
-        print("😴 No pending jobs. Sleeping...", flush=True)
+        print("😴 No pending jobs...", flush=True)
         time.sleep(SLEEP_TIME)
         continue
 
-    for job in jobs:
-
-        job_id = job["id"]
-        plot_name = job["plot_name"]
-        analysis_type = job["analysis_type"]
-        plot_id = job["plot_id"]
-
-        print(f"\n⚙ Processing {plot_name} → {analysis_type}", flush=True)
-
-        mark_processing(job_id)
-
-        try:
-
-            plot_data = plots.get(plot_name)
-
-            if not plot_data:
-                mark_failed(job_id)
-                continue
-
-            if analysis_type == "growth":
-                results = run_growth_analysis_by_plot(
-                    plot_name, plot_data,
-                    start_date, today
-                )
-
-            elif analysis_type == "water_uptake":
-                results = run_water_uptake_analysis_by_plot(
-                    plot_name, plot_data,
-                    start_date, today
-                )
-
-            elif analysis_type == "soil_moisture":
-                results = run_soil_moisture_analysis_by_plot(
-                    plot_name, plot_data,
-                    start_date, today
-                )
-
-            elif analysis_type == "pest_detection":
-                results = run_pest_detection_analysis_by_plot(
-                    plot_name, plot_data,
-                    pest_start, today
-                )
-
-            else:
-                mark_failed(job_id)
-                continue
-
-            store_results(results, analysis_type, plot_id)
-
-            mark_completed(job_id)
-
-        except Exception as e:
-            print("🔥 Job failed:", str(e), flush=True)
-            mark_failed(job_id)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        executor.map(process_job, jobs)
