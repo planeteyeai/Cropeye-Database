@@ -204,9 +204,6 @@ def run_plot_sync():
         processed += 1
 
         try:
-            if name in existing_names:
-                skipped += 1
-                continue
 
             geom = data["geometry"]
             geom_geojson = geom.getInfo()
@@ -226,9 +223,9 @@ def run_plot_sync():
                 "geom": f"SRID=4326;{wkt}",
                 "geojson": geom_geojson,
                 "area_hectares": area_ha,
-                "django_plot_id": str(plot["plot_name"]),
-                "plantation_date": plot.get("plantation_date"),
-                "crop_type": plot.get("crop_type_name"),
+                "django_plot_id": str(props.get("django_id")),
+                "plantation_date": props.get("plantation_date"),
+                "crop_type": props.get("crop_type_name"),
             }, on_conflict="plot_name").execute()
 
             inserted += 1
