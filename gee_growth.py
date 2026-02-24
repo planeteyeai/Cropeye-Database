@@ -790,7 +790,9 @@ def run_pest_detection_analysis_by_plot(
             print(f"❌ Missing geometry for {plot_name}")
             return None
 
-        geometry = ee.Geometry(geometry)
+        # ✅ FIX: geometry already EE object sometimes
+        if not isinstance(geometry, ee.Geometry):
+            geometry = ee.Geometry(geometry)
 
         props = plot_data.get("properties") or {}
 
@@ -808,7 +810,7 @@ def run_pest_detection_analysis_by_plot(
             return None
 
         # ==============================
-        # SAFE DATE CREATION
+        # DATE CREATION
         # ==============================
 
         if not start_date or not end_date:
@@ -821,7 +823,7 @@ def run_pest_detection_analysis_by_plot(
         baseline_year = analysis_end.get("year").subtract(1)
 
         # ========================================================
-        # GRAPES LOGIC (UNCHANGED)
+        # GRAPES
         # ========================================================
 
         if "grape" in crop_type:
@@ -847,7 +849,6 @@ def run_pest_detection_analysis_by_plot(
                 print(f"⚠ No Sentinel-1 images for {plot_name}")
                 return None
 
-            # ✅ SAFE ADD — IMAGE DATES
             image_dates = (
                 s1.aggregate_array("system:time_start")
                 .map(lambda d: ee.Date(d).format("YYYY-MM-dd"))
@@ -901,7 +902,7 @@ def run_pest_detection_analysis_by_plot(
             tile_image = cur.select("VV")
 
         # ========================================================
-        # SUGARCANE LOGIC (UNCHANGED)
+        # SUGARCANE
         # ========================================================
 
         elif "sugar" in crop_type:
@@ -915,9 +916,9 @@ def run_pest_detection_analysis_by_plot(
                 .filterDate(start_date, end_date)
                 .filter(ee.Filter.eq("instrumentMode", "IW"))
                 .filter(ee.Filter.listContains(
-                "transmitterReceiverPolarisation", "VV"))
+                    "transmitterReceiverPolarisation", "VV"))
                 .filter(ee.Filter.listContains(
-                "transmitterReceiverPolarisation", "VH"))
+                    "transmitterReceiverPolarisation", "VH"))
             )
 
             image_count = int(s1.size().getInfo() or 0)
@@ -940,81 +941,37 @@ def run_pest_detection_analysis_by_plot(
             ratio = vv.divide(vh.add(1e-6)).rename("VV_VH")
 
             sar_composite = vv.addBands(vh).addBands(ratio)
-            sar_water_index = vh.multiply(-1).rename("water_index")
-
-            def normalize01(image):
-                stats = image.reduceRegion(
-                    ee.Reducer.minMax(),
-                    geometry,
-                    10,
-                    bestEffort=True
-                )
-
-                band = image.bandNames().get(0)
-
-                min_val = ee.Number(
-                    stats.get(ee.String(band).cat("_min"))
-                )
-
-                max_val = ee.Number(
-                    stats.get(ee.String(band).cat("_max"))
-                )
-
-                return image.unitScale(min_val, max_val).clamp(0, 1)
+            sar_water_index = vh.multiply(-1)
 
             sar_mean = sar_composite.reduce(
                 ee.Reducer.mean()).rename("sar_fc")
 
-            sar_norm = normalize01(sar_mean)
-            water_norm = normalize01(sar_water_index)
-
-            avg = sar_norm.add(water_norm).multiply(0.5)
-
-            low = avg.reduceRegion(
-                ee.Reducer.percentile([2]),
-                geometry,
-                10,
-                bestEffort=True
-            ).values().get(0)
-
-            high = avg.reduceRegion(
-                ee.Reducer.percentile([98]),
-                geometry,
-                10,
-                bestEffort=True
-            ).values().get(0)
-
-            stretched = avg.unitScale(low, high).clamp(0, 1)
+            stretched = sar_mean.unitScale(-25, 5).clamp(0, 1)
 
             chewing_mask = stretched.lte(0.01)
-
-            # fungi derived from SAR stress
             fungi_mask = stretched.lte(0.03)
-
             sucking_mask = stretched.gte(0.85)
-
             wilt_mask = stretched.gte(0.9)
-
             soilborne_mask = chewing_mask
 
             tile_image = stretched
 
-            else:
-                print(f"⚠ Pest detection not supported for crop: {crop_type}")
-                return None
+        # ========================================================
+        # UNSUPPORTED
+        # ========================================================
+
+        else:
+            print(f"⚠ Pest detection not supported for crop: {crop_type}")
+            return None
 
         # ==============================
-        # SAFE TILE URL
+        # TILE URL
         # ==============================
 
         try:
             tile_url = tile_image.getMapId()["tile_fetcher"].url_format
         except Exception:
             tile_url = None
-
-        # ==============================
-        # PIXEL COUNTING (UNCHANGED)
-        # ==============================
 
         one = ee.Image.constant(1)
 
@@ -1039,33 +996,22 @@ def run_pest_detection_analysis_by_plot(
         soilborne_pixel_count = safe_count(soilborne_mask)
 
         healthy_pixel_count = max(
-            total_pixel_count
-            - (
-                chewing_pixel_count
-                + fungi_pixel_count
-                + sucking_pixel_count
-                + wilt_pixel_count
-                + soilborne_pixel_count
-            ),
-            0,
+            total_pixel_count - (
+                chewing_pixel_count +
+                fungi_pixel_count +
+                sucking_pixel_count +
+                wilt_pixel_count +
+                soilborne_pixel_count
+            ), 0
         )
 
         def percent(x):
             return (x / total_pixel_count) * 100 if total_pixel_count else 0
 
-        # ==============================
-        # RESPONSE
-        # ==============================
-        # =====================================
-# SATELLITE ANALYSIS DATE (FIX)
-# =====================================
+        analysis_image_date = (
+            image_dates[-1] if image_dates else end_date
+        )
 
-        analysis_image_date = None
-
-        if image_dates and len(image_dates) > 0:
-            analysis_image_date = image_dates[-1]
-        else:
-            analysis_image_date = end_date
         analysis_dates = {
             "baseline_start_date": baseline_start.format("YYYY-MM-dd").getInfo(),
             "baseline_end_date": baseline_end.format("YYYY-MM-dd").getInfo(),
@@ -1099,22 +1045,16 @@ def run_pest_detection_analysis_by_plot(
             "pixel_summary": {
                 "total_pixel_count": total_pixel_count,
                 "healthy_pixel_count": healthy_pixel_count,
-
                 "chewing_affected_pixel_count": chewing_pixel_count,
                 "chewing_affected_pixel_percentage": percent(chewing_pixel_count),
-
                 "fungi_affected_pixel_count": fungi_pixel_count,
                 "fungi_affected_pixel_percentage": percent(fungi_pixel_count),
-
                 "sucking_affected_pixel_count": sucking_pixel_count,
                 "sucking_affected_pixel_percentage": percent(sucking_pixel_count),
-
                 "wilt_affected_pixel_count": wilt_pixel_count,
                 "wilt_affected_pixel_percentage": percent(wilt_pixel_count),
-
                 "SoilBorn_pixel_count": soilborne_pixel_count,
                 "SoilBorn_affected_pixel_percentage": percent(soilborne_pixel_count),
-
                 **analysis_dates,
             },
         }
