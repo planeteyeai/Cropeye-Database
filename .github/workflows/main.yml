@@ -1,46 +1,61 @@
-name: Night Access Alert
+name: Night Access Alert (IST)
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
-    branches: [main]
+    branches: [ main ]
 
 jobs:
-  check-time-and-alert:
+  night-access-check:
     runs-on: ubuntu-latest
-    steps:
-      # 1️⃣ Check current time
-      - name: Check Time
-        id: check
-        run: |
-          HOUR=$(date +'%H')
-          TIME_NOW=$(date +"%H:%M")
-          echo "TIME_NOW=$TIME_NOW" >> $GITHUB_ENV
-          if [ $HOUR -ge 19 ]; then
-            echo "after_7_pm=true" >> $GITHUB_ENV
-          else
-            echo "after_7_pm=false" >> $GITHUB_ENV
 
-      # 2️⃣ Send Email Alert only after 7 PM
-      - name: Send Email Alert
-        if: env.after_7_pm == 'true'
+    steps:
+
+      # 1️⃣ Get India Time (IST)
+      - name: Get India Time
+        id: timecheck
+        run: |
+          HOUR=$(TZ="Asia/Kolkata" date +'%H')
+          TIME_NOW=$(TZ="Asia/Kolkata" date +"%H:%M")
+
+          echo "TIME_NOW=$TIME_NOW" >> $GITHUB_ENV
+
+          # Check if time is between 7 PM (19) and 7 AM (07)
+          if [ "$HOUR" -ge 19 ] || [ "$HOUR" -lt 7 ]; then
+            echo "night_time=true" >> $GITHUB_ENV
+          else
+            echo "night_time=false" >> $GITHUB_ENV
+          fi
+
+
+      # 2️⃣ Send Email Only at Night
+      - name: Send Night Alert Email
+        if: env.night_time == 'true'
         uses: dawidd6/action-send-mail@v3
+
         with:
           server_address: smtp.gmail.com
           server_port: 587
+
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "GitHub Alert: Repo Activity After 7 PM"
+
+          subject: "🚨 Night Access Alert (7PM–7AM IST)"
+
           to: ${{ secrets.ADMIN_EMAIL }}
+
           body: |
-            Attention Admin,
+            ⚠️ Night Access Detected!
 
-            User: ${{ github.actor }}
-            Repository: ${{ github.repository }}
-            Event: ${{ github.event_name }}
-            Time: ${{ env.TIME_NOW }}
+            Someone accessed the repository at restricted hours.
 
-            SCREATE secret value: ${{ secrets.SCREATE }}
+            👤 User: ${{ github.actor }}
+            📦 Repository: ${{ github.repository }}
+            📌 Event: ${{ github.event_name }}
+            🕒 Time (IST): ${{ env.TIME_NOW }}
+            🌿 Branch: main
 
-            This action occurred after 7 PM.
+            This activity happened between 7 PM and 7 AM (IST).
+
+            Please review if this was authorized.
