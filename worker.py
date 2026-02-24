@@ -65,7 +65,7 @@ for plot_name, plot_data in plots.items():
         plot_row = (
             supabase.table("plots")
             .select("id")
-            .eq("plot_name", plot_name)  # ⚠ Change if column name differs
+            .eq("plot_name", plot_name)
             .execute()
         )
 
@@ -77,7 +77,7 @@ for plot_name, plot_data in plots.items():
         print("✔ Plot ID:", plot_id, flush=True)
 
         # =====================================================
-        # SAFE STORE FUNCTION
+        # SAFE STORE FUNCTION (✅ FIX APPLIED HERE)
         # =====================================================
 
         def store_results(results, analysis_type):
@@ -85,7 +85,6 @@ for plot_name, plot_data in plots.items():
             if not results:
                 return
 
-            # 🔥 Normalize dict → list
             if isinstance(results, dict):
                 results = [results]
 
@@ -103,10 +102,13 @@ for plot_name, plot_data in plots.items():
 
                 properties = geojson["features"][0]["properties"]
 
-                # ---------------- DATE EXTRACTION ----------------
+                # =====================================================
+                # ✅ FIX — USE REAL SATELLITE IMAGE DATE
+                # =====================================================
 
                 analysis_date = (
-                    properties.get("latest_image_date")
+                    properties.get("analysis_image_date")   # ✅ NEW PRIMARY
+                    or properties.get("latest_image_date")
                     or properties.get("analysis_dates", {}).get("latest_image_date")
                     or properties.get("analysis_dates", {}).get("analysis_end_date")
                 )
