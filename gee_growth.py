@@ -1033,7 +1033,7 @@ def run_pest_detection_analysis_by_plot(
                 "sensor": "Sentinel-1",
                 "image_count": image_count,
                 "image_dates": image_dates,
-                "analysis_image_date": analysis_image_date,
+                "latest_image_date": analysis_image_date,
                 "tile_url": tile_url,
                 "last_updated": datetime.utcnow().isoformat(),
             },
