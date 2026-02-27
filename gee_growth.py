@@ -258,6 +258,8 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
         analysis_start = ee.Date(start_date)
         analysis_end = ee.Date(end_date)
 
+        results = []
+
         # ===============================
         # SENTINEL-2 NDMI
         # ===============================
@@ -280,6 +282,11 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
         latest_s2_img = None
 
         if s2_count > 0:
+
+            latest_s2_img = ee.Image(s2_collection.first())
+            latest_s2_date = ee.Date(
+                latest_s2_img.get("system:time_start")
+            )
 
             sensor = "s2"
 
@@ -316,6 +323,14 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
 
         if s1_count >= 2:
 
+            image_list = s1_collection.toList(2)
+            latest_image = ee.Image(image_list.get(0))
+            previous_image = ee.Image(image_list.get(1))
+
+            latest_s1_date = ee.Date(
+                latest_image.get("system:time_start")
+            )
+
             sensor = "s1"
 
             delta_vh = latest_image.subtract(previous_image)
@@ -323,9 +338,7 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             feature = build_feature(
                 plot_name,
                 sensor,
-                ee.Date(
-                latest_image.get("system:time_start")
-                ).format("YYYY-MM-dd").getInfo()
+                latest_s1_date.format("YYYY-MM-dd").getInfo()
             )
 
             results.append(feature)
@@ -336,7 +349,15 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
         use_s2 = False
         use_s1 = False
 
-
+        if latest_s2_date and latest_s1_date:
+            use_s2 = latest_s2_date.millis().getInfo() >= latest_s1_date.millis().getInfo()
+            use_s1 = not use_s2
+        elif latest_s2_date:
+            use_s2 = True
+        elif latest_s1_date:
+            use_s1 = True
+        else:
+            return None
 
         # ===============================
         # CLASSIFICATION (UNCHANGED)
@@ -544,6 +565,8 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         analysis_start = ee.Date(start_date)
         analysis_end = ee.Date(end_date)
 
+        results = []
+
         # =====================================================
         # SENTINEL-1 (VV)
         # =====================================================
@@ -559,9 +582,18 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         )
 
         s1_size = s1_collection.size().getInfo()
+        s1_count = s1_size
         s1_latest_date = None
 
         if s1_count >= 2:
+
+            image_list = s1_collection.toList(2)
+            latest_image = ee.Image(image_list.get(0))
+            previous_image = ee.Image(image_list.get(1))
+
+            s1_latest_date = ee.Date(
+                latest_image.get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
 
             sensor = "s1"
 
@@ -571,7 +603,7 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
                 plot_name,
                 sensor,
                 ee.Date(
-                latest_image.get("system:time_start")
+                    latest_image.get("system:time_start")
                 ).format("YYYY-MM-dd").getInfo()
             )
 
@@ -590,9 +622,16 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         )
 
         s2_size = s2_collection.size().getInfo()
+        s2_count = s2_size
         s2_latest_date = None
 
         if s2_count > 0:
+
+            latest_s2_img = ee.Image(s2_collection.first())
+
+            s2_latest_date = ee.Date(
+                latest_s2_img.get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
 
             sensor = "s2"
 
@@ -601,7 +640,7 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
             feature = build_feature(
                 plot_name,
                 sensor,
-                latest_s2_date.format("YYYY-MM-dd").getInfo()
+                s2_latest_date
             )
 
             results.append(feature)
@@ -611,6 +650,28 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         # =====================================================
         if s1_size == 0 and s2_size == 0:
             return None
+
+        use_s2 = False
+        sensor_used = None
+        latest_date = None
+
+        if s1_latest_date and s2_latest_date:
+            if s2_latest_date >= s1_latest_date:
+                use_s2 = True
+                sensor_used = "Sentinel-2"
+                latest_date = s2_latest_date
+            else:
+                use_s2 = False
+                sensor_used = "Sentinel-1"
+                latest_date = s1_latest_date
+        elif s2_latest_date:
+            use_s2 = True
+            sensor_used = "Sentinel-2"
+            latest_date = s2_latest_date
+        else:
+            use_s2 = False
+            sensor_used = "Sentinel-1"
+            latest_date = s1_latest_date
 
         # =====================================================
         # CLASSIFICATION
@@ -734,9 +795,6 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
             pixel_summary[f"{key}_pixel_percentage"] = round(percent, 2)
             pixel_summary[f"{key}_pixel_coordinates"] = coords
 
-        # =====================================================
-        # FEATURE
-        # =====================================================
         feature = {
             "type": "Feature",
             "geometry": {
