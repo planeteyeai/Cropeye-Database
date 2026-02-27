@@ -23,6 +23,13 @@ ee.Initialize(credentials, project=service_account_info["project_id"])
 # Growth Analysis
 # ======================================================
 
+def build_feature(plot_name, sensor, latest_date):
+    return {
+        "plot_name": plot_name,
+        "sensor": sensor,
+        "latest_image_date": latest_date
+    }
+
 def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
     try:
