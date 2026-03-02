@@ -85,14 +85,69 @@ print("✅ Queue created", flush=True)
 # =====================================================
 # STEP 3 — MONTHLY BACKFILL
 # =====================================================
+# =====================================================
+# STEP 3 — SMART MONTHLY BACKFILL ✅ COST SAFE
+# =====================================================
 
-print("🔁 Running monthly backfill...", flush=True)
+print("🧠 Smart backfill check...", flush=True)
+
+
+def get_plot_hash(plot_data):
+    plantation = str(plot_data.get("plantation_date"))
+    crop = str(plot_data.get("crop_type"))
+    return f"{plantation}_{crop}"
+
 
 for plot_name, plot_data in plots.items():
+
     try:
-        run_monthly_backfill_for_plot(plot_name, plot_data)
+
+        plot_row = (
+            supabase.table("plots")
+            .select("id, backfill_completed, last_backfill_hash")
+            .eq("plot_name", plot_name)
+            .single()
+            .execute()
+        )
+
+        if not plot_row.data:
+            continue
+
+        plot_id = plot_row.data["id"]
+        backfill_done = plot_row.data.get("backfill_completed")
+        old_hash = plot_row.data.get("last_backfill_hash")
+
+        new_hash = get_plot_hash(plot_data)
+
+        # ✅ NEW PLOT
+        if not backfill_done:
+            print(f"🆕 New plot → backfill {plot_name}", flush=True)
+
+            run_monthly_backfill_for_plot(plot_name, plot_data)
+
+            supabase.table("plots").update({
+                "backfill_completed": True,
+                "last_backfill_hash": new_hash
+            }).eq("id", plot_id).execute()
+
+            continue
+
+        # ✅ UPDATED PLOT
+        if old_hash != new_hash:
+
+            print(f"🌱 Plot updated → rebackfill {plot_name}", flush=True)
+
+            run_monthly_backfill_for_plot(plot_name, plot_data)
+
+            supabase.table("plots").update({
+                "last_backfill_hash": new_hash
+            }).eq("id", plot_id).execute()
+
+        else:
+            print(f"✅ Backfill already done {plot_name}", flush=True)
+
     except Exception as e:
-        print("🔥 Backfill failed:", plot_name, str(e), flush=True)
+        print("🔥 Smart backfill failed:", plot_name, str(e), flush=True)
 
 
 # =====================================================
