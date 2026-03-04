@@ -765,22 +765,19 @@ def verify_worker(token):
 
 def run_monthly_backfill_for_plot(plot_name, plot_data):
 
-    print(f"📦 Checking historical monthly backfill for {plot_name}", flush=True)
+    print(f"📦 Smart monthly backfill for {plot_name}", flush=True)
 
     props = plot_data.get("properties") or {}
+
     plantation_date = props.get("plantation_date")
     django_id = props.get("django_id")
-
-    if not plantation_date:
-        print("⚠ Missing plantation_date", flush=True)
-        return
 
     if not django_id:
         print("⚠ Missing django_id", flush=True)
         return
 
     # --------------------------------------------------
-    # Get plot_id from DB
+    # GET plot_id
     # --------------------------------------------------
 
     plot_row = (
@@ -796,26 +793,43 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
 
     plot_id = plot_row.data[0]["id"]
 
-    start = datetime.strptime(plantation_date, "%Y-%m-%d").date()
-    today = date.today()
-
-    current_month_start = start.replace(day=1)
+    today = date.today().replace(day=1)
 
     # ==================================================
-    # MONTH LOOP
+    # ✅ BACKFILL RANGE DECISION
     # ==================================================
 
-    while current_month_start < today:
+    if plantation_date:
 
-        next_month = current_month_start + relativedelta(months=1)
+        plantation_month = (
+            datetime.strptime(plantation_date, "%Y-%m-%d")
+            .date()
+            .replace(day=1)
+        )
 
-        month_start_str = current_month_start.isoformat()
+        stop_month = plantation_month
+
+    else:
+        print("⚠ Plantation date missing → last 10 months", flush=True)
+        stop_month = today - relativedelta(months=10)
+
+    current_month = today
+
+    # ==================================================
+    # MONTH LOOP (REVERSE ⭐)
+    # ==================================================
+
+    while current_month >= stop_month:
+
+        next_month = current_month + relativedelta(months=1)
+
+        month_start_str = current_month.isoformat()
         month_end_str = next_month.isoformat()
 
         print(f"\n🛰 Processing {month_start_str} → {month_end_str}", flush=True)
 
         # ==================================================
-        # HELPER FUNCTION FOR ALL ANALYSIS TYPES
+        # ANALYSIS RUNNER
         # ==================================================
 
         def process_analysis(analysis_type, analysis_function):
@@ -832,12 +846,13 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
             )
 
             if existing.data:
-                print(f"✔ {analysis_type} already stored", flush=True)
+                print(f"✔ {analysis_type} already exists", flush=True)
                 return
 
             print(f"🔎 Running {analysis_type}", flush=True)
 
             try:
+
                 results = analysis_function(
                     plot_name=plot_name,
                     plot_data=plot_data,
@@ -849,25 +864,10 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                     print(f"⚠ No {analysis_type} results", flush=True)
                     return
 
-                # ==================================================
-                # 🔥 CRITICAL FIX: Normalize result format
-                # ==================================================
-
                 if isinstance(results, dict):
-                    results = [results]   # convert single dict → list
-
-                if not isinstance(results, list):
-                    print(f"⚠ Unexpected result format for {analysis_type}", flush=True)
-                    return
-
-                # ==================================================
-                # STORE RESULTS
-                # ==================================================
+                    results = [results]
 
                 for geojson in results:
-
-                    if not isinstance(geojson, dict):
-                        continue
 
                     if not geojson.get("features"):
                         continue
@@ -890,10 +890,9 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                     tile_url = properties.get("tile_url")
 
                     if not analysis_date:
-                        print(f"⚠ Skipping {analysis_type} — missing analysis_date", flush=True)
                         continue
 
-                    response = supabase.table("analysis_results").upsert(
+                    supabase.table("analysis_results").upsert(
                         {
                             "plot_id": plot_id,
                             "analysis_type": analysis_type,
@@ -905,16 +904,16 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                         on_conflict="plot_id,analysis_type,analysis_date,sensor_used"
                     ).execute()
 
-                    if hasattr(response, "error") and response.error:
-                        print(f"❌ {analysis_type} insert error:", response.error, flush=True)
-                    else:
-                        print(f"   ✅ Stored {analysis_type} ({analysis_date})", flush=True)
+                    print(
+                        f"   ✅ Stored {analysis_type} ({analysis_date})",
+                        flush=True
+                    )
 
             except Exception as e:
                 print(f"🔥 {analysis_type} failed: {e}", flush=True)
 
         # ==================================================
-        # RUN ALL ANALYSIS TYPES
+        # RUN ANALYSIS
         # ==================================================
 
         process_analysis("growth", run_growth_analysis_by_plot)
@@ -922,9 +921,10 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         process_analysis("soil_moisture", run_soil_moisture_analysis_by_plot)
         process_analysis("pest_detection", run_pest_detection_analysis_by_plot)
 
-        current_month_start = next_month
+        # ⭐ MOVE BACKWARD
+        current_month = current_month - relativedelta(months=1)
 
-    print(f"\n✅ Monthly backfill completed for {plot_name}", flush=True)
+    print(f"\n✅ Backfill completed for {plot_name}", flush=True)
 
 
 @app.post("/analyze_Growth")
