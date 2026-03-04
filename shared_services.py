@@ -242,7 +242,52 @@ def run_plot_sync():
         "errors": errors,
         "processed": processed
     }
+# =====================================================
+# NEW FUNCTION: Trigger backfill for new plots immediately
+# =====================================================
 
+def trigger_new_plot_backfill():
+    """
+    Detect new plots (backfill_completed=False) and run monthly backfill immediately.
+    After completion, exit. Does not touch daily cron/queue.
+    """
+    plot_service = PlotSyncService()
+    plots = plot_service.get_plots_dict(force_refresh=True)
+
+    for plot_name, plot_data in plots.items():
+        try:
+            plot_row = (
+                supabase.table("plots")
+                .select("id, backfill_completed, last_backfill_hash")
+                .eq("plot_name", plot_name)
+                .single()
+                .execute()
+            )
+
+            if not plot_row.data:
+                continue
+
+            plot_id = plot_row.data["id"]
+            backfill_done = plot_row.data.get("backfill_completed", False)
+
+            if backfill_done:
+                continue  # Already done
+
+            new_hash = f"{plot_data['properties'].get('plantation_date')}_{plot_data['properties'].get('crop_type_name')}"
+
+            print(f"🆕 New plot detected → running backfill: {plot_name}", flush=True)
+            run_monthly_backfill_for_plot(plot_name, plot_data)
+
+            # Mark as backfilled
+            supabase.table("plots").update({
+                "backfill_completed": True,
+                "last_backfill_hash": new_hash
+            }).eq("id", plot_id).execute()
+
+            print(f"✅ Backfill completed for {plot_name}", flush=True)
+
+        except Exception as e:
+            print(f"🔥 Backfill failed for {plot_name}: {e}", flush=True)
 
 
     
