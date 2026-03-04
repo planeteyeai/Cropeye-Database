@@ -926,6 +926,343 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
 
     print(f"\n✅ Backfill completed for {plot_name}", flush=True)
 
+@app.post("/analyze_growth1")
+async def analyze_growth(
+    plot_name: str = Query(...),
+    end_date: str | None = Query(None)
+):
+    try:
+
+        plot = (
+            supabase.table("plots")
+            .select("id")
+            .eq("plot_name", plot_name)
+            .single()
+            .execute()
+        )
+
+        if not plot.data:
+            raise HTTPException(status_code=404, detail="Plot not found")
+
+        plot_id = plot.data["id"]
+
+        query = (
+            supabase.table("analysis_results")
+            .select("response_json, analysis_date")
+            .eq("plot_id", plot_id)
+            .eq("analysis_type", "growth")
+        )
+
+        # ✅ If date provided → fetch latest from same month
+        if end_date:
+            dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+            start_month = dt.replace(day=1)
+            last_day = calendar.monthrange(dt.year, dt.month)[1]
+            end_month = dt.replace(day=last_day)
+
+            query = (
+                query.gte("analysis_date", start_month.date().isoformat())
+                     .lte("analysis_date", end_month.date().isoformat())
+            )
+
+        res = (
+            query.order("analysis_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            raise HTTPException(
+                status_code=404,
+                detail="No satellite data available"
+            )
+
+        # ✅ return RAW JSON only
+        return res.data[0]["response_json"]
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Growth fetch failed: {str(e)}"
+        )
+
+@app.post("/wateruptake1")
+async def analyze_water_uptake(
+    plot_name: str = Query(...),
+    end_date: str | None = Query(None)
+):
+    try:
+
+        plot = (
+            supabase.table("plots")
+            .select("id")
+            .eq("plot_name", plot_name)
+            .single()
+            .execute()
+        )
+
+        if not plot.data:
+            raise HTTPException(status_code=404, detail="Plot not found")
+
+        plot_id = plot.data["id"]
+
+        query = (
+            supabase.table("analysis_results")
+            .select("response_json, analysis_date")
+            .eq("plot_id", plot_id)
+            .eq("analysis_type", "water_uptake")
+        )
+
+        # ✅ Month-based nearest data fetch
+        if end_date:
+            dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+            start_month = dt.replace(day=1)
+            last_day = calendar.monthrange(dt.year, dt.month)[1]
+            end_month = dt.replace(day=last_day)
+
+            query = (
+                query.gte("analysis_date", start_month.date().isoformat())
+                     .lte("analysis_date", end_month.date().isoformat())
+            )
+
+        res = (
+            query.order("analysis_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            raise HTTPException(
+                status_code=404,
+                detail="No satellite data available"
+            )
+
+        # ✅ RAW response only
+        return res.data[0]["response_json"]
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Water uptake fetch failed: {str(e)}"
+        )
+
+@app.post("/soilmoisture1")
+async def analyze_soil_moisture(
+    plot_name: str = Query(...),
+    end_date: str | None = Query(None)
+):
+    try:
+
+        plot = (
+            supabase.table("plots")
+            .select("id")
+            .eq("plot_name", plot_name)
+            .single()
+            .execute()
+        )
+
+        if not plot.data:
+            raise HTTPException(status_code=404, detail="Plot not found")
+
+        plot_id = plot.data["id"]
+
+        query = (
+            supabase.table("analysis_results")
+            .select("response_json, analysis_date")
+            .eq("plot_id", plot_id)
+            .eq("analysis_type", "soil_moisture")
+        )
+
+        if end_date:
+            dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+            start_month = dt.replace(day=1)
+            last_day = calendar.monthrange(dt.year, dt.month)[1]
+            end_month = dt.replace(day=last_day)
+
+            query = (
+                query.gte("analysis_date", start_month.date().isoformat())
+                     .lte("analysis_date", end_month.date().isoformat())
+            )
+
+        res = (
+            query.order("analysis_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            raise HTTPException(
+                status_code=404,
+                detail="No soil moisture data available"
+            )
+
+        return res.data[0]["response_json"]
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Soil moisture fetch failed: {str(e)}"
+        )
+    
+@app.post("/pestdetection1")
+async def analyze_pest_detection(
+    plot_name: str = Query(...),
+    end_date: str | None = Query(None)
+):
+    try:
+
+        plot = (
+            supabase.table("plots")
+            .select("id")
+            .eq("plot_name", plot_name)
+            .single()
+            .execute()
+        )
+
+        if not plot.data:
+            raise HTTPException(status_code=404, detail="Plot not found")
+
+        plot_id = plot.data["id"]
+
+        query = (
+            supabase.table("analysis_results")
+            .select("response_json, analysis_date")
+            .eq("plot_id", plot_id)
+            .eq("analysis_type", "pest_detection")
+        )
+
+        if end_date:
+            dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+            start_month = dt.replace(day=1)
+            last_day = calendar.monthrange(dt.year, dt.month)[1]
+            end_month = dt.replace(day=last_day)
+
+            query = (
+                query.gte("analysis_date", start_month.date().isoformat())
+                     .lte("analysis_date", end_month.date().isoformat())
+            )
+
+        res = (
+            query.order("analysis_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            raise HTTPException(
+                status_code=404,
+                detail="No pest detection data available"
+            )
+
+        return res.data[0]["response_json"]
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pest detection fetch failed: {str(e)}"
+        )
+
+@app.get("/analysis_timeline")
+async def get_analysis_timeline(
+    plot_name: str = Query(...)
+):
+    """
+    Returns stored satellite analysis dates
+    grouped monthly WITHOUT returning month key.
+    """
+
+    try:
+        # ---------------------------------
+        # Get plot id
+        # ---------------------------------
+        plot = (
+            supabase.table("plots")
+            .select("id")
+            .eq("plot_name", plot_name)
+            .single()
+            .execute()
+        )
+
+        if not plot.data:
+            raise HTTPException(status_code=404, detail="Plot not found")
+
+        plot_id = plot.data["id"]
+
+        # ---------------------------------
+        # Fetch analysis data
+        # ---------------------------------
+        res = (
+            supabase.table("analysis_results")
+            .select("analysis_type, analysis_date")
+            .eq("plot_id", plot_id)
+            .order("analysis_date")
+            .execute()
+        )
+
+        if not res.data:
+            return {
+                "plot_name": plot_name,
+                "timeline": []
+            }
+
+        # ---------------------------------
+        # Group by month internally
+        # ---------------------------------
+        monthly_map = {}
+
+        for row in res.data:
+
+            analysis_type = row["analysis_type"]
+            analysis_date = row["analysis_date"]
+
+            if not analysis_date:
+                continue
+
+            month_key = analysis_date[:7]  # YYYY-MM
+
+            if month_key not in monthly_map:
+                monthly_map[month_key] = {
+                    "growth_dates": [],
+                    "water_uptake_dates": [],
+                    "soil_moisture_dates": [],
+                    "pest_detection_dates": []
+                }
+
+            key = f"{analysis_type}_dates"
+
+            if key in monthly_map[month_key]:
+                monthly_map[month_key][key].append(analysis_date)
+
+        # ---------------------------------
+        # Clean duplicates + sort
+        # ---------------------------------
+        timeline = []
+
+        for month in sorted(monthly_map.keys()):
+
+            item = monthly_map[month]
+
+            for k in item:
+                item[k] = sorted(list(set(item[k])))
+
+            timeline.append(item)
+
+        return {
+            "plot_name": plot_name,
+            "timeline": timeline
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Timeline fetch failed: {str(e)}"
+        )
+
+
 
 @app.post("/analyze_Growth")
 async def analyze_growth(
