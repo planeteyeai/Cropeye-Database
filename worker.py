@@ -376,9 +376,8 @@ while True:
     jobs = fetch_jobs()
 
     if not jobs:
-        print("😴 No pending jobs...", flush=True)
-        time.sleep(SLEEP_TIME)
-        continue
+        print("✅ No pending jobs — worker exiting", flush=True)
+        break   # ✅ STOP WORKER
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         executor.map(process_job, jobs)
