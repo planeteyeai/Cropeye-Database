@@ -1,18 +1,24 @@
-from supabase import create_client
-from dotenv import load_dotenv
+import psycopg2
 import os
-import json
-# Load .env file
+from dotenv import load_dotenv
+
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise Exception("Supabase env vars missing")
+if not DATABASE_URL:
+    raise Exception("DATABASE_URL missing")
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_SERVICE_ROLE_KEY
-)
+conn = psycopg2.connect(DATABASE_URL)
 
+cursor = conn.cursor()
+
+cursor.execute("SELECT * FROM plots LIMIT 5")
+
+rows = cursor.fetchall()
+
+for row in rows:
+    print(row)
+
+cursor.close()
+conn.close()
