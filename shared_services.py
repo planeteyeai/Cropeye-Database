@@ -5,6 +5,7 @@ import ee
 import numpy as np
 import math
 from db import get_connection
+import json
 # ------------------------------
 # Helpers: safe rounding & JSON sanitization
 # ------------------------------
@@ -183,7 +184,7 @@ class PlotSyncService:
         self.plots_cache = plots_data
         self.last_sync = current_time
         return plots_data
-    
+
 def run_plot_sync():
 
     print("🔄 Starting internal plot sync...", flush=True)
@@ -196,8 +197,13 @@ def run_plot_sync():
     plot_service = PlotSyncService()
     plot_dict = plot_service.get_plots_dict(force_refresh=True)
 
-    existing_rows = supabase.table("plots").select("plot_name").execute()
-    existing_names = {row["plot_name"] for row in existing_rows.data}
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT plot_name FROM plots")
+    rows = cursor.fetchall()
+
+    existing_names = {r[0] for r in rows}
 
     for name, data in plot_dict.items():
 
@@ -215,24 +221,55 @@ def run_plot_sync():
             ) + "))"
 
             area_ha = float(geom.area().divide(10000).getInfo())
-            
+
             props = data.get("properties", {})
 
-            supabase.table("plots").upsert({
-                "plot_name": name,
-                "geom": f"SRID=4326;{wkt}",
-                "geojson": geom_geojson,
-                "area_hectares": area_ha,
-                "django_plot_id": str(props.get("django_id")),
-                "plantation_date": props.get("plantation_date"),
-                "crop_type": props.get("crop_type_name"),
-            }, on_conflict="plot_name").execute()
+            django_id = props.get("django_id")
+            plantation_date = props.get("plantation_date")
+            crop_type = props.get("crop_type_name")
+
+            cursor.execute(
+                """
+                INSERT INTO plots
+                (plot_name, geom, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
+                VALUES (
+                    %s,
+                    ST_SetSRID(ST_GeomFromText(%s),4326),
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                ON CONFLICT (plot_name)
+                DO UPDATE SET
+                    geom = EXCLUDED.geom,
+                    geojson = EXCLUDED.geojson,
+                    area_hectares = EXCLUDED.area_hectares,
+                    django_plot_id = EXCLUDED.django_plot_id,
+                    plantation_date = EXCLUDED.plantation_date,
+                    crop_type = EXCLUDED.crop_type
+                """,
+                (
+                    name,
+                    wkt,
+                    json.dumps(geom_geojson),
+                    area_ha,
+                    str(django_id),
+                    plantation_date,
+                    crop_type,
+                ),
+            )
 
             inserted += 1
 
         except Exception as e:
             print(f"❌ Error inserting {name}: {e}", flush=True)
             errors += 1
+
+    conn.commit()
+    cursor.close()
+    conn.close()
 
     print("✅ Internal sync complete", flush=True)
 
@@ -242,52 +279,68 @@ def run_plot_sync():
         "errors": errors,
         "processed": processed
     }
-# =====================================================
-# NEW FUNCTION: Trigger backfill for new plots immediately
-# =====================================================
+
 
 def trigger_new_plot_backfill():
     """
-    Detect new plots (backfill_completed=False) and run monthly backfill immediately.
-    After completion, exit. Does not touch daily cron/queue.
+    Detect new plots (backfill_completed=False)
+    and run monthly backfill immediately
     """
+
     plot_service = PlotSyncService()
     plots = plot_service.get_plots_dict(force_refresh=True)
 
+    conn = get_conn()
+    cursor = conn.cursor()
+
     for plot_name, plot_data in plots.items():
+
         try:
-            plot_row = (
-                supabase.table("plots")
-                .select("id, backfill_completed, last_backfill_hash")
-                .eq("plot_name", plot_name)
-                .single()
-                .execute()
+
+            cursor.execute(
+                """
+                SELECT id, backfill_completed, last_backfill_hash
+                FROM plots
+                WHERE plot_name = %s
+                """,
+                (plot_name,)
             )
 
-            if not plot_row.data:
+            row = cursor.fetchone()
+
+            if not row:
                 continue
 
-            plot_id = plot_row.data["id"]
-            backfill_done = plot_row.data.get("backfill_completed", False)
+            plot_id = row[0]
+            backfill_done = row[1]
 
             if backfill_done:
-                continue  # Already done
+                continue
 
-            new_hash = f"{plot_data['properties'].get('plantation_date')}_{plot_data['properties'].get('crop_type_name')}"
+            props = plot_data.get("properties", {})
+
+            new_hash = f"{props.get('plantation_date')}_{props.get('crop_type_name')}"
 
             print(f"🆕 New plot detected → running backfill: {plot_name}", flush=True)
+
             run_monthly_backfill_for_plot(plot_name, plot_data)
 
-            # Mark as backfilled
-            supabase.table("plots").update({
-                "backfill_completed": True,
-                "last_backfill_hash": new_hash
-            }).eq("id", plot_id).execute()
+            cursor.execute(
+                """
+                UPDATE plots
+                SET backfill_completed = TRUE,
+                    last_backfill_hash = %s
+                WHERE id = %s
+                """,
+                (new_hash, plot_id)
+            )
+
+            conn.commit()
 
             print(f"✅ Backfill completed for {plot_name}", flush=True)
 
         except Exception as e:
             print(f"🔥 Backfill failed for {plot_name}: {e}", flush=True)
 
-
-    
+    cursor.close()
+    conn.close()
