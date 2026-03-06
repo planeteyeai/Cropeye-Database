@@ -211,67 +211,46 @@ def run_plot_sync():
 
         try:
 
-            geom = data["geometry"]
-            geom_geojson = geom.getInfo()
-
-            coords = geom_geojson["coordinates"][0]
-
-            wkt = "POLYGON((" + ",".join(
-                [f"{lng} {lat}" for lng, lat in coords]
-            ) + "))"
-
-            area_ha = float(geom.area().divide(10000).getInfo())
-
-            props = data.get("properties", {})
-
-            django_id = props.get("django_id")
-            plantation_date = props.get("plantation_date")
-            crop_type = props.get("crop_type_name")
-
-            cursor.execute(
-                """
-                INSERT INTO plots
-                (plot_name, geom, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
-                VALUES (
-                    %s,
-                    ST_SetSRID(ST_GeomFromText(%s),4326),
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s
-                )
-                ON CONFLICT (plot_name)
-                DO UPDATE SET
-                    geom = EXCLUDED.geom,
-                    geojson = EXCLUDED.geojson,
-                    area_hectares = EXCLUDED.area_hectares,
-                    django_plot_id = EXCLUDED.django_plot_id,
-                    plantation_date = EXCLUDED.plantation_date,
-                    crop_type = EXCLUDED.crop_type
-                """,
-                (
-                    name,
-                    wkt,
-                    json.dumps(geom_geojson),
-                    area_ha,
-                    str(django_id),
-                    plantation_date,
-                    crop_type,
-                ),
-            )
-
-            inserted += 1
-
-        except Exception as e:
-            print(f"❌ Error inserting {name}: {e}", flush=True)
-            errors += 1
+    cursor.execute(
+        """
+        INSERT INTO plots
+        (plot_name, geom, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
+        VALUES (
+            %s,
+            ST_SetSRID(ST_GeomFromText(%s),4326),
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
+        ON CONFLICT (plot_name)
+        DO UPDATE SET
+            geom = EXCLUDED.geom,
+            geojson = EXCLUDED.geojson,
+            area_hectares = EXCLUDED.area_hectares,
+            django_plot_id = EXCLUDED.django_plot_id,
+            plantation_date = EXCLUDED.plantation_date,
+            crop_type = EXCLUDED.crop_type
+        """,
+        (
+            name,
+            wkt,
+            json.dumps(geom_geojson),
+            area_ha,
+            str(django_id),
+            plantation_date,
+            crop_type
+        )
+    )
 
     conn.commit()
-    cursor.close()
-    conn.close()
 
-    print("✅ Internal sync complete", flush=True)
+except Exception as e:
+
+    conn.rollback()
+
+    print(f"❌ Error inserting {name}: {e}", flush=True)
 
     return {
         "inserted": inserted,
