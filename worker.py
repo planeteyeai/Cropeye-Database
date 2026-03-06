@@ -10,7 +10,7 @@ from gee_growth import (
 )
 
 from shared_services import PlotSyncService, run_plot_sync
-from db import supabase
+from db import get_connection
 from Admin import run_monthly_backfill_for_plot
 
 # =====================================================
