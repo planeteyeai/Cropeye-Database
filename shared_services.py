@@ -197,7 +197,7 @@ def run_plot_sync():
     plot_service = PlotSyncService()
     plot_dict = plot_service.get_plots_dict(force_refresh=True)
 
-    conn = get_conn()
+    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("SELECT plot_name FROM plots")
@@ -290,7 +290,7 @@ def trigger_new_plot_backfill():
     plot_service = PlotSyncService()
     plots = plot_service.get_plots_dict(force_refresh=True)
 
-    conn = get_conn()
+    conn = get_connection()
     cursor = conn.cursor()
 
     for plot_name, plot_data in plots.items():
