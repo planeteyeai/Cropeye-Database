@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from shapely.geometry import shape, Point, Polygon
 from geopy.distance import geodesic
 from shared_services import PlotSyncService
-from db import supabase
+from db import get_connection
 import httpx
 import traceback
 from gee_growth import run_growth_analysis_by_plot, run_water_uptake_analysis_by_plot, run_soil_moisture_analysis_by_plot, run_pest_detection_analysis_by_plot
@@ -38,7 +38,6 @@ credentials = ee.ServiceAccountCredentials(
 )
 
 ee.Initialize(credentials, project=service_account_info["project_id"])
-print("SUPABASE URL:", os.environ.get("SUPABASE_URL"))
 
 # Pydantic models for request/response  
 class PlotInfo(BaseModel):
