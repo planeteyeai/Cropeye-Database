@@ -14,7 +14,7 @@ from gee_growth import (
 from shared_services import PlotSyncService, run_plot_sync
 from db import get_connection
 from Admin import run_monthly_backfill_for_plot
-
+from psycopg2.extras import Json
 # =====================================================
 # CONFIG
 # =====================================================
@@ -275,6 +275,8 @@ def is_scene_unchanged(plot_id, new_date):
 
 def store_results(results, analysis_type, plot_id):
 
+    from psycopg2.extras import Json
+
     if not results:
         return
 
@@ -302,8 +304,8 @@ def store_results(results, analysis_type, plot_id):
         run_query(
             """
             INSERT INTO satellite_images
-            (plot_id,satellite,satellite_date)
-            VALUES (%s,%s,%s)
+            (plot_id, satellite, satellite_date)
+            VALUES (%s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
             (plot_id, sensor_used, analysis_date)
@@ -312,10 +314,17 @@ def store_results(results, analysis_type, plot_id):
         run_query(
             """
             INSERT INTO analysis_results
-            (plot_id,analysis_type,analysis_date,sensor_used,tile_url,response_json)
-            VALUES (%s,%s,%s,%s,%s,%s)
+            (plot_id, analysis_type, analysis_date, sensor_used, tile_url, response_json)
+            VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (plot_id, analysis_type, analysis_date, sensor_used, tile_url, geojson)
+            (
+                plot_id,
+                analysis_type,
+                analysis_date,
+                sensor_used,
+                tile_url,
+                Json(geojson)   # ✅ FIX: convert dict → JSON
+            )
         )
 
         print(f"✅ Stored {analysis_type} {analysis_date}", flush=True)
