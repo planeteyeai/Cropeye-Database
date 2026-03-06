@@ -222,7 +222,6 @@ def run_plot_sync():
                     continue
 
                 geom_geojson = geom.getInfo()
-
                 area_ha = float(geom.area().divide(10000).getInfo())
 
                 props = data.get("properties", {})
@@ -261,7 +260,6 @@ def run_plot_sync():
 
                 conn.rollback()
                 errors += 1
-
                 print(f"❌ Error inserting {name}: {e}", flush=True)
 
     finally:
@@ -277,6 +275,7 @@ def run_plot_sync():
         "errors": errors,
         "processed": processed
     }
+
 
 def trigger_new_plot_backfill():
     """
