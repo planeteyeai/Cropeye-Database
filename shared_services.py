@@ -185,6 +185,7 @@ class PlotSyncService:
         self.last_sync = current_time
         return plots_data
 
+
 def run_plot_sync():
 
     print("🔄 Starting internal plot sync...", flush=True)
@@ -200,57 +201,75 @@ def run_plot_sync():
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT plot_name FROM plots")
-    rows = cursor.fetchall()
+    try:
 
-    existing_names = {r[0] for r in rows}
+        cursor.execute("SELECT plot_name FROM plots")
+        rows = cursor.fetchall()
 
-    for name, data in plot_dict.items():
+        existing_names = {r[0] for r in rows}
 
-        processed += 1
+        for name, data in plot_dict.items():
 
-        try:
+            processed += 1
 
-    cursor.execute(
-        """
-        INSERT INTO plots
-        (plot_name, geom, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
-        VALUES (
-            %s,
-            ST_SetSRID(ST_GeomFromText(%s),4326),
-            %s,
-            %s,
-            %s,
-            %s,
-            %s
-        )
-        ON CONFLICT (plot_name)
-        DO UPDATE SET
-            geom = EXCLUDED.geom,
-            geojson = EXCLUDED.geojson,
-            area_hectares = EXCLUDED.area_hectares,
-            django_plot_id = EXCLUDED.django_plot_id,
-            plantation_date = EXCLUDED.plantation_date,
-            crop_type = EXCLUDED.crop_type
-        """,
-        (
-            name,
-            wkt,
-            json.dumps(geom_geojson),
-            area_ha,
-            str(django_id),
-            plantation_date,
-            crop_type
-        )
-    )
+            try:
 
-    conn.commit()
+                geom = data.get("geometry")
 
-except Exception as e:
+                if not geom:
+                    print(f"⚠ Plot {name} has no valid geometry, skipping.", flush=True)
+                    skipped += 1
+                    continue
 
-    conn.rollback()
+                geom_geojson = geom.getInfo()
 
-    print(f"❌ Error inserting {name}: {e}", flush=True)
+                area_ha = float(geom.area().divide(10000).getInfo())
+
+                props = data.get("properties", {})
+
+                django_id = props.get("django_id")
+                plantation_date = props.get("plantation_date")
+                crop_type = props.get("crop_type_name")
+
+                cursor.execute(
+                    """
+                    INSERT INTO plots
+                    (plot_name, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (plot_name)
+                    DO UPDATE SET
+                        geojson = EXCLUDED.geojson,
+                        area_hectares = EXCLUDED.area_hectares,
+                        django_plot_id = EXCLUDED.django_plot_id,
+                        plantation_date = EXCLUDED.plantation_date,
+                        crop_type = EXCLUDED.crop_type
+                    """,
+                    (
+                        name,
+                        json.dumps(geom_geojson),
+                        area_ha,
+                        str(django_id) if django_id else None,
+                        plantation_date,
+                        crop_type
+                    )
+                )
+
+                conn.commit()
+                inserted += 1
+
+            except Exception as e:
+
+                conn.rollback()
+                errors += 1
+
+                print(f"❌ Error inserting {name}: {e}", flush=True)
+
+    finally:
+
+        cursor.close()
+        conn.close()
+
+    print("✅ Internal sync complete", flush=True)
 
     return {
         "inserted": inserted,
@@ -259,11 +278,9 @@ except Exception as e:
         "processed": processed
     }
 
-
 def trigger_new_plot_backfill():
     """
-    Detect new plots (backfill_completed=False)
-    and run monthly backfill immediately
+    Detect new plots and run backfill immediately
     """
 
     plot_service = PlotSyncService()
@@ -272,54 +289,63 @@ def trigger_new_plot_backfill():
     conn = get_connection()
     cursor = conn.cursor()
 
-    for plot_name, plot_data in plots.items():
+    try:
 
-        try:
+        for plot_name, plot_data in plots.items():
 
-            cursor.execute(
-                """
-                SELECT id, backfill_completed, last_backfill_hash
-                FROM plots
-                WHERE plot_name = %s
-                """,
-                (plot_name,)
-            )
+            try:
 
-            row = cursor.fetchone()
+                cursor.execute(
+                    """
+                    SELECT id, backfill_completed, last_backfill_hash
+                    FROM plots
+                    WHERE plot_name = %s
+                    """,
+                    (plot_name,)
+                )
 
-            if not row:
-                continue
+                row = cursor.fetchone()
 
-            plot_id = row[0]
-            backfill_done = row[1]
+                if not row:
+                    continue
 
-            if backfill_done:
-                continue
+                plot_id = row[0]
+                backfill_done = row[1]
 
-            props = plot_data.get("properties", {})
+                if backfill_done:
+                    continue
 
-            new_hash = f"{props.get('plantation_date')}_{props.get('crop_type_name')}"
+                props = plot_data.get("properties", {})
 
-            print(f"🆕 New plot detected → running backfill: {plot_name}", flush=True)
+                plantation_date = props.get("plantation_date")
+                crop_type = props.get("crop_type_name")
 
-            run_monthly_backfill_for_plot(plot_name, plot_data)
+                new_hash = f"{plantation_date}_{crop_type}"
 
-            cursor.execute(
-                """
-                UPDATE plots
-                SET backfill_completed = TRUE,
-                    last_backfill_hash = %s
-                WHERE id = %s
-                """,
-                (new_hash, plot_id)
-            )
+                print(f"🆕 New plot detected → running backfill: {plot_name}", flush=True)
 
-            conn.commit()
+                run_monthly_backfill_for_plot(plot_name, plot_data)
 
-            print(f"✅ Backfill completed for {plot_name}", flush=True)
+                cursor.execute(
+                    """
+                    UPDATE plots
+                    SET backfill_completed = TRUE,
+                        last_backfill_hash = %s
+                    WHERE id = %s
+                    """,
+                    (new_hash, plot_id)
+                )
 
-        except Exception as e:
-            print(f"🔥 Backfill failed for {plot_name}: {e}", flush=True)
+                conn.commit()
 
-    cursor.close()
-    conn.close()
+                print(f"✅ Backfill completed for {plot_name}", flush=True)
+
+            except Exception as e:
+
+                conn.rollback()
+                print(f"🔥 Backfill failed for {plot_name}: {e}", flush=True)
+
+    finally:
+
+        cursor.close()
+        conn.close()
