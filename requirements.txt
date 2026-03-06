@@ -13,3 +13,4 @@ python-dotenv
 python-multipart
 apscheduler
 python-dateutil
+psycopg2-binary
