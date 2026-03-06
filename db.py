@@ -9,16 +9,5 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL missing")
 
-conn = psycopg2.connect(DATABASE_URL)
-
-cursor = conn.cursor()
-
-cursor.execute("SELECT * FROM plots LIMIT 5")
-
-rows = cursor.fetchall()
-
-for row in rows:
-    print(row)
-
-cursor.close()
-conn.close()
+def get_connection():
+    return psycopg2.connect(DATABASE_URL)
