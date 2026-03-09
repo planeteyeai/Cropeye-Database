@@ -747,7 +747,6 @@ async def get_plot_info_with_dates(plot_name: str):
 # =====================================================
 # DB QUERY HELPER
 # =====================================================
-
 def run_query(query, params=None, fetch=False, fetchone=False):
 
     conn = get_connection()
@@ -779,7 +778,6 @@ def run_query(query, params=None, fetch=False, fetchone=False):
 
         cursor.close()
         conn.close()
-
 
 # =====================================================
 # CACHE FETCH
