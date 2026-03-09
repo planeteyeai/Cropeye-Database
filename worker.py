@@ -281,7 +281,6 @@ def mark_failed(job_id, error):
 # =====================================================
 # STORE RESULTS
 # =====================================================
-
 from psycopg2.extras import Json
 
 def store_results(results, analysis_type, plot_id):
@@ -294,34 +293,34 @@ def store_results(results, analysis_type, plot_id):
 
     for geojson in results:
 
-        if not geojson.get("features"):
+        features = geojson.get("features")
+        if not features:
             continue
 
-        props = geojson["features"][0].get("properties", {})
+        props = features[0].get("properties", {})
 
-        analysis_date = props.get("analysis_image_date") or props.get("latest_image_date")
-        sensor_used = props.get("sensor", "unknown")
+        analysis_date = (
+            props.get("analysis_image_date")
+            or props.get("latest_image_date")
+        )
+
+        sensor_used = props.get("sensor", "Unknown")
+
         tile_url = props.get("tile_url")
 
         if not analysis_date:
             continue
 
-        if is_scene_unchanged(plot_id, analysis_date):
-            print("⏭ Scene unchanged — skipping")
-            return
-
-        # store satellite image
         run_query(
             """
             INSERT INTO satellite_images
-            (plot_id, satellite, satellite_date)
+            (plot_id,satellite,satellite_date)
             VALUES (%s,%s,%s)
             ON CONFLICT DO NOTHING
             """,
             (plot_id, sensor_used, analysis_date)
         )
 
-        # store analysis results
         run_query(
             """
             INSERT INTO analysis_results
@@ -332,7 +331,7 @@ def store_results(results, analysis_type, plot_id):
             (plot_id, analysis_type, analysis_date, sensor_used, tile_url, Json(geojson))
         )
 
-        print(f"✅ Stored {analysis_type} {analysis_date}", flush=True)
+        print(f"✅ Stored {analysis_type} {analysis_date} ({sensor_used})", flush=True)
 # =====================================================
 # JOB PROCESSOR
 # =====================================================
