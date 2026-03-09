@@ -908,7 +908,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                     )
 
                     sensor = (
-                        props.get("data_source")
+                        props.get("sensor_used")
                         or props.get("sensor")
                         or "unknown"
                     )
@@ -925,7 +925,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                         VALUES (%s,%s,%s,%s,%s,%s)
                         ON CONFLICT (plot_id,analysis_type,analysis_date) DO NOTHING
                         """,
-                        (plot_id, analysis_type, analysis_date, sensor_used, tile_url, Json(geojson))
+                        (plot_id, analysis_type, analysis_date, sensor, tile_url, Json(geojson))
                     )
                     print(f"   ✅ Stored {analysis_type} {analysis_date}")
 
