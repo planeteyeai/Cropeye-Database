@@ -21,7 +21,7 @@ from psycopg2.extras import Json
 
 BATCH_SIZE = 20
 REQUEST_DELAY = 3
-MAX_WORKERS = 5
+MAX_WORKERS = 10
 MAX_RETRY = 3
 
 # =====================================================
@@ -45,11 +45,10 @@ plots = PlotSyncService().get_plots_dict(force_refresh=True)
 def run_query(query, params=None, fetchone=False, fetchall=False):
 
     conn = get_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
 
-        # convert dict → Json automatically
         if params:
             new_params = []
             for p in params:
@@ -63,8 +62,10 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
 
         if fetchone:
             result = cursor.fetchone()
+
         elif fetchall:
             result = cursor.fetchall()
+
         else:
             result = None
 
