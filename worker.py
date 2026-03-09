@@ -42,21 +42,38 @@ plots = PlotSyncService().get_plots_dict(force_refresh=True)
 # DB HELPER
 # =====================================================
 
-def run_query(query, params=None, fetch=False, fetchone=False):
+def run_query(query, params=None):
+
     conn = get_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor = conn.cursor()
 
-    cursor.execute(query, params)
+    try:
 
-    result = None
-    if fetch:
-        result = cursor.fetchall()
-    elif fetchone:
-        result = cursor.fetchone()
+        if params:
+            new_params = []
 
-    conn.commit()
-    cursor.close()
-    conn.close()
+            for p in params:
+
+                if isinstance(p, dict):
+                    new_params.append(Json(p))   # ✅ convert dict → JSON
+                else:
+                    new_params.append(p)
+
+            params = tuple(new_params)
+
+        cursor.execute(query, params)
+
+        conn.commit()
+
+    except Exception as e:
+
+        conn.rollback()
+        print(f"🔥 DB error: {e}", flush=True)
+
+    finally:
+
+        cursor.close()
+        conn.close()
 
     return result
 
