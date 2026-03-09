@@ -923,18 +923,9 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                         INSERT INTO analysis_results
                         (plot_id,analysis_type,analysis_date,sensor_used,tile_url,response_json)
                         VALUES (%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (plot_id,analysis_type,analysis_date,sensor_used)
-                        DO UPDATE SET response_json=EXCLUDED.response_json
+                        ON CONFLICT (plot_id,analysis_type,analysis_date) DO NOTHING
                         """,
-                        (
-                            plot_id,
-                            analysis_type,
-                            analysis_date,
-                            sensor,
-                            tile_url,
-                            Json(geojson)   # ✅ FIXED
-                        )
-                    )
+                        (plot_id, analysis_type, analysis_date, sensor_used, tile_url, Json(geojson))
 
                     print(f"   ✅ Stored {analysis_type} {analysis_date}")
 
