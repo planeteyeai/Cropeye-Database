@@ -926,7 +926,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                         ON CONFLICT (plot_id,analysis_type,analysis_date) DO NOTHING
                         """,
                         (plot_id, analysis_type, analysis_date, sensor_used, tile_url, Json(geojson))
-
+                    )
                     print(f"   ✅ Stored {analysis_type} {analysis_date}")
 
             except Exception as e:
