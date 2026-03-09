@@ -10,7 +10,7 @@ from gee_growth import (
     run_soil_moisture_analysis_by_plot,
     run_pest_detection_analysis_by_plot
 )
-
+import json
 from shared_services import PlotSyncService, run_plot_sync
 from db import get_connection
 from Admin import run_monthly_backfill_for_plot
