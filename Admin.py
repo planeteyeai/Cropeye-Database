@@ -28,7 +28,7 @@ from datetime import timezone
 from dateutil.relativedelta import relativedelta
 from psycopg2.extras import RealDictCursor
 import calendar
-
+from psycopg2.extras import Json
 # Initialize Earth Engine - move this to the top
 
 service_account_info = json.loads(os.environ["EE_SERVICE_ACCOUNT_JSON"])
@@ -745,7 +745,7 @@ async def get_plot_info_with_dates(plot_name: str):
     )
 
 # =====================================================
-# DATABASE HELPER
+# DB QUERY HELPER
 # =====================================================
 
 def run_query(query, params=None, fetch=False, fetchone=False):
@@ -753,22 +753,33 @@ def run_query(query, params=None, fetch=False, fetchone=False):
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-    cursor.execute(query, params)
+    try:
 
-    result = None
+        cursor.execute(query, params)
 
-    if fetch:
-        result = cursor.fetchall()
+        result = None
 
-    if fetchone:
-        result = cursor.fetchone()
+        if fetch:
+            result = cursor.fetchall()
 
-    conn.commit()
+        if fetchone:
+            result = cursor.fetchone()
 
-    cursor.close()
-    conn.close()
+        conn.commit()
 
-    return result
+        return result
+
+    except Exception as e:
+
+        conn.rollback()
+        print("🔥 DB error:", e, flush=True)
+        return None
+
+    finally:
+
+        cursor.close()
+        conn.close()
+
 
 # =====================================================
 # CACHE FETCH
@@ -923,7 +934,7 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                             analysis_date,
                             sensor,
                             tile_url,
-                            geojson
+                            Json(geojson)   # ✅ FIXED
                         )
                     )
 
@@ -1084,7 +1095,6 @@ async def get_analysis_timeline(plot_name: str = Query(...)):
         "plot_name": plot_name,
         "timeline": timeline
     }
-
 
 
 @app.post("/analyze_Growth")
