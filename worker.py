@@ -1,8 +1,7 @@
 from datetime import date, timedelta
 import time
 from concurrent.futures import ThreadPoolExecutor
-
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 
 from gee_growth import (
     run_growth_analysis_by_plot,
@@ -10,18 +9,18 @@ from gee_growth import (
     run_soil_moisture_analysis_by_plot,
     run_pest_detection_analysis_by_plot
 )
-import json
+
 from shared_services import PlotSyncService, run_plot_sync
 from db import get_connection
 from Admin import run_monthly_backfill_for_plot
-from psycopg2.extras import Json
+
 # =====================================================
 # CONFIG
 # =====================================================
 
 BATCH_SIZE = 20
 REQUEST_DELAY = 3
-MAX_WORKERS = 10
+MAX_WORKERS = 3
 MAX_RETRY = 3
 
 # =====================================================
@@ -62,30 +61,25 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
 
         if fetchone:
             result = cursor.fetchone()
-
         elif fetchall:
             result = cursor.fetchall()
-
         else:
             result = None
 
         conn.commit()
-
         return result
 
     except Exception as e:
-
         conn.rollback()
-        print(f"🔥 DB error: {e}", flush=True)
+        print("🔥 DB error:", e, flush=True)
         return None
 
     finally:
-
         cursor.close()
         conn.close()
 
 # =====================================================
-# STEP 2 — SMART NEW PLOT BACKFILL TRIGGER
+# BACKFILL HASH
 # =====================================================
 
 def get_plot_hash(plot_data):
@@ -93,13 +87,18 @@ def get_plot_hash(plot_data):
     crop = str(plot_data.get("crop_type"))
     return f"{plantation}_{crop}"
 
+# =====================================================
+# NEW PLOT BACKFILL
+# =====================================================
+
 def trigger_backfill_for_new_plots(plots):
 
     for plot_name, plot_data in plots.items():
+
         try:
 
             plot_row = run_query(
-                "SELECT id, backfill_completed, last_backfill_hash FROM plots WHERE plot_name = %s",
+                "SELECT id, backfill_completed, last_backfill_hash FROM plots WHERE plot_name=%s",
                 (plot_name,),
                 fetchone=True
             )
@@ -114,6 +113,7 @@ def trigger_backfill_for_new_plots(plots):
             new_hash = get_plot_hash(plot_data)
 
             if not backfill_done:
+
                 print(f"🆕 New plot → backfill {plot_name}", flush=True)
 
                 run_monthly_backfill_for_plot(plot_name, plot_data)
@@ -121,14 +121,15 @@ def trigger_backfill_for_new_plots(plots):
                 run_query(
                     """
                     UPDATE plots
-                    SET backfill_completed = TRUE,
-                        last_backfill_hash = %s
-                    WHERE id = %s
+                    SET backfill_completed=TRUE,
+                        last_backfill_hash=%s
+                    WHERE id=%s
                     """,
                     (new_hash, plot_id)
                 )
 
             elif old_hash != new_hash:
+
                 print(f"🌱 Plot updated → rebackfill {plot_name}", flush=True)
 
                 run_monthly_backfill_for_plot(plot_name, plot_data)
@@ -136,13 +137,14 @@ def trigger_backfill_for_new_plots(plots):
                 run_query(
                     """
                     UPDATE plots
-                    SET last_backfill_hash = %s
-                    WHERE id = %s
+                    SET last_backfill_hash=%s
+                    WHERE id=%s
                     """,
                     (new_hash, plot_id)
                 )
 
             else:
+
                 print(f"✅ Backfill already done {plot_name}", flush=True)
 
         except Exception as e:
@@ -151,7 +153,7 @@ def trigger_backfill_for_new_plots(plots):
 trigger_backfill_for_new_plots(plots)
 
 # =====================================================
-# STEP 3 — CREATE ANALYSIS QUEUE
+# CREATE QUEUE
 # =====================================================
 
 print("📦 Creating analysis queue...", flush=True)
@@ -176,7 +178,7 @@ for plot_name in plots.keys():
         run_query(
             """
             INSERT INTO analysis_queue
-            (plot_id, plot_name, analysis_type, status, priority)
+            (plot_id,plot_name,analysis_type,status,priority)
             VALUES (%s,%s,%s,'pending',1)
             ON CONFLICT (plot_id,analysis_type)
             DO UPDATE SET status='pending'
@@ -195,7 +197,7 @@ start_date = (date.today() - timedelta(days=30)).isoformat()
 pest_start = (date.today() - timedelta(days=15)).isoformat()
 
 # =====================================================
-# QUEUE HELPERS
+# FETCH JOBS
 # =====================================================
 
 def fetch_jobs():
@@ -208,8 +210,12 @@ def fetch_jobs():
         LIMIT %s
         """,
         (BATCH_SIZE,),
-        fetch=True
+        fetchall=True
     )
+
+# =====================================================
+# JOB LOCK
+# =====================================================
 
 def lock_job(job_id):
 
@@ -226,6 +232,10 @@ def lock_job(job_id):
 
     return res is not None
 
+# =====================================================
+# JOB STATUS
+# =====================================================
+
 def mark_completed(job_id):
 
     run_query(
@@ -233,7 +243,7 @@ def mark_completed(job_id):
         (job_id,)
     )
 
-def mark_failed(job_id, error="Unknown"):
+def mark_failed(job_id, error):
 
     job = run_query(
         "SELECT retry_count FROM analysis_queue WHERE id=%s",
@@ -256,8 +266,6 @@ def mark_failed(job_id, error="Unknown"):
             (retry + 1, str(error), job_id)
         )
 
-        print("🔁 Retrying job", flush=True)
-
     else:
 
         run_query(
@@ -271,35 +279,10 @@ def mark_failed(job_id, error="Unknown"):
         )
 
 # =====================================================
-# SCENE SKIP CHECK
-# =====================================================
-
-def is_scene_unchanged(plot_id, new_date):
-
-    latest = run_query(
-        """
-        SELECT satellite_date
-        FROM satellite_images
-        WHERE plot_id=%s
-        ORDER BY satellite_date DESC
-        LIMIT 1
-        """,
-        (plot_id,),
-        fetchone=True
-    )
-
-    if not latest:
-        return False
-
-    return str(latest["satellite_date"]) == str(new_date)
-
-# =====================================================
 # STORE RESULTS
 # =====================================================
 
 def store_results(results, analysis_type, plot_id):
-
-    from psycopg2.extras import Json
 
     if not results:
         return
@@ -321,15 +304,11 @@ def store_results(results, analysis_type, plot_id):
         if not analysis_date:
             continue
 
-        if is_scene_unchanged(plot_id, analysis_date):
-            print("⏭ Scene unchanged — skipping")
-            return
-
         run_query(
             """
             INSERT INTO satellite_images
-            (plot_id, satellite, satellite_date)
-            VALUES (%s, %s, %s)
+            (plot_id,satellite,satellite_date)
+            VALUES (%s,%s,%s)
             ON CONFLICT DO NOTHING
             """,
             (plot_id, sensor_used, analysis_date)
@@ -338,17 +317,10 @@ def store_results(results, analysis_type, plot_id):
         run_query(
             """
             INSERT INTO analysis_results
-            (plot_id, analysis_type, analysis_date, sensor_used, tile_url, response_json)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            (plot_id,analysis_type,analysis_date,sensor_used,tile_url,response_json)
+            VALUES (%s,%s,%s,%s,%s,%s)
             """,
-            (
-                plot_id,
-                analysis_type,
-                analysis_date,
-                sensor_used,
-                tile_url,
-                Json(geojson)   # ✅ FIX: convert dict → JSON
-            )
+            (plot_id, analysis_type, analysis_date, sensor_used, tile_url, Json(geojson))
         )
 
         print(f"✅ Stored {analysis_type} {analysis_date}", flush=True)
@@ -367,15 +339,9 @@ def process_job(job):
     if not lock_job(job_id):
         return
 
-    print(f"⚙ Processing {plot_name} → {analysis_type}", flush=True)
-
     try:
 
         plot_data = plots.get(plot_name)
-
-        if not plot_data:
-            mark_failed(job_id, "Plot missing")
-            return
 
         if analysis_type == "growth":
             results = run_growth_analysis_by_plot(plot_name, plot_data, start_date, today)
@@ -389,10 +355,6 @@ def process_job(job):
         elif analysis_type == "pest_detection":
             results = run_pest_detection_analysis_by_plot(plot_name, plot_data, pest_start, today)
 
-        else:
-            mark_failed(job_id, "Unknown analysis")
-            return
-
         store_results(results, analysis_type, plot_id)
 
         mark_completed(job_id)
@@ -401,11 +363,7 @@ def process_job(job):
 
     except Exception as e:
 
-        if "Quota exceeded" in str(e):
-            print("🧊 Cooling GEE 5 mins...")
-            time.sleep(300)
-
-        print("🔥 Job failed:", str(e), flush=True)
+        print("🔥 Job failed:", e, flush=True)
 
         mark_failed(job_id, str(e))
 
