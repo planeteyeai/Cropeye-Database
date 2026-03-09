@@ -30,6 +30,7 @@ def build_feature(plot_name, sensor, latest_date):
         "latest_image_date": latest_date
     }
 
+
 def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
     try:
@@ -138,6 +139,8 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
         if s2_collection.size().getInfo() > 0:
 
+            sensor_used = "Sentinel-2 NDVI"  # FIX
+
             image = s2_collection.first()
 
             latest_date = ee.Date(
@@ -164,7 +167,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                         "end_date": end_date,
                         "image_count": s2_collection.size().getInfo(),
                         "tile_url": tile_url,
-                        "sensor_used": "Sentinel-2 NDVI",
+                        "sensor_used": sensor_used,
                         "latest_image_date": latest_date,
                         "last_updated": datetime.utcnow().isoformat()
                     }
@@ -194,6 +197,8 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
         if s1_collection.size().getInfo() > 0:
 
+            sensor_used = "Sentinel-1 VH"  # FIX
+
             image = s1_collection.first()
 
             latest_date = ee.Date(
@@ -220,7 +225,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                         "end_date": end_date,
                         "image_count": s1_collection.size().getInfo(),
                         "tile_url": tile_url,
-                        "sensor_used": "Sentinel-1 VH",
+                        "sensor_used": sensor_used,
                         "latest_image_date": latest_date,
                         "last_updated": datetime.utcnow().isoformat()
                     }
@@ -267,11 +272,13 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
 
         results = []
 
+        sensor = None  # FIX: ensure sensor always defined
+
         # ===============================
         # SENTINEL-2 NDMI
         # ===============================
         s2_collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR")
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
             .filterBounds(geometry)
             .filterDate(analysis_start, analysis_end)
             .filter(ee.Filter.notNull(["system:time_start"]))
@@ -574,6 +581,11 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
 
         results = []
 
+        sensor = None
+        sensor_used = None
+        latest_date = None
+        image_count = 0
+
         # =====================================================
         # SENTINEL-1 (VV)
         # =====================================================
@@ -620,7 +632,7 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
         # SENTINEL-2 (NDWI)
         # =====================================================
         s2_collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR")
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
             .filterBounds(geometry)
             .filterDate(analysis_start, analysis_end)
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
@@ -653,14 +665,12 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
             results.append(feature)
 
         # =====================================================
-        # SENSOR SELECTION (SAME AS ENDPOINT)
+        # SENSOR SELECTION (UNCHANGED LOGIC)
         # =====================================================
         if s1_size == 0 and s2_size == 0:
             return None
 
         use_s2 = False
-        sensor_used = None
-        latest_date = None
 
         if s1_latest_date and s2_latest_date:
             if s2_latest_date >= s1_latest_date:
@@ -1028,13 +1038,15 @@ def run_pest_detection_analysis_by_plot(
 
             tile_image = stretched
 
-        # ========================================================
-        # UNSUPPORTED
-        # ========================================================
-
         else:
             print(f"⚠ Pest detection not supported for crop: {crop_type}")
             return None
+
+        # ==============================
+        # FIX: Ensure sensor_used always exists
+        # ==============================
+
+        sensor_used = "Sentinel-1"
 
         # ==============================
         # TILE URL
@@ -1102,7 +1114,7 @@ def run_pest_detection_analysis_by_plot(
                 "crop_type": crop_type,
                 "start_date": start_date,
                 "end_date": end_date,
-                "sensor_used": "Sentinel-1",
+                "sensor_used": sensor_used,
                 "image_count": image_count,
                 "image_dates": image_dates,
                 "latest_image_date": analysis_image_date,
