@@ -164,7 +164,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                         "end_date": end_date,
                         "image_count": s2_collection.size().getInfo(),
                         "tile_url": tile_url,
-                        "data_source": "Sentinel-2 NDVI",
+                        "sensor_used": "Sentinel-2 NDVI",
                         "latest_image_date": latest_date,
                         "last_updated": datetime.utcnow().isoformat()
                     }
@@ -220,7 +220,7 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
                         "end_date": end_date,
                         "image_count": s1_collection.size().getInfo(),
                         "tile_url": tile_url,
-                        "data_source": "Sentinel-1 VH",
+                        "sensor_used": "Sentinel-1 VH",
                         "latest_image_date": latest_date,
                         "last_updated": datetime.utcnow().isoformat()
                     }
@@ -512,7 +512,7 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
             "properties": {
                 "plot_name": plot_name,
                 "tile_url": tile_url,
-                "sensor": sensor,
+                "sensor_used": sensor,
                 "image_count_in_range": image_count,
                 "analysis_dates": {
                     "start_date": start_date,
@@ -1102,7 +1102,7 @@ def run_pest_detection_analysis_by_plot(
                 "crop_type": crop_type,
                 "start_date": start_date,
                 "end_date": end_date,
-                "sensor": "Sentinel-1",
+                "sensor_used": "Sentinel-1",
                 "image_count": image_count,
                 "image_dates": image_dates,
                 "latest_image_date": analysis_image_date,
