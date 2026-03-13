@@ -79,7 +79,7 @@ class PlotSyncService:
             response = requests.get(
                 f"{self.django_api_url}/api/plots/public/",
                 headers={'Content-Type': 'application/json'},
-                timeout=60
+                timeout=180
             )
 
             if response.status_code == 200:
