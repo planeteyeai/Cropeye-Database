@@ -9,6 +9,7 @@ import json
 # ------------------------------
 # Helpers: safe rounding & JSON sanitization
 # ------------------------------
+
 def _is_num(x):
     return isinstance(x, (int, float, np.number))
 
