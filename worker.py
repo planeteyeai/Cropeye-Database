@@ -332,15 +332,37 @@ def process_job(job):
 # WORKER LOOP
 # =====================================================
 
-print("🚀 QUEUE WORKER STARTED", flush=True)
+print("🚀 PERSISTENT WORKER STARTED", flush=True)
 
 while True:
 
-    jobs = fetch_jobs()
+    try:
 
-    if not jobs:
-        print("✅ No pending jobs — worker exiting", flush=True)
-        break
+        print("🔄 Syncing plots...", flush=True)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(process_job, jobs)
+        run_plot_sync()
+
+        plots = PlotSyncService().get_plots_dict(force_refresh=True)
+
+        trigger_backfill_for_new_plots(plots)
+
+        jobs = fetch_jobs()
+
+        if jobs:
+
+            print(f"📦 Processing {len(jobs)} jobs", flush=True)
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                executor.map(process_job, jobs)
+
+        else:
+
+            print("⏳ No jobs — sleeping 5 minutes", flush=True)
+
+        time.sleep(300)   # 5 minutes
+
+    except Exception as e:
+
+        print("🔥 Worker error:", e, flush=True)
+
+        time.sleep(60)
