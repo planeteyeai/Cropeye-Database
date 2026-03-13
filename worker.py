@@ -1,7 +1,9 @@
 from datetime import date, timedelta
 import time
-import ee
+import threading
 from concurrent.futures import ThreadPoolExecutor
+import ee
+from flask import Flask, request, jsonify
 from psycopg2.extras import RealDictCursor, Json
 
 from gee_growth import (
@@ -15,17 +17,23 @@ from shared_services import PlotSyncService, run_plot_sync
 from db import get_connection
 from Admin import run_monthly_backfill_for_plot
 
+
+# =====================================================
+# FLASK APP
+# =====================================================
+
+app = Flask(__name__)
+
 # =====================================================
 # CONFIG
 # =====================================================
 
-BATCH_SIZE = 20
-REQUEST_DELAY = 3
-MAX_WORKERS = 6
-MAX_RETRY = 3
+CHECK_INTERVAL = 20
+MAX_PARALLEL_ANALYSIS = 4
+
 
 # =====================================================
-# STEP 1 — INTERNAL PLOT SYNC
+# INITIAL PLOT SYNC
 # =====================================================
 
 print("🔄 Running plot sync...", flush=True)
@@ -36,7 +44,11 @@ try:
 except Exception as e:
     print("❌ Plot sync failed:", str(e), flush=True)
 
-plots = PlotSyncService().get_plots_dict(force_refresh=True)
+plot_service = PlotSyncService()
+plots = plot_service.get_plots_dict(force_refresh=True)
+
+known_plots = set(plots.keys())
+
 
 # =====================================================
 # DB HELPER
@@ -79,6 +91,7 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         cursor.close()
         conn.close()
 
+
 # =====================================================
 # STORE RESULTS
 # =====================================================
@@ -105,7 +118,6 @@ def store_results(results, analysis_type, plot_id):
         )
 
         sensor_used = props.get("sensor", "Unknown")
-
         tile_url = props.get("tile_url")
 
         if not analysis_date:
@@ -133,91 +145,71 @@ def store_results(results, analysis_type, plot_id):
 
         print(f"✅ Stored {analysis_type} {analysis_date}", flush=True)
 
+
 # =====================================================
-# TODAY ANALYSIS
+# TODAY ANALYSIS (PARALLEL)
 # =====================================================
 
 def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 
-    print(f"🌅 Running TODAY analysis for {plot_name}")
+    print(f"🌅 Running TODAY analysis for {plot_name}", flush=True)
 
     end_date = date.today()
-    start_date = end_date - timedelta(days=30)
-
-    start_date = start_date.isoformat()
+    start_date = (end_date - timedelta(days=30)).isoformat()
     end_date = end_date.isoformat()
 
-    try:
-
-        res = run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date)
-        store_results(res, "growth", plot_id)
-
-        res = run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date)
-        store_results(res, "water_uptake", plot_id)
-
-        res = run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date)
-        store_results(res, "soil_moisture", plot_id)
-
-        res = run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date)
-        store_results(res, "pest_detection", plot_id)
-
-        print(f"✅ TODAY analysis complete {plot_name}")
-
-    except Exception as e:
-        print(f"🔥 TODAY analysis failed {plot_name}: {e}")
-
-# =====================================================
-# NEW PLOT BACKFILL
-# =====================================================
-
-def trigger_backfill_for_new_plots(plots):
-
-    for plot_name, plot_data in plots.items():
-
+    def run_growth():
         try:
-
-            row = run_query(
-                "SELECT id,backfill_completed FROM plots WHERE plot_name=%s",
-                (plot_name,),
-                fetchone=True
-            )
-
-            if not row:
-                continue
-
-            plot_id = row["id"]
-
-            if not row["backfill_completed"]:
-
-                print(f"🆕 New plot detected → {plot_name}")
-
-                run_today_analysis_for_plot(plot_name, plot_data, plot_id)
-
-                run_monthly_backfill_for_plot(plot_name, plot_data)
-
-                run_query(
-                    "UPDATE plots SET backfill_completed=TRUE WHERE id=%s",
-                    (plot_id,)
-                )
-
-            else:
-
-                print(f"✅ Backfill already done {plot_name}", flush=True)
-
+            res = run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date)
+            store_results(res, "growth", plot_id)
         except Exception as e:
-            print(f"🔥 Backfill failed {plot_name}: {e}", flush=True)
+            print(f"🔥 growth failed {plot_name}: {e}")
 
-trigger_backfill_for_new_plots(plots)
+    def run_water():
+        try:
+            res = run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date)
+            store_results(res, "water_uptake", plot_id)
+        except Exception as e:
+            print(f"🔥 water uptake failed {plot_name}: {e}")
+
+    def run_soil():
+        try:
+            res = run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date)
+            store_results(res, "soil_moisture", plot_id)
+        except Exception as e:
+            print(f"🔥 soil moisture failed {plot_name}: {e}")
+
+    def run_pest():
+        try:
+            res = run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date)
+            store_results(res, "pest_detection", plot_id)
+        except Exception as e:
+            print(f"🔥 pest detection failed {plot_name}: {e}")
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
+
+        executor.submit(run_growth)
+        executor.submit(run_water)
+        executor.submit(run_soil)
+        executor.submit(run_pest)
+
+    print(f"✅ TODAY analysis complete {plot_name}", flush=True)
+
 
 # =====================================================
-# CREATE QUEUE
+# NEW PLOT PIPELINE
 # =====================================================
 
-print("📦 Creating analysis queue...", flush=True)
+def process_new_plot(plot_name):
 
-analysis_types = ["growth","water_uptake","soil_moisture","pest_detection"]
+    print(f"🚀 Processing new plot {plot_name}", flush=True)
 
-for plot_name in plots.keys():
+    plots = plot_service.get_plots_dict(force_refresh=True)
+    plot_data = plots.get(plot_name)
+
+    if not plot_data:
+        print("⚠ Plot not found after sync")
+        return
 
     row = run_query(
         "SELECT id FROM plots WHERE plot_name=%s",
@@ -226,143 +218,93 @@ for plot_name in plots.keys():
     )
 
     if not row:
-        continue
+        print("⚠ Plot not in DB yet")
+        return
 
     plot_id = row["id"]
 
-    for analysis in analysis_types:
+    run_today_analysis_for_plot(plot_name, plot_data, plot_id)
 
-        run_query(
-            """
-            INSERT INTO analysis_queue
-            (plot_id,plot_name,analysis_type,status,priority)
-            VALUES (%s,%s,%s,'pending',1)
-            ON CONFLICT (plot_id,analysis_type)
-            DO UPDATE SET status='pending'
-            """,
-            (plot_id, plot_name, analysis)
-        )
+    run_monthly_backfill_for_plot(plot_name, plot_data)
 
-print("✅ Queue created", flush=True)
 
 # =====================================================
-# JOB FUNCTIONS
+# MANUAL TRIGGER API
 # =====================================================
 
-today = date.today().isoformat()
-start_date = (date.today() - timedelta(days=30)).isoformat()
-pest_start = (date.today() - timedelta(days=15)).isoformat()
+@app.route("/trigger-new-plot", methods=["POST"])
+def trigger_new_plot():
 
-def fetch_jobs():
+    data = request.json
+    plot_name = data.get("plot_name")
 
-    return run_query(
-        """
-        SELECT * FROM analysis_queue
-        WHERE status='pending'
-        ORDER BY priority DESC
-        LIMIT %s
-        """,
-        (BATCH_SIZE,),
-        fetchall=True
-    )
+    if not plot_name:
+        return jsonify({"error": "plot_name missing"}), 400
 
-def lock_job(job_id):
+    print(f"🚀 Manual trigger received for {plot_name}")
 
-    res = run_query(
-        """
-        UPDATE analysis_queue
-        SET status='processing'
-        WHERE id=%s AND status='pending'
-        RETURNING id
-        """,
-        (job_id,),
-        fetchone=True
-    )
+    threading.Thread(
+        target=process_new_plot,
+        args=(plot_name,)
+    ).start()
 
-    return res is not None
+    return jsonify({"status": "triggered"})
 
-def mark_completed(job_id):
-
-    run_query(
-        "UPDATE analysis_queue SET status='completed' WHERE id=%s",
-        (job_id,)
-    )
-
-# =====================================================
-# JOB PROCESSOR
-# =====================================================
-
-def process_job(job):
-
-    job_id = job["id"]
-    plot_name = job["plot_name"]
-    analysis_type = job["analysis_type"]
-    plot_id = job["plot_id"]
-
-    if not lock_job(job_id):
-        return
-
-    try:
-
-        plot_data = plots.get(plot_name)
-
-        if analysis_type == "growth":
-            results = run_growth_analysis_by_plot(plot_name, plot_data, start_date, today)
-
-        elif analysis_type == "water_uptake":
-            results = run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, today)
-
-        elif analysis_type == "soil_moisture":
-            results = run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, today)
-
-        elif analysis_type == "pest_detection":
-            results = run_pest_detection_analysis_by_plot(plot_name, plot_data, pest_start, today)
-
-        store_results(results, analysis_type, plot_id)
-
-        mark_completed(job_id)
-
-        time.sleep(REQUEST_DELAY)
-
-    except Exception as e:
-
-        print("🔥 Job failed:", e, flush=True)
 
 # =====================================================
 # WORKER LOOP
 # =====================================================
 
-print("🚀 PERSISTENT WORKER STARTED", flush=True)
+def worker_loop():
 
-while True:
+    global known_plots
 
-    try:
+    print("🚀 Worker loop started")
 
-        print("🔄 Syncing plots...", flush=True)
+    while True:
 
-        run_plot_sync()
+        try:
 
-        plots = PlotSyncService().get_plots_dict(force_refresh=True)
+            print("🔎 Checking for new plots...", flush=True)
 
-        trigger_backfill_for_new_plots(plots)
+            run_plot_sync()
 
-        jobs = fetch_jobs()
+            plots = plot_service.get_plots_dict(force_refresh=True)
 
-        if jobs:
+            current_plots = set(plots.keys())
 
-            print(f"📦 Processing {len(jobs)} jobs", flush=True)
+            new_plots = current_plots - known_plots
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                executor.map(process_job, jobs)
+            if new_plots:
 
-        else:
+                print(f"🆕 New plots detected: {new_plots}", flush=True)
 
-            print("⏳ No jobs — sleeping 5 minutes", flush=True)
+                for plot_name in new_plots:
 
-        time.sleep(300)   # 5 minutes
+                    threading.Thread(
+                        target=process_new_plot,
+                        args=(plot_name,)
+                    ).start()
 
-    except Exception as e:
+            known_plots = current_plots
 
-        print("🔥 Worker error:", e, flush=True)
+            time.sleep(CHECK_INTERVAL)
 
-        time.sleep(60)
+        except Exception as e:
+
+            print("🔥 Worker error:", e)
+
+            time.sleep(30)
+
+
+# =====================================================
+# MAIN
+# =====================================================
+
+if __name__ == "__main__":
+
+    threading.Thread(target=worker_loop).start()
+
+    print("🌐 Worker API running on port 8000")
+
+    app.run(host="0.0.0.0", port=8000)
