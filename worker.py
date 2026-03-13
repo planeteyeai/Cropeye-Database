@@ -87,6 +87,47 @@ def get_plot_hash(plot_data):
     crop = str(plot_data.get("crop_type"))
     return f"{plantation}_{crop}"
 
+def run_today_analysis_for_plot(plot_name, plot_data):
+
+    print(f"🌅 Running TODAY analysis for {plot_name}")
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=30)
+
+    start_date = start_date.isoformat()
+    end_date = end_date.isoformat()
+
+    try:
+
+        res = run_growth_analysis_by_plot(
+            plot_name, plot_data, start_date, end_date
+        )
+        if res:
+            store_results(plot_name, "growth", res)
+
+        res = run_water_uptake_analysis_by_plot(
+            plot_name, plot_data, start_date, end_date
+        )
+        if res:
+            store_results(plot_name, "water_uptake", res)
+
+        res = run_soil_moisture_analysis_by_plot(
+            plot_name, plot_data, start_date, end_date
+        )
+        if res:
+            store_results(plot_name, "soil_moisture", res)
+
+        res = run_pest_detection_analysis_by_plot(
+            plot_name, plot_data, start_date, end_date
+        )
+        if res:
+            store_results(plot_name, "pest_detection", res)
+
+        print(f"✅ TODAY analysis complete {plot_name}")
+
+    except Exception as e:
+        print(f"🔥 TODAY analysis failed {plot_name}: {e}")
+
 # =====================================================
 # NEW PLOT BACKFILL
 # =====================================================
