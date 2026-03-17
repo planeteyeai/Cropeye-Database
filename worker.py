@@ -1,8 +1,7 @@
 from datetime import date, timedelta
-import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
-import ee
+
 from flask import Flask, request, jsonify
 from psycopg2.extras import RealDictCursor, Json
 
@@ -28,15 +27,16 @@ app = Flask(__name__)
 # CONFIG
 # =====================================================
 
-CHECK_INTERVAL = 20
 MAX_PARALLEL_ANALYSIS = 4
 
+# Memory for tracking plots
+known_plot_ids = set()
 
 # =====================================================
-# INITIAL PLOT SYNC
+# INITIAL SYNC (RUN ONLY ONCE)
 # =====================================================
 
-print("🔄 Running plot sync...", flush=True)
+print("🔄 Initial plot sync...", flush=True)
 
 try:
     sync_result = run_plot_sync()
@@ -45,9 +45,6 @@ except Exception as e:
     print("❌ Plot sync failed:", str(e), flush=True)
 
 plot_service = PlotSyncService()
-plots = plot_service.get_plots_dict(force_refresh=True)
-
-known_plots = set(plots.keys())
 
 
 # =====================================================
@@ -147,7 +144,7 @@ def store_results(results, analysis_type, plot_id):
 
 
 # =====================================================
-# TODAY ANALYSIS (PARALLEL)
+# TODAY ANALYSIS
 # =====================================================
 
 def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
@@ -187,7 +184,6 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
             print(f"🔥 pest detection failed {plot_name}: {e}")
 
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
-
         executor.submit(run_growth)
         executor.submit(run_water)
         executor.submit(run_soil)
@@ -197,39 +193,102 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 
 
 # =====================================================
-# NEW PLOT PIPELINE
+# NEW PLOT PIPELINE (NO DJANGO CALL)
 # =====================================================
 
 def process_new_plot(plot_name):
 
     print(f"🚀 Processing new plot {plot_name}", flush=True)
 
-    plots = plot_service.get_plots_dict(force_refresh=True)
-    plot_data = plots.get(plot_name)
-
-    if not plot_data:
-        print("⚠ Plot not found after sync")
-        return
-
+    # ✅ DIRECT DB FETCH (NO DJANGO API)
     row = run_query(
-        "SELECT id FROM plots WHERE plot_name=%s",
+        "SELECT id, geometry FROM plots WHERE plot_name=%s",
         (plot_name,),
         fetchone=True
     )
 
     if not row:
-        print("⚠ Plot not in DB yet")
+        print("⚠ Plot not found in DB")
         return
 
     plot_id = row["id"]
 
+    # Convert DB geometry → GeoJSON
+    plot_data = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": row["geometry"],
+                "properties": {}
+            }
+        ]
+    }
+
+    # Run analysis
     run_today_analysis_for_plot(plot_name, plot_data, plot_id)
 
-    run_monthly_backfill_for_plot(plot_name, plot_data)
+    # Run backfill in background
+    threading.Thread(
+        target=run_monthly_backfill_for_plot,
+        args=(plot_name, plot_data)
+    ).start()
 
 
 # =====================================================
-# MANUAL TRIGGER API
+# SMART REFRESH (MAIN MAGIC 🚀)
+# =====================================================
+
+@app.route("/refresh-from-django", methods=["POST"])
+def refresh_from_django():
+
+    global known_plot_ids
+
+    try:
+        print("🔄 Smart refresh triggered...", flush=True)
+
+        plot_dict = plot_service.get_plots_dict(force_refresh=True)
+
+        current_plot_ids = set()
+
+        for plot_name, plot_data in plot_dict.items():
+            django_id = plot_data.get("properties", {}).get("django_id")
+            if django_id:
+                current_plot_ids.add(django_id)
+
+        new_plots = current_plot_ids - known_plot_ids
+
+        print(f"🆕 New plots detected: {len(new_plots)}", flush=True)
+
+        triggered = []
+
+        for plot_name, plot_data in plot_dict.items():
+
+            django_id = plot_data.get("properties", {}).get("django_id")
+
+            if django_id in new_plots:
+
+                threading.Thread(
+                    target=process_new_plot,
+                    args=(plot_name,)
+                ).start()
+
+                triggered.append(plot_name)
+
+        known_plot_ids = current_plot_ids
+
+        return jsonify({
+            "status": "success",
+            "new_detected": len(new_plots),
+            "triggered": triggered
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# =====================================================
+# MANUAL TRIGGER
 # =====================================================
 
 @app.route("/trigger-new-plot", methods=["POST"])
@@ -241,8 +300,6 @@ def trigger_new_plot():
     if not plot_name:
         return jsonify({"error": "plot_name missing"}), 400
 
-    print(f"🚀 Manual trigger received for {plot_name}")
-
     threading.Thread(
         target=process_new_plot,
         args=(plot_name,)
@@ -252,58 +309,10 @@ def trigger_new_plot():
 
 
 # =====================================================
-# WORKER LOOP
-# =====================================================
-
-def worker_loop():
-
-    global known_plots
-
-    print("🚀 Worker loop started")
-
-    while True:
-
-        try:
-
-            print("🔎 Checking for new plots...", flush=True)
-
-            run_plot_sync()
-
-            plots = plot_service.get_plots_dict(force_refresh=True)
-
-            current_plots = set(plots.keys())
-
-            new_plots = current_plots - known_plots
-
-            if new_plots:
-
-                print(f"🆕 New plots detected: {new_plots}", flush=True)
-
-                for plot_name in new_plots:
-
-                    threading.Thread(
-                        target=process_new_plot,
-                        args=(plot_name,)
-                    ).start()
-
-            known_plots = current_plots
-
-            time.sleep(CHECK_INTERVAL)
-
-        except Exception as e:
-
-            print("🔥 Worker error:", e)
-
-            time.sleep(30)
-
-
-# =====================================================
 # MAIN
 # =====================================================
 
 if __name__ == "__main__":
-
-    threading.Thread(target=worker_loop).start()
 
     print("🌐 Worker API running on port 8000")
 
