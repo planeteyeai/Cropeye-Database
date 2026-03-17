@@ -2061,7 +2061,69 @@ async def refresh_from_django():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to refresh from Django: {str(e)}")
 
+# Store known plots in memory
+known_plot_ids = set()
 
+@app.post("/refresh-from-django")
+async def refresh_from_django():
+    """
+    Smart refresh:
+    - Fetch plots
+    - Detect NEW ones
+    - Auto trigger processing
+    """
+
+    global known_plot_ids
+
+    try:
+        print("🔄 Smart refresh started...")
+
+        # Step 1: Fetch plots ONCE
+        plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+
+        # Step 2: Extract IDs
+        current_plot_ids = set()
+
+        for plot_name, plot_data in plot_dict.items():
+            django_id = plot_data.get("properties", {}).get("django_id")
+            if django_id:
+                current_plot_ids.add(django_id)
+
+        # Step 3: Detect NEW plots
+        new_plots = current_plot_ids - known_plot_ids
+
+        print(f"🆕 New plots detected: {len(new_plots)}")
+
+        triggered = []
+
+        # Step 4: Trigger processing
+        for plot_name, plot_data in plot_dict.items():
+
+            django_id = plot_data.get("properties", {}).get("django_id")
+
+            if django_id in new_plots:
+
+                print(f"🚀 Triggering plot {plot_name}")
+
+                threading.Thread(
+                    target=process_new_plot,
+                    args=(plot_name,)
+                ).start()
+
+                triggered.append(plot_name)
+
+        # Step 5: Update memory
+        known_plot_ids = current_plot_ids
+
+        return {
+            "status": "success",
+            "total_plots": len(current_plot_ids),
+            "new_detected": len(new_plots),
+            "triggered": triggered
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
