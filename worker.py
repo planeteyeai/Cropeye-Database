@@ -14,7 +14,6 @@ from gee_growth import (
     run_pest_detection_analysis_by_plot
 )
 
-from shared_services import PlotSyncService, run_plot_sync
 from db import get_connection
 from Admin import run_monthly_backfill_for_plot
 
@@ -30,39 +29,8 @@ app = Flask(__name__)
 
 MAX_PARALLEL_ANALYSIS = 4
 
-# Memory for tracking plots
+# Track known plots using DB IDs
 known_plot_ids = set()
-
-# =====================================================
-# INITIAL SYNC (RUN ONLY ONCE)
-# =====================================================
-
-print("🔄 Initial plot sync...", flush=True)
-
-try:
-    sync_result = run_plot_sync()
-    print("✅ Sync result:", sync_result, flush=True)
-except Exception as e:
-    print("❌ Plot sync failed:", str(e), flush=True)
-
-plot_service = PlotSyncService()
-
-# ✅ IMPORTANT FIX: Initialize known_plot_ids
-print("🧠 Initializing known plots...", flush=True)
-
-try:
-    plot_dict = plot_service.get_plots_dict(force_refresh=True)
-
-    for plot_name, plot_data in plot_dict.items():
-        django_id = plot_data.get("properties", {}).get("django_id")
-        if django_id:
-            known_plot_ids.add(django_id)
-
-    print(f"✅ Initialized {len(known_plot_ids)} known plots", flush=True)
-
-except Exception as e:
-    print("❌ Failed to initialize known plots:", e)
-
 
 # =====================================================
 # DB HELPER
@@ -74,15 +42,8 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
     cursor = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-
         if params:
-            new_params = []
-            for p in params:
-                if isinstance(p, dict):
-                    new_params.append(Json(p))
-                else:
-                    new_params.append(p)
-            params = tuple(new_params)
+            params = tuple(Json(p) if isinstance(p, dict) else p for p in params)
 
         cursor.execute(query, params)
 
@@ -105,6 +66,18 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         cursor.close()
         conn.close()
 
+# =====================================================
+# INITIAL LOAD (FROM DB DIRECTLY 🚀)
+# =====================================================
+
+print("🧠 Loading existing plots from DB...", flush=True)
+
+rows = run_query("SELECT id FROM plots", fetchall=True) or []
+
+for r in rows:
+    known_plot_ids.add(r["id"])
+
+print(f"✅ Loaded {len(known_plot_ids)} plots into memory", flush=True)
 
 # =====================================================
 # STORE RESULTS
@@ -159,7 +132,6 @@ def store_results(results, analysis_type, plot_id):
 
         print(f"✅ Stored {analysis_type} {analysis_date}", flush=True)
 
-
 # =====================================================
 # TODAY ANALYSIS
 # =====================================================
@@ -208,9 +180,8 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 
     print(f"✅ TODAY analysis complete {plot_name}", flush=True)
 
-
 # =====================================================
-# NEW PLOT PIPELINE
+# NEW PLOT PIPELINE (FIXED GEOJSON ✅)
 # =====================================================
 
 def process_new_plot(plot_name):
@@ -218,7 +189,7 @@ def process_new_plot(plot_name):
     print(f"🚀 Processing new plot {plot_name}", flush=True)
 
     row = run_query(
-        "SELECT id, geometry FROM plots WHERE plot_name=%s",
+        "SELECT id, geojson FROM plots WHERE plot_name=%s",
         (plot_name,),
         fetchone=True
     )
@@ -227,8 +198,8 @@ def process_new_plot(plot_name):
         print("⚠ Plot not found in DB")
         return
 
-    if not row["geometry"]:
-        print(f"⚠ Plot {plot_name} has no geometry → skipping")
+    if not row["geojson"]:
+        print(f"⚠ Plot {plot_name} has no geojson → skipping")
         return
 
     plot_id = row["id"]
@@ -238,7 +209,7 @@ def process_new_plot(plot_name):
         "features": [
             {
                 "type": "Feature",
-                "geometry": row["geometry"],
+                "geometry": row["geojson"],  # ✅ FIXED
                 "properties": {}
             }
         ]
@@ -251,9 +222,8 @@ def process_new_plot(plot_name):
         args=(plot_name, plot_data)
     ).start()
 
-
 # =====================================================
-# SMART REFRESH
+# SMART REFRESH (DB-BASED 🚀 NO DELAY)
 # =====================================================
 
 @app.route("/refresh-from-django", methods=["POST"])
@@ -264,37 +234,37 @@ def refresh_from_django():
     try:
         print("🔄 Smart refresh triggered...", flush=True)
 
-        plot_dict = plot_service.get_plots_dict(force_refresh=True)
+        rows = run_query(
+            "SELECT id, plot_name FROM plots",
+            fetchall=True
+        ) or []
 
-        current_plot_ids = set()
+        current_ids = set()
+        plot_map = {}
 
-        for plot_name, plot_data in plot_dict.items():
-            django_id = plot_data.get("properties", {}).get("django_id")
-            if django_id:
-                current_plot_ids.add(django_id)
+        for r in rows:
+            current_ids.add(r["id"])
+            plot_map[r["id"]] = r["plot_name"]
 
-        new_plots = current_plot_ids - known_plot_ids
+        new_plots = current_ids - known_plot_ids
 
         print(f"🆕 New plots detected: {len(new_plots)}", flush=True)
 
         triggered = []
 
-        for plot_name, plot_data in plot_dict.items():
+        for pid in new_plots:
+            plot_name = plot_map[pid]
 
-            django_id = plot_data.get("properties", {}).get("django_id")
+            print(f"🚀 Triggering {plot_name}", flush=True)
 
-            if django_id in new_plots:
+            threading.Thread(
+                target=process_new_plot,
+                args=(plot_name,)
+            ).start()
 
-                print(f"🚀 Triggering {plot_name}", flush=True)
+            triggered.append(plot_name)
 
-                threading.Thread(
-                    target=process_new_plot,
-                    args=(plot_name,)
-                ).start()
-
-                triggered.append(plot_name)
-
-        known_plot_ids = current_plot_ids
+        known_plot_ids = current_ids
 
         return jsonify({
             "status": "success",
@@ -305,9 +275,8 @@ def refresh_from_django():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # =====================================================
-# AUTO REFRESH LOOP (FALLBACK 🚀)
+# AUTO REFRESH LOOP (FAST ⚡)
 # =====================================================
 
 def auto_refresh_loop():
@@ -318,8 +287,8 @@ def auto_refresh_loop():
             requests.post("http://localhost:8000/refresh-from-django", timeout=5)
         except Exception as e:
             print("⚠ Auto refresh failed:", e)
-        time.sleep(10)
 
+        time.sleep(5)  # ⚡ faster detection
 
 # =====================================================
 # MANUAL TRIGGER
@@ -341,7 +310,6 @@ def trigger_new_plot():
 
     return jsonify({"status": "triggered"})
 
-
 # =====================================================
 # MAIN
 # =====================================================
@@ -350,7 +318,6 @@ if __name__ == "__main__":
 
     print("🌐 Worker API running on port 8000")
 
-    # ✅ START AUTO REFRESH LOOP
     threading.Thread(target=auto_refresh_loop).start()
 
     app.run(host="0.0.0.0", port=8000)
