@@ -16,6 +16,7 @@ from gee_growth import (
 
 from db import get_connection
 from Admin import run_monthly_backfill_for_plot
+from shared_services import run_plot_sync  # ✅ IMPORTANT
 
 # =====================================================
 # FLASK APP
@@ -29,7 +30,6 @@ app = Flask(__name__)
 
 MAX_PARALLEL_ANALYSIS = 4
 
-# Track known plots using DB IDs
 known_plot_ids = set()
 
 # =====================================================
@@ -67,8 +67,15 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# INITIAL LOAD (FROM DB DIRECTLY 🚀)
+# INITIAL LOAD
 # =====================================================
+
+print("🔄 Running initial sync...", flush=True)
+
+try:
+    run_plot_sync()  # ✅ ensure DB is populated
+except Exception as e:
+    print("❌ Initial sync failed:", e)
 
 print("🧠 Loading existing plots from DB...", flush=True)
 
@@ -181,7 +188,7 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
     print(f"✅ TODAY analysis complete {plot_name}", flush=True)
 
 # =====================================================
-# NEW PLOT PIPELINE (FIXED GEOJSON ✅)
+# PROCESS NEW PLOT
 # =====================================================
 
 def process_new_plot(plot_name):
@@ -209,7 +216,7 @@ def process_new_plot(plot_name):
         "features": [
             {
                 "type": "Feature",
-                "geometry": row["geojson"],  # ✅ FIXED
+                "geometry": row["geojson"],
                 "properties": {}
             }
         ]
@@ -223,7 +230,7 @@ def process_new_plot(plot_name):
     ).start()
 
 # =====================================================
-# SMART REFRESH (DB-BASED 🚀 NO DELAY)
+# SMART REFRESH
 # =====================================================
 
 @app.route("/refresh-from-django", methods=["POST"])
@@ -233,6 +240,9 @@ def refresh_from_django():
 
     try:
         print("🔄 Smart refresh triggered...", flush=True)
+
+        # ✅ CRITICAL: Sync first
+        run_plot_sync()
 
         rows = run_query(
             "SELECT id, plot_name FROM plots",
@@ -276,7 +286,7 @@ def refresh_from_django():
         return jsonify({"error": str(e)}), 500
 
 # =====================================================
-# AUTO REFRESH LOOP (FAST ⚡)
+# AUTO REFRESH LOOP (FIXED STARTUP)
 # =====================================================
 
 def auto_refresh_loop():
@@ -284,11 +294,15 @@ def auto_refresh_loop():
     while True:
         try:
             print("⏱ Auto refresh calling...", flush=True)
-            requests.post("http://localhost:8000/refresh-from-django", timeout=5)
+            requests.post("http://127.0.0.1:8000/refresh-from-django", timeout=5)
         except Exception as e:
             print("⚠ Auto refresh failed:", e)
 
-        time.sleep(5)  # ⚡ faster detection
+        time.sleep(5)
+
+def start_background_jobs():
+    time.sleep(2)  # ✅ wait for Flask to start
+    auto_refresh_loop()
 
 # =====================================================
 # MANUAL TRIGGER
@@ -318,6 +332,6 @@ if __name__ == "__main__":
 
     print("🌐 Worker API running on port 8000")
 
-    threading.Thread(target=auto_refresh_loop).start()
+    threading.Thread(target=start_background_jobs).start()
 
     app.run(host="0.0.0.0", port=8000)
