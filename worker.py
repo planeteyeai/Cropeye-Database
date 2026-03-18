@@ -1,5 +1,7 @@
 from datetime import date, timedelta
 import threading
+import time
+import requests
 from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, request, jsonify
@@ -44,6 +46,22 @@ except Exception as e:
     print("❌ Plot sync failed:", str(e), flush=True)
 
 plot_service = PlotSyncService()
+
+# ✅ IMPORTANT FIX: Initialize known_plot_ids
+print("🧠 Initializing known plots...", flush=True)
+
+try:
+    plot_dict = plot_service.get_plots_dict(force_refresh=True)
+
+    for plot_name, plot_data in plot_dict.items():
+        django_id = plot_data.get("properties", {}).get("django_id")
+        if django_id:
+            known_plot_ids.add(django_id)
+
+    print(f"✅ Initialized {len(known_plot_ids)} known plots", flush=True)
+
+except Exception as e:
+    print("❌ Failed to initialize known plots:", e)
 
 
 # =====================================================
@@ -192,14 +210,13 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 
 
 # =====================================================
-# NEW PLOT PIPELINE (NO DJANGO CALL)
+# NEW PLOT PIPELINE
 # =====================================================
 
 def process_new_plot(plot_name):
 
     print(f"🚀 Processing new plot {plot_name}", flush=True)
 
-    # ✅ DIRECT DB FETCH (NO DJANGO API)
     row = run_query(
         "SELECT id, geometry FROM plots WHERE plot_name=%s",
         (plot_name,),
@@ -210,9 +227,12 @@ def process_new_plot(plot_name):
         print("⚠ Plot not found in DB")
         return
 
+    if not row["geometry"]:
+        print(f"⚠ Plot {plot_name} has no geometry → skipping")
+        return
+
     plot_id = row["id"]
 
-    # Convert DB geometry → GeoJSON
     plot_data = {
         "type": "FeatureCollection",
         "features": [
@@ -224,10 +244,8 @@ def process_new_plot(plot_name):
         ]
     }
 
-    # Run analysis
     run_today_analysis_for_plot(plot_name, plot_data, plot_id)
 
-    # Run backfill in background
     threading.Thread(
         target=run_monthly_backfill_for_plot,
         args=(plot_name, plot_data)
@@ -235,7 +253,7 @@ def process_new_plot(plot_name):
 
 
 # =====================================================
-# SMART REFRESH (MAIN MAGIC 🚀)
+# SMART REFRESH
 # =====================================================
 
 @app.route("/refresh-from-django", methods=["POST"])
@@ -267,6 +285,8 @@ def refresh_from_django():
 
             if django_id in new_plots:
 
+                print(f"🚀 Triggering {plot_name}", flush=True)
+
                 threading.Thread(
                     target=process_new_plot,
                     args=(plot_name,)
@@ -284,6 +304,21 @@ def refresh_from_django():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# =====================================================
+# AUTO REFRESH LOOP (FALLBACK 🚀)
+# =====================================================
+
+def auto_refresh_loop():
+
+    while True:
+        try:
+            print("⏱ Auto refresh calling...", flush=True)
+            requests.post("http://localhost:8000/refresh-from-django", timeout=5)
+        except Exception as e:
+            print("⚠ Auto refresh failed:", e)
+        time.sleep(10)
 
 
 # =====================================================
@@ -314,5 +349,8 @@ def trigger_new_plot():
 if __name__ == "__main__":
 
     print("🌐 Worker API running on port 8000")
+
+    # ✅ START AUTO REFRESH LOOP
+    threading.Thread(target=auto_refresh_loop).start()
 
     app.run(host="0.0.0.0", port=8000)
