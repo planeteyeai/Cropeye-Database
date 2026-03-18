@@ -294,7 +294,7 @@ def auto_refresh_loop():
     while True:
         try:
             print("⏱ Auto refresh calling...", flush=True)
-            requests.post("http://127.0.0.1:8000/refresh-from-django", timeout=5)
+            requests.post("http://127.0.0.1:8000/refresh-from-django", timeout=60)
         except Exception as e:
             print("⚠ Auto refresh failed:", e)
 
