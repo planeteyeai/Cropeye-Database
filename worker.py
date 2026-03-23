@@ -6,6 +6,7 @@ from queue import Queue
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+import uvicorn
 
 from psycopg2.extras import RealDictCursor, Json
 
@@ -30,15 +31,21 @@ app = FastAPI()
 # CONFIG
 # =====================================================
 
-MAX_PARALLEL_ANALYSIS = 4
-GLOBAL_LIMIT = 8  # 🚀 prevent overload
+MAX_PARALLEL_ANALYSIS = 3   # 🔥 safer
+GLOBAL_LIMIT = 4            # 🔥 prevent Railway crash
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
 known_plot_ids = set()
-
-# Thread-safe queue
 priority_queue = Queue()
+
+# =====================================================
+# HEALTH CHECK (CRITICAL FOR RAILWAY)
+# =====================================================
+
+@app.get("/")
+def health():
+    return {"status": "alive"}
 
 # =====================================================
 # REQUEST MODEL
@@ -74,7 +81,7 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
 
     except Exception as e:
         conn.rollback()
-        print("🔥 DB error:", e)
+        print("🔥 DB error:", e, flush=True)
         return None
 
     finally:
@@ -82,22 +89,24 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# INITIAL LOAD
+# INITIAL LOAD (ONLY ONCE)
 # =====================================================
 
-print("🔄 Initial sync...", flush=True)
+def initial_load():
 
-try:
-    run_plot_sync()
-except Exception as e:
-    print("❌ Sync failed:", e)
+    print("🔄 Initial sync...", flush=True)
 
-rows = run_query("SELECT id FROM plots", fetchall=True) or []
+    try:
+        run_plot_sync()
+    except Exception as e:
+        print("❌ Sync failed:", e)
 
-for r in rows:
-    known_plot_ids.add(r["id"])
+    rows = run_query("SELECT id FROM plots", fetchall=True) or []
 
-print(f"✅ Loaded {len(known_plot_ids)} plots", flush=True)
+    for r in rows:
+        known_plot_ids.add(r["id"])
+
+    print(f"✅ Loaded {len(known_plot_ids)} plots", flush=True)
 
 # =====================================================
 # STORE RESULTS
@@ -105,39 +114,43 @@ print(f"✅ Loaded {len(known_plot_ids)} plots", flush=True)
 
 def store_results(results, analysis_type, plot_id):
 
-    if not results:
-        return
+    try:
+        if not results:
+            return
 
-    if isinstance(results, dict):
-        results = [results]
+        if isinstance(results, dict):
+            results = [results]
 
-    for geojson in results:
+        for geojson in results:
 
-        features = geojson.get("features")
-        if not features:
-            continue
+            features = geojson.get("features")
+            if not features:
+                continue
 
-        props = features[0].get("properties", {})
+            props = features[0].get("properties", {})
 
-        analysis_date = (
-            props.get("analysis_image_date")
-            or props.get("latest_image_date")
-        )
+            analysis_date = (
+                props.get("analysis_image_date")
+                or props.get("latest_image_date")
+            )
 
-        if not analysis_date:
-            continue
+            if not analysis_date:
+                continue
 
-        run_query(
-            """
-            INSERT INTO analysis_results
-            (plot_id,analysis_type,analysis_date,response_json)
-            VALUES (%s,%s,%s,%s)
-            ON CONFLICT DO NOTHING
-            """,
-            (plot_id, analysis_type, analysis_date, Json(geojson))
-        )
+            run_query(
+                """
+                INSERT INTO analysis_results
+                (plot_id,analysis_type,analysis_date,response_json)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING
+                """,
+                (plot_id, analysis_type, analysis_date, Json(geojson))
+            )
 
-        print(f"✅ Stored {analysis_type} for plot {plot_id}", flush=True)
+            print(f"✅ Stored {analysis_type} for plot {plot_id}", flush=True)
+
+    except Exception as e:
+        print("🔥 store_results error:", e, flush=True)
 
 # =====================================================
 # ANALYSIS
@@ -145,31 +158,35 @@ def store_results(results, analysis_type, plot_id):
 
 def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 
-    with semaphore:
+    try:
+        with semaphore:
 
-        print(f"🌅 Running TODAY analysis for {plot_name}", flush=True)
+            print(f"🌅 Running TODAY analysis for {plot_name}", flush=True)
 
-        end_date = date.today()
-        start_date = (end_date - timedelta(days=30)).isoformat()
-        end_date = end_date.isoformat()
+            end_date = date.today()
+            start_date = (end_date - timedelta(days=30)).isoformat()
+            end_date = end_date.isoformat()
 
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
+            with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
 
-            executor.submit(lambda: store_results(
-                run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "growth", plot_id))
+                executor.submit(lambda: store_results(
+                    run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                    "growth", plot_id))
 
-            executor.submit(lambda: store_results(
-                run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "water", plot_id))
+                executor.submit(lambda: store_results(
+                    run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                    "water", plot_id))
 
-            executor.submit(lambda: store_results(
-                run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "soil", plot_id))
+                executor.submit(lambda: store_results(
+                    run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                    "soil", plot_id))
 
-            executor.submit(lambda: store_results(
-                run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "pest", plot_id))
+                executor.submit(lambda: store_results(
+                    run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                    "pest", plot_id))
+
+    except Exception as e:
+        print(f"🔥 Analysis failed for {plot_name}: {e}", flush=True)
 
 # =====================================================
 # PROCESS PLOT
@@ -177,39 +194,43 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 
 def process_plot(plot_name):
 
-    print(f"➡ Processing {plot_name}", flush=True)
+    try:
+        print(f"➡ Processing {plot_name}", flush=True)
 
-    row = run_query(
-        "SELECT id, geojson FROM plots WHERE plot_name=%s",
-        (plot_name,),
-        fetchone=True
-    )
+        row = run_query(
+            "SELECT id, geojson FROM plots WHERE plot_name=%s",
+            (plot_name,),
+            fetchone=True
+        )
 
-    if not row or not row["geojson"]:
-        print(f"⚠ Skipping {plot_name} (no geojson)", flush=True)
-        return
+        if not row or not row["geojson"]:
+            print(f"⚠ Skipping {plot_name}", flush=True)
+            return
 
-    plot_id = row["id"]
+        plot_id = row["id"]
 
-    plot_data = {
-        "type": "FeatureCollection",
-        "features": [{
-            "type": "Feature",
-            "geometry": row["geojson"],
-            "properties": {}
-        }]
-    }
+        plot_data = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": row["geojson"],
+                "properties": {}
+            }]
+        }
 
-    run_today_analysis_for_plot(plot_name, plot_data, plot_id)
+        run_today_analysis_for_plot(plot_name, plot_data, plot_id)
 
-    threading.Thread(
-        target=run_monthly_backfill_for_plot,
-        args=(plot_name, plot_data),
-        daemon=True
-    ).start()
+        threading.Thread(
+            target=run_monthly_backfill_for_plot,
+            args=(plot_name, plot_data),
+            daemon=True
+        ).start()
+
+    except Exception as e:
+        print(f"🔥 process_plot error: {e}", flush=True)
 
 # =====================================================
-# INSTANT TRIGGER (FROM DJANGO)
+# API TRIGGER
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -230,16 +251,11 @@ def worker_loop():
     while True:
         try:
 
-            # 🔥 PRIORITY FIRST
             if not priority_queue.empty():
-                plot_name = priority_queue.get()
-                process_plot(plot_name)
+                process_plot(priority_queue.get())
                 continue
 
-            rows = run_query(
-                "SELECT id, plot_name FROM plots",
-                fetchall=True
-            ) or []
+            rows = run_query("SELECT id, plot_name FROM plots", fetchall=True) or []
 
             current_ids = set(r["id"] for r in rows)
             new_ids = current_ids - known_plot_ids
@@ -257,37 +273,40 @@ def worker_loop():
             time.sleep(5)
 
 # =====================================================
-# DAILY JOB (SAFE + BATCHED)
+# DAILY JOB (SAFE)
 # =====================================================
 
 def daily_scheduler():
 
     while True:
 
-        print("🕛 Running DAILY job for ALL plots", flush=True)
+        try:
+            print("🕛 Running DAILY job for ALL plots", flush=True)
 
-        rows = run_query(
-            "SELECT plot_name FROM plots WHERE geojson IS NOT NULL",
-            fetchall=True
-        ) or []
+            rows = run_query(
+                "SELECT plot_name FROM plots WHERE geojson IS NOT NULL",
+                fetchall=True
+            ) or []
 
-        # ✅ process in batches to avoid crash
-        batch_size = 20
+            batch_size = 10  # 🔥 safer
 
-        for i in range(0, len(rows), batch_size):
+            for i in range(0, len(rows), batch_size):
 
-            batch = rows[i:i + batch_size]
+                batch = rows[i:i + batch_size]
 
-            for r in batch:
-                threading.Thread(
-                    target=process_plot,
-                    args=(r["plot_name"],),
-                    daemon=True
-                ).start()
+                for r in batch:
+                    threading.Thread(
+                        target=process_plot,
+                        args=(r["plot_name"],),
+                        daemon=True
+                    ).start()
 
-            time.sleep(10)  # 🚀 prevent overload
+                time.sleep(5)
 
-        time.sleep(86400)  # 24h
+        except Exception as e:
+            print("🔥 Daily job error:", e, flush=True)
+
+        time.sleep(86400)
 
 # =====================================================
 # STARTUP
@@ -295,9 +314,21 @@ def daily_scheduler():
 
 def start_background_jobs():
 
-    time.sleep(3)  # allow server startup
+    time.sleep(5)  # allow server startup
+
+    initial_load()
 
     threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=daily_scheduler, daemon=True).start()
 
-start_background_jobs()
+# =====================================================
+# MAIN
+# =====================================================
+
+if __name__ == "__main__":
+
+    print("🌐 Worker starting...", flush=True)
+
+    threading.Thread(target=start_background_jobs, daemon=True).start()
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
