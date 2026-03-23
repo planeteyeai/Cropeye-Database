@@ -114,41 +114,46 @@ def build_plot_data(row):
 
     geometry = None
 
-    # direct geometry
-    if isinstance(geojson, dict) and geojson.get("type") in ["Polygon", "MultiPolygon"]:
-        geometry = geojson
+    if isinstance(geojson, dict):
 
-    # Feature
-    elif geojson.get("type") == "Feature":
-        geometry = geojson.get("geometry")
+        if geojson.get("type") in ["Polygon", "MultiPolygon"]:
+            geometry = geojson
 
-    # FeatureCollection
-    elif geojson.get("type") == "FeatureCollection":
-        features = geojson.get("features", [])
-        if features:
-            geometry = features[0].get("geometry")
+        elif geojson.get("type") == "Feature":
+            geometry = geojson.get("geometry")
 
-    # 🔥 VALIDATION
+        elif geojson.get("type") == "FeatureCollection":
+            features = geojson.get("features", [])
+            if features:
+                geometry = features[0].get("geometry")
+
+    # 🚨 HARD VALIDATION
     if not geometry:
         print("❌ Geometry extraction failed")
         return None
 
-    if "coordinates" not in geometry:
-        print("❌ Geometry missing coordinates")
+    if not geometry.get("coordinates"):
+        print("❌ Coordinates missing")
         return None
 
-    if not geometry["coordinates"]:
+    if len(geometry.get("coordinates")) == 0:
         print("❌ Empty coordinates")
         return None
 
-    # 🔥 FINAL SAFE STRUCTURE
+    # ✅ FIXED django_id
+    django_id = row.get("django_plot_id")
+
+    if not django_id:
+        print("❌ Missing django_plot_id")
+        return None
+
     return {
         "type": "FeatureCollection",
         "features": [{
             "type": "Feature",
             "geometry": geometry,
             "properties": {
-                "plot_id": str(row["id"])  # ✅ FIXED
+                "django_id": django_id   # ✅ CRITICAL FIX
             }
         }]
     }
