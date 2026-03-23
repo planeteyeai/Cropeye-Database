@@ -243,8 +243,8 @@ def process_plot(plot_name):
     try:
         row = run_query(
             """
-            SELECT id, geojson, django_plot_id 
-            FROM plots 
+            SELECT id, geojson, django_plot_id, plot_name, crop_type
+            FROM plots
             WHERE plot_name=%s
             """,
             (plot_name,),
