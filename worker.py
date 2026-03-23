@@ -101,15 +101,16 @@ def initial_load():
     print(f"✅ Loaded {len(known_plot_ids)} plots", flush=True)
 
 # =====================================================
-# 🔥 STRICT GEOJSON BUILDER (FIXED)
+# GEOJSON BUILDER (STRICT + SAFE)
 # =====================================================
 
 def build_plot_data(row):
 
     geojson = row.get("geojson")
+    django_id = row.get("django_plot_id")
 
-    if not geojson:
-        print("❌ GeoJSON missing")
+    # ❌ skip invalid plots silently
+    if not geojson or not django_id:
         return None
 
     geometry = None
@@ -127,24 +128,14 @@ def build_plot_data(row):
             if features:
                 geometry = features[0].get("geometry")
 
-    # 🚨 HARD VALIDATION
+    # ❌ strict validation
     if not geometry:
-        print("❌ Geometry extraction failed")
         return None
 
     if not geometry.get("coordinates"):
-        print("❌ Coordinates missing")
         return None
 
     if len(geometry.get("coordinates")) == 0:
-        print("❌ Empty coordinates")
-        return None
-
-    # ✅ FIXED django_id
-    django_id = row.get("django_plot_id")
-
-    if not django_id:
-        print("❌ Missing django_plot_id")
         return None
 
     return {
@@ -153,7 +144,7 @@ def build_plot_data(row):
             "type": "Feature",
             "geometry": geometry,
             "properties": {
-                "django_id": django_id   # ✅ CRITICAL FIX
+                "django_id": django_id  # ✅ FIXED
             }
         }]
     }
@@ -245,23 +236,23 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 def process_plot(plot_name):
 
     try:
-        print(f"➡ Processing {plot_name}", flush=True)
-
         row = run_query(
-            "SELECT id, geojson FROM plots WHERE plot_name=%s",
+            """
+            SELECT id, geojson, django_plot_id 
+            FROM plots 
+            WHERE plot_name=%s
+            """,
             (plot_name,),
             fetchone=True
         )
 
         if not row:
-            print(f"❌ Plot not found {plot_name}", flush=True)
             return
 
         plot_data = build_plot_data(row)
 
         if not plot_data:
-            print(f"❌ Invalid geometry for {plot_name}", flush=True)
-            return
+            return  # ✅ silently skip bad plots
 
         plot_id = row["id"]
 
@@ -282,8 +273,6 @@ def process_plot(plot_name):
 
 @app.post("/trigger-new-plot")
 def trigger_new_plot(data: PlotRequest):
-
-    print(f"🚀 PRIORITY trigger for {data.plot_name}", flush=True)
 
     priority_queue.put(data.plot_name)
 
@@ -309,7 +298,7 @@ def worker_loop():
             time.sleep(5)
 
 # =====================================================
-# DAILY JOB
+# DAILY JOB (FIXED QUERY)
 # =====================================================
 
 def daily_scheduler():
@@ -319,7 +308,13 @@ def daily_scheduler():
         print("🕛 Running DAILY job for ALL plots", flush=True)
 
         rows = run_query(
-            "SELECT plot_name FROM plots WHERE geojson IS NOT NULL",
+            """
+            SELECT plot_name 
+            FROM plots 
+            WHERE geojson IS NOT NULL
+            AND geojson::text != '{}'
+            AND django_plot_id IS NOT NULL
+            """,
             fetchall=True
         ) or []
 
