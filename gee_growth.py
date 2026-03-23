@@ -491,11 +491,6 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
 
         results = []
 
-        sensor = None
-        sensor_used = None
-        latest_date = None
-        image_count = 0
-
         # =====================================================
         # SENTINEL-1 (VV)
         # =====================================================
@@ -507,126 +502,11 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
             .select(["VV"])
             .map(lambda img: img.clip(geometry))
-            .sort("system:time_start", False)
         )
 
-        s1_size = s1_collection.size().getInfo()
-        s1_count = s1_size
-        s1_latest_date = None
+        s1_size = int(s1_collection.size().getInfo() or 0)
 
-        if s1_count >= 2:
-
-            image_list = s1_collection.toList(2)
-            latest_image = ee.Image(image_list.get(0))
-            previous_image = ee.Image(image_list.get(1))
-
-            s1_latest_date = ee.Date(
-                latest_image.get("system:time_start")
-            ).format("YYYY-MM-dd").getInfo()
-
-            sensor = "s1"
-
-            delta_vh = latest_image.subtract(previous_image)
-
-            feature = build_feature(
-                plot_name,
-                sensor,
-                ee.Date(
-                    latest_image.get("system:time_start")
-                ).format("YYYY-MM-dd").getInfo()
-            )
-
-            results.append(feature)
-
-        # =====================================================
-        # SENTINEL-2 (NDWI)
-        # =====================================================
-        s2_collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(geometry)
-            .filterDate(analysis_start, analysis_end)
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
-            .map(lambda img: img.clip(geometry))
-            .sort("system:time_start", False)
-        )
-
-        s2_size = s2_collection.size().getInfo()
-        s2_count = s2_size
-        s2_latest_date = None
-
-        if s2_count > 0:
-
-            latest_s2_img = ee.Image(s2_collection.first())
-
-            s2_latest_date = ee.Date(
-                latest_s2_img.get("system:time_start")
-            ).format("YYYY-MM-dd").getInfo()
-
-            sensor = "s2"
-
-            ndmi_image = s2_collection.median().clip(geometry)
-
-            feature = build_feature(
-                plot_name,
-                sensor,
-                s2_latest_date
-            )
-
-            results.append(feature)
-
-        # =====================================================
-        # SENSOR SELECTION (UNCHANGED LOGIC)
-        # =====================================================
-        if s1_size == 0 and s2_size == 0:
-            return None
-
-        use_s2 = False
-
-        if s1_latest_date and s2_latest_date:
-            if s2_latest_date >= s1_latest_date:
-                use_s2 = True
-                sensor_used = "Sentinel-2"
-                latest_date = s2_latest_date
-            else:
-                use_s2 = False
-                sensor_used = "Sentinel-1"
-                latest_date = s1_latest_date
-        elif s2_latest_date:
-            use_s2 = True
-            sensor_used = "Sentinel-2"
-            latest_date = s2_latest_date
-        else:
-            use_s2 = False
-            sensor_used = "Sentinel-1"
-            latest_date = s1_latest_date
-
-        # =====================================================
-        # CLASSIFICATION
-        # =====================================================
-        if use_s2:
-
-            s2_composite = s2_collection.median().clip(geometry)
-
-            ndwi = (
-                s2_composite
-                .normalizedDifference(["B3", "B8"])
-                .rename("NDWI")
-            )
-
-            classified = (
-                ee.Image.constant(0)
-                .where(ndwi.lte(-0.4), 1)
-                .where(ndwi.gt(-0.4).And(ndwi.lte(-0.3)), 2)
-                .where(ndwi.gt(-0.3).And(ndwi.lte(0)), 3)
-                .where(ndwi.gt(0).And(ndwi.lte(0.2)), 4)
-                .where(ndwi.gt(0.2), 5)
-                .rename("soil_class")
-                .clip(geometry)
-            )
-
-            image_count = s2_size
-
-        else:
+        if s1_size > 0:
 
             vv_composite = s1_collection.median().clip(geometry)
             vv_band = vv_composite.select("VV")
@@ -642,118 +522,162 @@ def run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_dat
                 .clip(geometry)
             )
 
-            image_count = s1_size
+            sensor_used = "Sentinel-1"
+
+            latest_date = ee.Date(
+                s1_collection.sort("system:time_start", False)
+                .first()
+                .get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
+
+            results.append(
+                _build_soil_moisture_response(
+                    plot_name, geom_type, original_coords,
+                    classified, geometry,
+                    start_date, end_date,
+                    sensor_used, latest_date, s1_size
+                )
+            )
 
         # =====================================================
-        # VISUALIZATION
+        # SENTINEL-2 (NDWI BASED)
         # =====================================================
-        palette = [
-            "#2FC0D3",
-            "#4365D4",
-            "#473CDF",
-            "#2116BF",
-            "#000475",
-        ]
-
-        vis_params = {"min": 1, "max": 5, "palette": palette}
-
-        smoothed = classified.focal_mean(radius=20, units="meters")
-        visual = smoothed.visualize(**vis_params).clip(geometry)
-        tile_url = visual.getMapId()["tile_fetcher"].url_format
-
-        # =====================================================
-        # PIXEL COUNTING
-        # =====================================================
-        count_image = ee.Image.constant(1)
-
-        total_pixel_count = (
-            count_image.reduceRegion(
-                ee.Reducer.count(), geometry, 10, bestEffort=True
-            ).get("constant").getInfo()
+        s2_collection = (
+            ee.ImageCollection("COPERNICUS/S2_SR")
+            .filterBounds(geometry)
+            .filterDate(analysis_start, analysis_end)
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
+            .map(lambda img: img.clip(geometry))
         )
 
-        def get_pixel_count(mask):
-            return (
-                count_image.updateMask(mask)
-                .reduceRegion(
-                    ee.Reducer.count(), geometry, 10, bestEffort=True
-                ).get("constant").getInfo() or 0
+        s2_size = int(s2_collection.size().getInfo() or 0)
+
+        if s2_size > 0:
+
+            s2_composite = s2_collection.median().clip(geometry)
+
+            ndwi = s2_composite.normalizedDifference(["B3", "B8"]).rename("NDWI")
+
+            classified = (
+                ee.Image.constant(0)
+                .where(ndwi.lte(-0.4), 1)
+                .where(ndwi.gt(-0.4).And(ndwi.lte(-0.3)), 2)
+                .where(ndwi.gt(-0.3).And(ndwi.lte(0)), 3)
+                .where(ndwi.gt(0).And(ndwi.lte(0.2)), 4)
+                .where(ndwi.gt(0.2), 5)
+                .rename("soil_class")
+                .clip(geometry)
             )
 
-        def mask_to_coords(mask):
-            sampled = (
-                mask.selfMask()
-                .addBands(ee.Image.pixelLonLat())
-                .sample(region=geometry, scale=10, geometries=True, tileScale=4)
-                .getInfo()
+            sensor_used = "Sentinel-2"
+
+            latest_date = ee.Date(
+                s2_collection.sort("system:time_start", False)
+                .first()
+                .get("system:time_start")
+            ).format("YYYY-MM-dd").getInfo()
+
+            results.append(
+                _build_soil_moisture_response(
+                    plot_name, geom_type, original_coords,
+                    classified, geometry,
+                    start_date, end_date,
+                    sensor_used, latest_date, s2_size
+                )
             )
-            coords = [f["geometry"]["coordinates"] for f in sampled.get("features", [])]
-            return [list(x) for x in {tuple(c) for c in coords}]
 
-        labels = {
-            1: "less",
-            2: "adequate",
-            3: "excellent",
-            4: "excess",
-            5: "shallow water",
-        }
-
-        pixel_summary = {
-            "total_pixel_count": total_pixel_count,
-            "start_date": start_date,
-            "end_date": end_date,
-            "latest_image_date": latest_date,
-            "sensor_used": sensor_used,
-            "s1_available": s1_size > 0,
-            "s2_available": s2_size > 0,
-            "s1_latest_date": s1_latest_date,
-            "s2_latest_date": s2_latest_date,
-        }
-
-        for class_id in range(1, 6):
-
-            mask = classified.eq(class_id)
-            count = get_pixel_count(mask)
-            percent = (count / total_pixel_count) * 100 if total_pixel_count else 0
-            coords = mask_to_coords(mask)
-
-            key = labels[class_id].lower().replace(" ", "_")
-            pixel_summary[f"{key}_pixel_count"] = count
-            pixel_summary[f"{key}_pixel_percentage"] = round(percent, 2)
-            pixel_summary[f"{key}_pixel_coordinates"] = coords
-
-        feature = {
-            "type": "Feature",
-            "geometry": {
-                "type": geom_type,
-                "coordinates": original_coords,
-            },
-            "properties": {
-                "plot_name": plot_name,
-                "start_date": start_date,
-                "end_date": end_date,
-                "sensor_used": sensor_used,
-                "latest_image_date": latest_date,
-                "image_count": image_count,
-                "analysis_dates": {
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "latest_image_date": latest_date,
-                },
-                "tile_url": tile_url,
-                "last_updated": datetime.utcnow().isoformat(),
-            },
-        }
-
-        return {
-            "type": "FeatureCollection",
-            "features": [feature],
-            "pixel_summary": pixel_summary,
-        }
+        return results if results else None
 
     except Exception as e:
         print("❌ Soil moisture failed:", e, flush=True)
         return None
+
+def _build_soil_moisture_response(
+    plot_name, geom_type, original_coords,
+    classified, geometry,
+    start_date, end_date,
+    sensor_used, latest_date, image_count
+):
+
+    palette = ["#2FC0D3", "#4365D4", "#473CDF", "#2116BF", "#000475"]
+    vis_params = {"min": 1, "max": 5, "palette": palette}
+
+    smoothed = classified.focal_mean(radius=20, units="meters")
+    tile_url = smoothed.visualize(**vis_params).clip(geometry).getMapId()["tile_fetcher"].url_format
+
+    count_image = ee.Image.constant(1)
+
+    def get_pixel_count(mask):
+        return int(
+            count_image.updateMask(mask)
+            .reduceRegion(ee.Reducer.count(), geometry, 10, bestEffort=True)
+            .get("constant")
+            .getInfo() or 0
+        )
+
+    def mask_to_coords(mask):
+        sampled = (
+            mask.selfMask()
+            .addBands(ee.Image.pixelLonLat())
+            .sample(region=geometry, scale=10, geometries=True, tileScale=4)
+            .getInfo()
+        )
+        coords = [f["geometry"]["coordinates"] for f in sampled.get("features", [])]
+        return [list(x) for x in {tuple(c) for c in coords}]
+
+    total_pixel_count = get_pixel_count(count_image)
+
+    labels = {
+        1: "less",
+        2: "adequate",
+        3: "excellent",
+        4: "excess",
+        5: "shallow_water",
+    }
+
+    pixel_summary = {
+        "total_pixel_count": total_pixel_count,
+        "start_date": start_date,
+        "end_date": end_date,
+        "latest_image_date": latest_date,
+        "sensor_used": sensor_used,
+    }
+
+    for class_id in range(1, 6):
+        mask = classified.eq(class_id)
+        count = get_pixel_count(mask)
+        coords = mask_to_coords(mask)
+
+        pct = (count / total_pixel_count) * 100 if total_pixel_count else 0
+        key = labels[class_id]
+
+        pixel_summary[f"{key}_pixel_count"] = count
+        pixel_summary[f"{key}_pixel_percentage"] = round(pct, 2)
+        pixel_summary[f"{key}_pixel_coordinates"] = coords
+
+    feature = {
+        "type": "Feature",
+        "geometry": {
+            "type": geom_type,
+            "coordinates": original_coords,
+        },
+        "properties": {
+            "plot_name": plot_name,
+            "start_date": start_date,
+            "end_date": end_date,
+            "sensor_used": sensor_used,
+            "latest_image_date": latest_date,
+            "image_count": image_count,
+            "tile_url": tile_url,
+            "last_updated": datetime.utcnow().isoformat(),
+        },
+    }
+
+    return {
+        "type": "FeatureCollection",
+        "features": [feature],
+        "pixel_summary": pixel_summary,
+    }
 # ==========================================================
 # PEST DETECTION (FIXED)
 # ==========================================================
