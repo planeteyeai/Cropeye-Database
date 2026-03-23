@@ -107,10 +107,9 @@ def initial_load():
 def build_plot_data(row):
 
     geojson = row.get("geojson")
-    django_id = row.get("django_plot_id")
 
-    # ❌ skip invalid plots silently
-    if not geojson or not django_id:
+    if not geojson:
+        print("❌ GeoJSON missing")
         return None
 
     geometry = None
@@ -128,25 +127,31 @@ def build_plot_data(row):
             if features:
                 geometry = features[0].get("geometry")
 
-    # ❌ strict validation
     if not geometry:
+        print("❌ Geometry extraction failed")
         return None
 
     if not geometry.get("coordinates"):
+        print("❌ Coordinates missing")
         return None
 
-    if len(geometry.get("coordinates")) == 0:
+    # ✅ django_id fix
+    django_id = row.get("django_plot_id")
+
+    if not django_id:
+        print("❌ Missing django_plot_id")
         return None
 
+    # ✅ RETURN FORMAT MATCHES GEE FILE
     return {
-        "type": "FeatureCollection",
-        "features": [{
-            "type": "Feature",
-            "geometry": geometry,
-            "properties": {
-                "django_id": django_id  # ✅ FIXED
-            }
-        }]
+        "geometry": geometry,
+        "geom_type": geometry.get("type"),
+        "original_coords": geometry.get("coordinates"),
+        "properties": {
+            "django_id": django_id,
+            "plot_name": row.get("plot_name"),
+            "crop_type": row.get("crop_type"),
+        }
     }
 
 # =====================================================
