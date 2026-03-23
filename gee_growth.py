@@ -255,229 +255,33 @@ def run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date):
 
     try:
-        # ===============================
-        # GEOMETRY SAFE LOAD
-        # ===============================
         geometry = plot_data.get("geometry")
         geom_type = plot_data.get("geom_type")
         original_coords = plot_data.get("original_coords")
 
-        if geometry is None:
+        if not geometry or not geom_type or not original_coords:
+            print("⚠ Missing geometry", flush=True)
             return None
 
-        geometry = ee.Geometry(geometry)
+        if not isinstance(geometry, ee.Geometry):
+            geometry = ee.Geometry(geometry)
 
         analysis_start = ee.Date(start_date)
         analysis_end = ee.Date(end_date)
 
         results = []
 
-        sensor = None  # FIX: ensure sensor always defined
-
-        # ===============================
-        # SENTINEL-2 NDMI
-        # ===============================
-        s2_collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(geometry)
-            .filterDate(analysis_start, analysis_end)
-            .filter(ee.Filter.notNull(["system:time_start"]))
-            .map(lambda img:
-                img.normalizedDifference(['B8A', 'B11'])
-                   .rename('NDMI')
-                   .clip(geometry)
-                   .copyProperties(img, ["system:time_start"])
-            )
-            .sort("system:time_start", False)
-        )
-
-        s2_count = int(s2_collection.size().getInfo() or 0)
-        latest_s2_date = None
-        latest_s2_img = None
-
-        if s2_count > 0:
-
-            latest_s2_img = ee.Image(s2_collection.first())
-            latest_s2_date = ee.Date(
-                latest_s2_img.get("system:time_start")
-            )
-
-            sensor = "s2"
-
-            ndmi_image = s2_collection.median().clip(geometry)
-
-            feature = build_feature(
-                plot_name,
-                sensor,
-                latest_s2_date.format("YYYY-MM-dd").getInfo()
-            )
-
-            results.append(feature)
-
-        # ===============================
-        # SENTINEL-1 VH
-        # ===============================
-        s1_collection = (
-            ee.ImageCollection("COPERNICUS/S1_GRD")
-            .filterBounds(geometry)
-            .filterDate(analysis_start, analysis_end)
-            .filter(ee.Filter.eq("instrumentMode", "IW"))
-            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
-            .filter(ee.Filter.notNull(["system:time_start"]))
-            .select(["VH"])
-            .map(lambda img: img.clip(geometry)
-                 .copyProperties(img, ["system:time_start"]))
-            .sort("system:time_start", False)
-        )
-
-        s1_count = int(s1_collection.size().getInfo() or 0)
-        latest_s1_date = None
-        latest_image = None
-        previous_image = None
-
-        if s1_count >= 2:
-
-            image_list = s1_collection.toList(2)
-            latest_image = ee.Image(image_list.get(0))
-            previous_image = ee.Image(image_list.get(1))
-
-            latest_s1_date = ee.Date(
-                latest_image.get("system:time_start")
-            )
-
-            sensor = "s1"
-
-            delta_vh = latest_image.subtract(previous_image)
-
-            feature = build_feature(
-                plot_name,
-                sensor,
-                latest_s1_date.format("YYYY-MM-dd").getInfo()
-            )
-
-            results.append(feature)
-
-        # ===============================
-        # SENSOR DECISION (UNCHANGED LOGIC)
-        # ===============================
-        use_s2 = False
-        use_s1 = False
-
-        if latest_s2_date and latest_s1_date:
-            use_s2 = latest_s2_date.millis().getInfo() >= latest_s1_date.millis().getInfo()
-            use_s1 = not use_s2
-        elif latest_s2_date:
-            use_s2 = True
-        elif latest_s1_date:
-            use_s1 = True
-        else:
-            return None
-
-        # ===============================
-        # CLASSIFICATION (UNCHANGED)
-        # ===============================
-        if use_s2:
-
-            sensor = "s2"
-
-            ndmi_image = (
-                s2_collection
-                .median()
-                .rename("NDMI")
-                .clip(geometry)
-            )
-
-            deficient = ndmi_image.lt(-0.21)
-            less = ndmi_image.gte(-0.21).And(ndmi_image.lt(-0.031))
-            adequat = ndmi_image.gte(-0.031).And(ndmi_image.lt(0.142))
-            excellent = ndmi_image.gte(0.14).And(ndmi_image.lt(0.22))
-            excess = ndmi_image.gte(0.22)
-
-            latest_date_str = (
-                latest_s2_date.format("YYYY-MM-dd").getInfo()
-                if latest_s2_date else None
-            )
-
-            previous_date_str = None
-            image_count = s2_count
-
-        else:
-
-            sensor = "s1"
-
-            delta_vh = (
-                latest_image
-                .subtract(previous_image)
-                .rename("deltaVH")
-                .clip(geometry)
-            )
-
-            deficient = delta_vh.lt(-3.13)
-            less = delta_vh.gte(-3.13).And(delta_vh.lte(-0.1))
-            adequat = delta_vh.gt(-0.1).And(delta_vh.lt(4))
-            excellent = delta_vh.gte(4).And(delta_vh.lt(6))
-            excess = delta_vh.gte(6)
-
-            latest_date_str = (
-                latest_s1_date.format("YYYY-MM-dd").getInfo()
-                if latest_s1_date else None
-            )
-
-            previous_date_str = (
-                ee.Date(previous_image.get("system:time_start"))
-                .format("YYYY-MM-dd")
-                .getInfo()
-                if previous_image else None
-            )
-
-            image_count = s1_count
-
-        # ===============================
-        # SAFE SINGLE-BAND CLASSIFICATION
-        # ===============================
-        combined_class = (
-            ee.Image.constant(0)
-            .where(deficient, 1)
-            .where(less, 2)
-            .where(adequat, 3)
-            .where(excellent, 4)
-            .where(excess, 5)
-            .rename("water_class")
-            .clip(geometry)
-        )
-
-        smoothed_class = combined_class.focal_mean(radius=7, units="meters")
-
-        vis_params = {
-            "min": 0,
-            "max": 5,
-            "palette": [
-                "#EBFF34",
-                "#CC8213AF",
-                "#1348E88E",
-                "#2E199ABD",
-                "#0602178F",
-            ],
-        }
-
-        smoothed_vis = smoothed_class.visualize(**vis_params).clip(geometry)
-        tile_url = smoothed_vis.getMapId()["tile_fetcher"].url_format
-
-        # ===============================
-        # PIXEL SUMMARY
-        # ===============================
-        count_image = ee.Image.constant(1)
-
+        # =========================================================
+        # COMMON HELPERS
+        # =========================================================
         def get_pixel_count(mask):
-            value = count_image.updateMask(mask).reduceRegion(
-                ee.Reducer.count(),
-                geometry,
-                10,
-                bestEffort=True
-            ).get("constant")
-            return int(value.getInfo() or 0)
-
-        total_pixel_count = get_pixel_count(count_image)
+            try:
+                value = ee.Image.constant(1).updateMask(mask).reduceRegion(
+                    ee.Reducer.count(), geometry, 10, bestEffort=True
+                ).get("constant")
+                return int(value.getInfo() or 0)
+            except:
+                return 0
 
         def mask_to_coords(mask):
             try:
@@ -487,80 +291,186 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
                     region=geometry,
                     scale=10,
                     geometries=True,
-                    tileScale=4
+                    tileScale=4,
+                    numPixels=10000
                 ).getInfo()
 
                 coords = [f["geometry"]["coordinates"] for f in sampled.get("features", [])]
                 return [list(x) for x in {tuple(c) for c in coords}]
-            except Exception:
+            except:
                 return []
 
-        deficient_count = get_pixel_count(combined_class.eq(1))
-        less_count = get_pixel_count(combined_class.eq(2))
-        adequat_count = get_pixel_count(combined_class.eq(3))
-        excellent_count = get_pixel_count(combined_class.eq(4))
-        excess_count = get_pixel_count(combined_class.eq(5))
+        # =========================================================
+        # SENTINEL-2 (NDWI)
+        # =========================================================
+        s2_collection = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterBounds(geometry)
+            .filterDate(analysis_start, analysis_end)
+            .map(lambda img:
+                img.normalizedDifference(['B3', 'B8'])
+                   .rename('NDWI')
+                   .clip(geometry)
+                   .copyProperties(img, ["system:time_start"])
+            )
+            .sort("system:time_start", False)
+        )
 
-        deficient_coords = mask_to_coords(combined_class.eq(1))
-        less_coords = mask_to_coords(combined_class.eq(2))
-        adequat_coords = mask_to_coords(combined_class.eq(3))
-        excellent_coords = mask_to_coords(combined_class.eq(4))
-        excess_coords = mask_to_coords(combined_class.eq(5))
+        if s2_collection.size().getInfo() > 0:
 
-        # ===============================
-        # RESPONSE (UNCHANGED)
-        # ===============================
-        feature = {
-            "type": "Feature",
-            "geometry": {
-                "type": geom_type,
-                "coordinates": original_coords,
-            },
-            "properties": {
-                "plot_name": plot_name,
-                "tile_url": tile_url,
-                "sensor_used": sensor,
-                "image_count_in_range": image_count,
-                "analysis_dates": {
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "latest_image_date": latest_date_str,
-                    "previous_image_date": previous_date_str,
+            image = ee.Image(s2_collection.first())
+            latest_date = ee.Date(image.get("system:time_start")).format("YYYY-MM-dd").getInfo()
+
+            ndwi = s2_collection.median().clip(geometry)
+
+            deficient = ndwi.lt(-0.21)
+            less = ndwi.gte(-0.21).And(ndwi.lt(-0.031))
+            adequat = ndwi.gte(-0.031).And(ndwi.lt(0.142))
+            excellent = ndwi.gte(0.14).And(ndwi.lt(0.22))
+            excess = ndwi.gte(0.22)
+
+            combined = (
+                ee.Image.constant(0)
+                .where(deficient, 1)
+                .where(less, 2)
+                .where(adequat, 3)
+                .where(excellent, 4)
+                .where(excess, 5)
+                .clip(geometry)
+            )
+
+            tile_url = combined.focal_mean(radius=7, units="meters").visualize(
+                min=0, max=5,
+                palette=["#EBFF34", "#CC8213AF", "#1348E88E", "#2E199ABD", "#0602178F"]
+            ).getMapId()["tile_fetcher"].url_format
+
+            total = get_pixel_count(ee.Image.constant(1))
+
+            result = {
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "geometry": {"type": geom_type, "coordinates": original_coords},
+                    "properties": {
+                        "plot_name": plot_name,
+                        "tile_url": tile_url,
+                        "sensor_used": "s2",
+                        "image_count_in_range": s2_collection.size().getInfo(),
+                        "analysis_dates": {
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "latest_image_date": latest_date,
+                            "previous_image_date": None,
+                        },
+                        "last_updated": datetime.utcnow().isoformat(),
+                    },
+                }],
+                "pixel_summary": {
+                    "total_pixel_count": total,
+
+                    "deficient_pixel_count": get_pixel_count(combined.eq(1)),
+                    "deficient_pixel_percentage": 0,
+                    "deficient_pixel_coordinates": mask_to_coords(combined.eq(1)),
+
+                    "less_pixel_count": get_pixel_count(combined.eq(2)),
+                    "less_pixel_percentage": 0,
+                    "less_pixel_coordinates": mask_to_coords(combined.eq(2)),
+
+                    "adequat_pixel_count": get_pixel_count(combined.eq(3)),
+                    "adequat_pixel_percentage": 0,
+                    "adequat_pixel_coordinates": mask_to_coords(combined.eq(3)),
+
+                    "excellent_pixel_count": get_pixel_count(combined.eq(4)),
+                    "excellent_pixel_percentage": 0,
+                    "excellent_pixel_coordinates": mask_to_coords(combined.eq(4)),
+
+                    "excess_pixel_count": get_pixel_count(combined.eq(5)),
+                    "excess_pixel_percentage": 0,
+                    "excess_pixel_coordinates": mask_to_coords(combined.eq(5)),
+
+                    "analysis_start_date": start_date,
+                    "analysis_end_date": end_date,
                 },
-                "last_updated": datetime.utcnow().isoformat(),
-            },
-        }
+            }
 
-        return {
-            "type": "FeatureCollection",
-            "features": [feature],
-            "pixel_summary": {
-                "total_pixel_count": total_pixel_count,
+            results.append(result)
 
-                "deficient_pixel_count": deficient_count,
-                "deficient_pixel_percentage": (deficient_count / total_pixel_count) * 100 if total_pixel_count else 0,
-                "deficient_pixel_coordinates": deficient_coords,
+        # =========================================================
+        # SENTINEL-1 (VH)
+        # =========================================================
+        s1_collection = (
+            ee.ImageCollection("COPERNICUS/S1_GRD")
+            .filterBounds(geometry)
+            .filterDate(analysis_start, analysis_end)
+            .filter(ee.Filter.eq("instrumentMode", "IW"))
+            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+            .select("VH")
+            .sort("system:time_start", False)
+        )
 
-                "less_pixel_count": less_count,
-                "less_pixel_percentage": (less_count / total_pixel_count) * 100 if total_pixel_count else 0,
-                "less_pixel_coordinates": less_coords,
+        if s1_collection.size().getInfo() >= 2:
 
-                "adequat_pixel_count": adequat_count,
-                "adequat_pixel_percentage": (adequat_count / total_pixel_count) * 100 if total_pixel_count else 0,
-                "adequat_pixel_coordinates": adequat_coords,
+            images = s1_collection.toList(2)
+            latest = ee.Image(images.get(0))
+            prev = ee.Image(images.get(1))
 
-                "excellent_pixel_count": excellent_count,
-                "excellent_pixel_percentage": (excellent_count / total_pixel_count) * 100 if total_pixel_count else 0,
-                "excellent_pixel_coordinates": excellent_coords,
+            latest_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
+            prev_date = ee.Date(prev.get("system:time_start")).format("YYYY-MM-dd").getInfo()
 
-                "excess_pixel_count": excess_count,
-                "excess_pixel_percentage": (excess_count / total_pixel_count) * 100 if total_pixel_count else 0,
-                "excess_pixel_coordinates": excess_coords,
+            delta = latest.subtract(prev).clip(geometry)
 
-                "analysis_start_date": start_date,
-                "analysis_end_date": end_date,
-            },
-        }
+            deficient = delta.lt(-3.13)
+            less = delta.gte(-3.13).And(delta.lte(-0.1))
+            adequat = delta.gt(-0.1).And(delta.lt(4))
+            excellent = delta.gte(4).And(delta.lt(6))
+            excess = delta.gte(6)
+
+            combined = (
+                ee.Image.constant(0)
+                .where(deficient, 1)
+                .where(less, 2)
+                .where(adequat, 3)
+                .where(excellent, 4)
+                .where(excess, 5)
+                .clip(geometry)
+            )
+
+            tile_url = combined.focal_mean(radius=7, units="meters").visualize(
+                min=0, max=5,
+                palette=["#EBFF34", "#CC8213AF", "#1348E88E", "#2E199ABD", "#0602178F"]
+            ).getMapId()["tile_fetcher"].url_format
+
+            total = get_pixel_count(ee.Image.constant(1))
+
+            result = {
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "geometry": {"type": geom_type, "coordinates": original_coords},
+                    "properties": {
+                        "plot_name": plot_name,
+                        "tile_url": tile_url,
+                        "sensor_used": "s1",
+                        "image_count_in_range": s1_collection.size().getInfo(),
+                        "analysis_dates": {
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "latest_image_date": latest_date,
+                            "previous_image_date": prev_date,
+                        },
+                        "last_updated": datetime.utcnow().isoformat(),
+                    },
+                }],
+                "pixel_summary": {
+                    "total_pixel_count": total,
+                    "analysis_start_date": start_date,
+                    "analysis_end_date": end_date,
+                },
+            }
+
+            results.append(result)
+
+        return results if results else None
 
     except Exception as e:
         print("❌ Water uptake failed:", e, flush=True)
