@@ -21,18 +21,10 @@ from db import get_connection
 from Admin import run_monthly_backfill_for_plot
 from shared_services import run_plot_sync
 
-# =====================================================
-# FASTAPI APP
-# =====================================================
-
 app = FastAPI()
 
-# =====================================================
-# CONFIG
-# =====================================================
-
-MAX_PARALLEL_ANALYSIS = 3   # 🔥 safer
-GLOBAL_LIMIT = 4            # 🔥 prevent Railway crash
+MAX_PARALLEL_ANALYSIS = 3
+GLOBAL_LIMIT = 4
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
@@ -40,7 +32,7 @@ known_plot_ids = set()
 priority_queue = Queue()
 
 # =====================================================
-# HEALTH CHECK (CRITICAL FOR RAILWAY)
+# HEALTH
 # =====================================================
 
 @app.get("/")
@@ -89,7 +81,7 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# INITIAL LOAD (ONLY ONCE)
+# INITIAL LOAD
 # =====================================================
 
 def initial_load():
@@ -107,6 +99,50 @@ def initial_load():
         known_plot_ids.add(r["id"])
 
     print(f"✅ Loaded {len(known_plot_ids)} plots", flush=True)
+
+# =====================================================
+# GEOJSON FIXER 🔥
+# =====================================================
+
+def build_plot_data(row):
+
+    geojson = row.get("geojson")
+
+    if not geojson:
+        return None
+
+    geometry = None
+
+    # Case 1: direct geometry
+    if geojson.get("type") in ["Polygon", "MultiPolygon"]:
+        geometry = geojson
+
+    # Case 2: Feature
+    elif geojson.get("type") == "Feature":
+        geometry = geojson.get("geometry")
+
+    # Case 3: FeatureCollection
+    elif geojson.get("type") == "FeatureCollection":
+        features = geojson.get("features", [])
+        if features:
+            geometry = features[0].get("geometry")
+
+    if not geometry:
+        return None
+
+    # inject django_id safely
+    properties = {
+        "django_id": row.get("id")
+    }
+
+    return {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "geometry": geometry,
+            "properties": properties
+        }]
+    }
 
 # =====================================================
 # STORE RESULTS
@@ -203,20 +239,17 @@ def process_plot(plot_name):
             fetchone=True
         )
 
-        if not row or not row["geojson"]:
-            print(f"⚠ Skipping {plot_name}", flush=True)
+        if not row:
+            print(f"❌ Plot not found {plot_name}", flush=True)
+            return
+
+        plot_data = build_plot_data(row)
+
+        if not plot_data:
+            print(f"❌ Invalid geometry for {plot_name}", flush=True)
             return
 
         plot_id = row["id"]
-
-        plot_data = {
-            "type": "FeatureCollection",
-            "features": [{
-                "type": "Feature",
-                "geometry": row["geojson"],
-                "properties": {}
-            }]
-        }
 
         run_today_analysis_for_plot(plot_name, plot_data, plot_id)
 
@@ -273,7 +306,7 @@ def worker_loop():
             time.sleep(5)
 
 # =====================================================
-# DAILY JOB (SAFE)
+# DAILY JOB
 # =====================================================
 
 def daily_scheduler():
@@ -288,20 +321,8 @@ def daily_scheduler():
                 fetchall=True
             ) or []
 
-            batch_size = 10  # 🔥 safer
-
-            for i in range(0, len(rows), batch_size):
-
-                batch = rows[i:i + batch_size]
-
-                for r in batch:
-                    threading.Thread(
-                        target=process_plot,
-                        args=(r["plot_name"],),
-                        daemon=True
-                    ).start()
-
-                time.sleep(5)
+            for r in rows:
+                priority_queue.put(r["plot_name"])
 
         except Exception as e:
             print("🔥 Daily job error:", e, flush=True)
@@ -314,7 +335,7 @@ def daily_scheduler():
 
 def start_background_jobs():
 
-    time.sleep(5)  # allow server startup
+    time.sleep(5)
 
     initial_load()
 
