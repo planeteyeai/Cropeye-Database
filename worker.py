@@ -16,6 +16,7 @@ from gee_growth import (
     run_soil_moisture_analysis_by_plot,
     run_pest_detection_analysis_by_plot
 )
+
 from db import get_connection
 from Admin import run_monthly_backfill_for_plot
 from shared_services import run_plot_sync
@@ -100,51 +101,54 @@ def initial_load():
     print(f"✅ Loaded {len(known_plot_ids)} plots", flush=True)
 
 # =====================================================
-# GEOJSON FIX (FINAL)
+# 🔥 STRICT GEOJSON BUILDER (FIXED)
 # =====================================================
 
 def build_plot_data(row):
 
     geojson = row.get("geojson")
-    django_id = row.get("django_plot_id")  # ✅ FIXED
 
     if not geojson:
-        print("⚠ Missing geojson")
-        return None
-
-    if not django_id:
-        print("⚠ Missing django_plot_id")
+        print("❌ GeoJSON missing")
         return None
 
     geometry = None
 
-    if geojson.get("type") in ["Polygon", "MultiPolygon"]:
+    # direct geometry
+    if isinstance(geojson, dict) and geojson.get("type") in ["Polygon", "MultiPolygon"]:
         geometry = geojson
 
+    # Feature
     elif geojson.get("type") == "Feature":
         geometry = geojson.get("geometry")
 
+    # FeatureCollection
     elif geojson.get("type") == "FeatureCollection":
         features = geojson.get("features", [])
         if features:
             geometry = features[0].get("geometry")
 
-    # ✅ STRICT VALIDATION
-    if not geometry or "coordinates" not in geometry:
-        print("⚠ Invalid geometry structure")
+    # 🔥 VALIDATION
+    if not geometry:
+        print("❌ Geometry extraction failed")
+        return None
+
+    if "coordinates" not in geometry:
+        print("❌ Geometry missing coordinates")
         return None
 
     if not geometry["coordinates"]:
-        print("⚠ Empty coordinates")
+        print("❌ Empty coordinates")
         return None
 
+    # 🔥 FINAL SAFE STRUCTURE
     return {
         "type": "FeatureCollection",
         "features": [{
             "type": "Feature",
             "geometry": geometry,
             "properties": {
-                "django_id": django_id  # ✅ FIXED
+                "plot_id": str(row["id"])  # ✅ FIXED
             }
         }]
     }
@@ -199,65 +203,73 @@ def store_results(results, analysis_type, plot_id):
 
 def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 
-    with semaphore:
+    try:
+        with semaphore:
 
-        print(f"🌅 Running TODAY analysis for {plot_name}", flush=True)
+            print(f"🌅 Running TODAY analysis for {plot_name}", flush=True)
 
-        end_date = date.today()
-        start_date = (end_date - timedelta(days=30)).isoformat()
-        end_date = end_date.isoformat()
+            end_date = date.today()
+            start_date = (end_date - timedelta(days=30)).isoformat()
+            end_date = end_date.isoformat()
 
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
+            with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
 
-            executor.submit(lambda: store_results(
-                run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "growth", plot_id))
+                executor.submit(lambda: store_results(
+                    run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                    "growth", plot_id))
 
-            executor.submit(lambda: store_results(
-                run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "water", plot_id))
+                executor.submit(lambda: store_results(
+                    run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                    "water", plot_id))
 
-            executor.submit(lambda: store_results(
-                run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "soil", plot_id))
+                executor.submit(lambda: store_results(
+                    run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                    "soil", plot_id))
 
-            executor.submit(lambda: store_results(
-                run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "pest", plot_id))
+                executor.submit(lambda: store_results(
+                    run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                    "pest", plot_id))
+
+    except Exception as e:
+        print(f"🔥 Analysis failed for {plot_name}: {e}", flush=True)
 
 # =====================================================
-# PROCESS PLOT (FINAL SAFE)
+# PROCESS PLOT (FIXED)
 # =====================================================
 
 def process_plot(plot_name):
 
-    print(f"➡ Processing {plot_name}", flush=True)
+    try:
+        print(f"➡ Processing {plot_name}", flush=True)
 
-    row = run_query(
-        "SELECT id, geojson, django_plot_id FROM plots WHERE plot_name=%s",
-        (plot_name,),
-        fetchone=True
-    )
+        row = run_query(
+            "SELECT id, geojson FROM plots WHERE plot_name=%s",
+            (plot_name,),
+            fetchone=True
+        )
 
-    if not row:
-        print(f"❌ Plot not found {plot_name}", flush=True)
-        return
+        if not row:
+            print(f"❌ Plot not found {plot_name}", flush=True)
+            return
 
-    plot_data = build_plot_data(row)
+        plot_data = build_plot_data(row)
 
-    if not plot_data:
-        print(f"❌ Skipping {plot_name} due to invalid data", flush=True)
-        return
+        if not plot_data:
+            print(f"❌ Invalid geometry for {plot_name}", flush=True)
+            return
 
-    plot_id = row["id"]
+        plot_id = row["id"]
 
-    run_today_analysis_for_plot(plot_name, plot_data, plot_id)
+        run_today_analysis_for_plot(plot_name, plot_data, plot_id)
 
-    threading.Thread(
-        target=run_monthly_backfill_for_plot,
-        args=(plot_name, plot_data),
-        daemon=True
-    ).start()
+        threading.Thread(
+            target=run_monthly_backfill_for_plot,
+            args=(plot_name, plot_data),
+            daemon=True
+        ).start()
+
+    except Exception as e:
+        print(f"🔥 process_plot error: {e}", flush=True)
 
 # =====================================================
 # API TRIGGER
@@ -279,23 +291,11 @@ def trigger_new_plot(data: PlotRequest):
 def worker_loop():
 
     while True:
-
         try:
 
             if not priority_queue.empty():
                 process_plot(priority_queue.get())
                 continue
-
-            rows = run_query("SELECT id, plot_name FROM plots", fetchall=True) or []
-
-            current_ids = set(r["id"] for r in rows)
-            new_ids = current_ids - known_plot_ids
-
-            for r in rows:
-                if r["id"] in new_ids:
-                    process_plot(r["plot_name"])
-
-            known_plot_ids.update(new_ids)
 
             time.sleep(5)
 
