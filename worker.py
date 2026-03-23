@@ -101,48 +101,34 @@ def initial_load():
     print(f"✅ Loaded {len(known_plot_ids)} plots", flush=True)
 
 # =====================================================
-# GEOJSON BUILDER (STRICT + SAFE)
+# GEOJSON BUILDER
 # =====================================================
 
 def build_plot_data(row):
 
     geojson = row.get("geojson")
-
     if not geojson:
-        print("❌ GeoJSON missing")
         return None
 
     geometry = None
 
     if isinstance(geojson, dict):
-
         if geojson.get("type") in ["Polygon", "MultiPolygon"]:
             geometry = geojson
-
         elif geojson.get("type") == "Feature":
             geometry = geojson.get("geometry")
-
         elif geojson.get("type") == "FeatureCollection":
             features = geojson.get("features", [])
             if features:
                 geometry = features[0].get("geometry")
 
-    if not geometry:
-        print("❌ Geometry extraction failed")
+    if not geometry or not geometry.get("coordinates"):
         return None
 
-    if not geometry.get("coordinates"):
-        print("❌ Coordinates missing")
-        return None
-
-    # ✅ django_id fix
     django_id = row.get("django_plot_id")
-
     if not django_id:
-        print("❌ Missing django_plot_id")
         return None
 
-    # ✅ RETURN FORMAT MATCHES GEE FILE
     return {
         "geometry": geometry,
         "geom_type": geometry.get("type"),
@@ -155,7 +141,7 @@ def build_plot_data(row):
     }
 
 # =====================================================
-# STORE RESULTS
+# 🔥 FIXED STORE RESULTS
 # =====================================================
 
 def store_results(results, analysis_type, plot_id):
@@ -180,20 +166,26 @@ def store_results(results, analysis_type, plot_id):
                 or props.get("latest_image_date")
             )
 
-            if not analysis_date:
+            sensor = props.get("sensor_used") or props.get("sensor")
+
+            if not analysis_date or not sensor:
                 continue
+
+            # ✅ KEY FIX: differentiate S1 & S2
+            final_analysis_type = f"{analysis_type}_{sensor.lower().replace('-', '')}"
 
             run_query(
                 """
                 INSERT INTO analysis_results
-                (plot_id,analysis_type,analysis_date,response_json)
+                (plot_id, analysis_type, analysis_date, response_json)
                 VALUES (%s,%s,%s,%s)
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (plot_id, analysis_type, analysis_date)
+                DO UPDATE SET response_json = EXCLUDED.response_json
                 """,
-                (plot_id, analysis_type, analysis_date, Json(geojson))
+                (plot_id, final_analysis_type, analysis_date, Json(geojson))
             )
 
-            print(f"✅ Stored {analysis_type} for plot {plot_id}", flush=True)
+            print(f"✅ Stored {final_analysis_type} for plot {plot_id}", flush=True)
 
     except Exception as e:
         print("🔥 store_results error:", e, flush=True)
@@ -235,7 +227,7 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
         print(f"🔥 Analysis failed for {plot_name}: {e}", flush=True)
 
 # =====================================================
-# PROCESS PLOT (FIXED)
+# PROCESS PLOT
 # =====================================================
 
 def process_plot(plot_name):
@@ -255,9 +247,8 @@ def process_plot(plot_name):
             return
 
         plot_data = build_plot_data(row)
-
         if not plot_data:
-            return  # ✅ silently skip bad plots
+            return
 
         plot_id = row["id"]
 
@@ -273,29 +264,25 @@ def process_plot(plot_name):
         print(f"🔥 process_plot error: {e}", flush=True)
 
 # =====================================================
-# API TRIGGER
+# API
 # =====================================================
 
 @app.post("/trigger-new-plot")
 def trigger_new_plot(data: PlotRequest):
-
     priority_queue.put(data.plot_name)
-
     return {"status": "queued"}
 
 # =====================================================
-# WORKER LOOP
+# WORKER
 # =====================================================
 
 def worker_loop():
 
     while True:
         try:
-
             if not priority_queue.empty():
                 process_plot(priority_queue.get())
                 continue
-
             time.sleep(5)
 
         except Exception as e:
@@ -303,14 +290,14 @@ def worker_loop():
             time.sleep(5)
 
 # =====================================================
-# DAILY JOB (FIXED QUERY)
+# DAILY JOB
 # =====================================================
 
 def daily_scheduler():
 
     while True:
 
-        print("🕛 Running DAILY job for ALL plots", flush=True)
+        print("🕛 Running DAILY job", flush=True)
 
         rows = run_query(
             """
