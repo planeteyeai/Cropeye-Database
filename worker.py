@@ -91,7 +91,7 @@ def initial_load():
     try:
         run_plot_sync()
     except Exception as e:
-        print("❌ Sync failed:", e)
+        print("❌ Sync failed:", e, flush=True)
 
     rows = run_query("SELECT id FROM plots", fetchall=True) or []
 
@@ -141,7 +141,7 @@ def build_plot_data(row):
     }
 
 # =====================================================
-# 🔥 FIXED STORE RESULTS
+# STORE RESULTS
 # =====================================================
 
 def store_results(results, analysis_type, plot_id):
@@ -171,7 +171,6 @@ def store_results(results, analysis_type, plot_id):
             if not analysis_date or not sensor:
                 continue
 
-            # ✅ KEY FIX: differentiate S1 & S2
             final_analysis_type = f"{analysis_type}_{sensor.lower().replace('-', '')}"
 
             run_query(
@@ -233,6 +232,8 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 def process_plot(plot_name):
 
     try:
+        print(f"⚙️ Processing plot: {plot_name}", flush=True)
+
         row = run_query(
             """
             SELECT id, geojson, django_plot_id, plot_name, crop_type
@@ -244,10 +245,12 @@ def process_plot(plot_name):
         )
 
         if not row:
+            print("❌ Plot not found in DB", flush=True)
             return
 
         plot_data = build_plot_data(row)
         if not plot_data:
+            print("❌ Invalid plot data", flush=True)
             return
 
         plot_id = row["id"]
@@ -264,30 +267,21 @@ def process_plot(plot_name):
         print(f"🔥 process_plot error: {e}", flush=True)
 
 # =====================================================
-# API
+# API (FIXED)
 # =====================================================
 
 @app.post("/trigger-new-plot")
 def trigger_new_plot(data: PlotRequest):
-    priority_queue.put(data.plot_name)
-    return {"status": "queued"}
 
-# =====================================================
-# WORKER
-# =====================================================
+    print(f"🚀 Trigger received: {data.plot_name}", flush=True)
 
-def worker_loop():
+    threading.Thread(
+        target=process_plot,
+        args=(data.plot_name,),
+        daemon=True
+    ).start()
 
-    while True:
-        try:
-            if not priority_queue.empty():
-                process_plot(priority_queue.get())
-                continue
-            time.sleep(5)
-
-        except Exception as e:
-            print("🔥 Worker error:", e, flush=True)
-            time.sleep(5)
+    return {"status": "processing started"}
 
 # =====================================================
 # DAILY JOB
@@ -311,21 +305,18 @@ def daily_scheduler():
         ) or []
 
         for r in rows:
-            priority_queue.put(r["plot_name"])
+            process_plot(r["plot_name"])
 
         time.sleep(86400)
 
 # =====================================================
-# STARTUP
+# STARTUP (IMPORTANT FIX)
 # =====================================================
 
-def start_background_jobs():
-
-    time.sleep(5)
-
-    initial_load()
-
-    threading.Thread(target=worker_loop, daemon=True).start()
+@app.on_event("startup")
+def startup_event():
+    print("🚀 App started", flush=True)
+    threading.Thread(target=initial_load, daemon=True).start()
     threading.Thread(target=daily_scheduler, daemon=True).start()
 
 # =====================================================
@@ -335,7 +326,5 @@ def start_background_jobs():
 if __name__ == "__main__":
 
     print("🌐 Worker starting...", flush=True)
-
-    threading.Thread(target=start_background_jobs, daemon=True).start()
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
