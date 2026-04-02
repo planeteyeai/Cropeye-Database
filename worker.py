@@ -6,7 +6,7 @@ from queue import Queue
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
-
+from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor, Json
 
 from gee_growth import (
