@@ -3,7 +3,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
-
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
@@ -30,7 +29,14 @@ semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
 known_plot_ids = set()
 priority_queue = Queue()
-
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure this for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # =====================================================
 # HEALTH
 # =====================================================
