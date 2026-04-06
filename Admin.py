@@ -995,22 +995,22 @@ def fetch_analysis(plot_name, analysis_type, end_date):
 # API ROUTES
 # =====================================================
 
-@app.post("/analyze_growth1")
+@app.post("/analyze_growth")
 async def analyze_growth(plot_name: str = Query(...), end_date: str | None = Query(None)):
     return fetch_analysis(plot_name, "growth", end_date)
 
 
-@app.post("/wateruptake1")
+@app.post("/wateruptake")
 async def analyze_water(plot_name: str = Query(...), end_date: str | None = Query(None)):
     return fetch_analysis(plot_name, "water_uptake", end_date)
 
 
-@app.post("/soilmoisture1")
+@app.post("/soilmoisture")
 async def analyze_soil(plot_name: str = Query(...), end_date: str | None = Query(None)):
     return fetch_analysis(plot_name, "soil_moisture", end_date)
 
 
-@app.post("/pestdetection1")
+@app.post("/pestdetection")
 async def analyze_pest(plot_name: str = Query(...), end_date: str | None = Query(None)):
     return fetch_analysis(plot_name, "pest_detection", end_date)
 
@@ -1094,7 +1094,7 @@ async def get_analysis_timeline(plot_name: str = Query(...)):
         "timeline": timeline
     }
 
-
+'''
 @app.post("/analyze_Growth")
 async def analyze_growth(
     plot_name: str = Query(...),
@@ -1907,7 +1907,7 @@ async def pest_detection_combined(
  
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pest/Fungi detection failed: {str(e)}")
- 
+ '''
 
 
  
