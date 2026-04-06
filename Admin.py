@@ -1035,7 +1035,7 @@ async def get_analysis_timeline(plot_name: str = Query(...)):
 
     rows = run_query(
         """
-        SELECT analysis_type,analysis_date
+        SELECT analysis_type, analysis_date
         FROM analysis_results
         WHERE plot_id=%s
         ORDER BY analysis_date
@@ -1051,13 +1051,12 @@ async def get_analysis_timeline(plot_name: str = Query(...)):
 
     for r in rows:
 
-        analysis_type = r["analysis_type"]
+        analysis_type = (r["analysis_type"] or "").lower()
         analysis_date = str(r["analysis_date"])
 
         month = analysis_date[:7]
 
         if month not in monthly:
-
             monthly[month] = {
                 "growth_dates": [],
                 "water_uptake_dates": [],
@@ -1065,7 +1064,17 @@ async def get_analysis_timeline(plot_name: str = Query(...)):
                 "pest_detection_dates": []
             }
 
-        key = f"{analysis_type}_dates"
+        # ✅ Normalize analysis_type
+        if "growth" in analysis_type:
+            key = "growth_dates"
+        elif "water" in analysis_type:
+            key = "water_uptake_dates"
+        elif "soil" in analysis_type:
+            key = "soil_moisture_dates"
+        elif "pest" in analysis_type:
+            key = "pest_detection_dates"
+        else:
+            continue  # skip unknown types safely
 
         monthly[month][key].append(analysis_date)
 
