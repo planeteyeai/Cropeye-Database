@@ -277,26 +277,26 @@ def process_plot(plot_name):
 # =====================================================
 
 @app.post("/trigger-new-plot")
-def trigger_new_plot(data: PlotRequest):
+def trigger_new_plot():
 
-    print(f"🚀 Trigger received: {data.plot_name}", flush=True)
+    print("🚀 Trigger received (no input)", flush=True)
 
     def full_pipeline():
 
         try:
-            # ✅ STEP 1: Force sync from Django
+            # ✅ STEP 1: Sync latest plots
             print("🔄 Syncing plots from Django...", flush=True)
             run_plot_sync()
 
-            # ✅ STEP 2: Now process (plot will exist)
-            process_plot(data.plot_name)
+            # ✅ STEP 2: Detect & process new plots automatically
+            trigger_new_plot_backfill()
 
         except Exception as e:
             print(f"🔥 trigger pipeline error: {e}", flush=True)
 
     threading.Thread(target=full_pipeline, daemon=True).start()
 
-    return {"status": "sync + processing started"}
+    return {"status": "sync + auto-detect processing started"}
 
 # =====================================================
 # DAILY JOB
