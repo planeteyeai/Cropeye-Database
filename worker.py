@@ -237,8 +237,7 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 # =====================================================
 
 def process_plot(plot_name):
-    if plot_name in known_plot_ids:
-    print(f"⚠ Already processed recently: {plot_name}", flush=True)
+
     try:
         print(f"⚙️ Processing plot: {plot_name}", flush=True)
 
