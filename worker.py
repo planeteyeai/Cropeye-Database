@@ -2,14 +2,11 @@ from datetime import date, timedelta
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor, Json
-from typing import Optional
-from fastapi import Request
+
 from gee_growth import (
     run_growth_analysis_by_plot,
     run_water_uptake_analysis_by_plot,
@@ -19,25 +16,36 @@ from gee_growth import (
 
 from db import get_connection
 from Admin import run_monthly_backfill_for_plot
-from shared_services import run_plot_sync
+from shared_services import PlotSyncService
+
+# =====================================================
+# APP INIT
+# =====================================================
 
 app = FastAPI()
+
+plot_sync_service = PlotSyncService()
+plot_dict = {}
+
 priority_processing = False
+
 MAX_PARALLEL_ANALYSIS = 3
 GLOBAL_LIMIT = 4
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
-known_plot_ids = set()
-priority_queue = Queue()
-# Add CORS middleware
+# =====================================================
+# CORS
+# =====================================================
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # =====================================================
 # HEALTH
 # =====================================================
@@ -45,13 +53,6 @@ app.add_middleware(
 @app.get("/")
 def health():
     return {"status": "alive"}
-
-# =====================================================
-# REQUEST MODEL
-# =====================================================
-
-class PlotRequest(BaseModel):
-    plot_name: str
 
 # =====================================================
 # DB HELPER
@@ -88,64 +89,62 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# INITIAL LOAD
+# 🔥 REFRESH FROM DJANGO (NEW)
 # =====================================================
 
-def initial_load():
-
-    print("🔄 Initial sync...", flush=True)
-
+@app.post("/refresh-from-django")
+async def refresh_from_django():
     try:
-        run_plot_sync()
+        global plot_dict
+
+        print("🔄 FULL REFRESH from Django...", flush=True)
+
+        plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+
+        print(f"✅ Loaded {len(plot_dict)} plots from Django", flush=True)
+
+        return {
+            "status": "success",
+            "plot_count": len(plot_dict)
+        }
+
     except Exception as e:
-        print("❌ Sync failed:", e, flush=True)
-
-    rows = run_query("SELECT id FROM plots", fetchall=True) or []
-
-    for r in rows:
-        known_plot_ids.add(r["id"])
-
-    print(f"✅ Loaded {len(known_plot_ids)} plots", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =====================================================
 # GEOJSON BUILDER
 # =====================================================
 
-def build_plot_data(row):
+def build_plot_data_from_dict(plot_name):
 
-    geojson = row.get("geojson")
-    if not geojson:
+    global plot_dict
+
+    if plot_name not in plot_dict:
+        print("❌ Plot not in refreshed dict", flush=True)
         return None
 
-    geometry = None
+    data = plot_dict[plot_name]
 
-    if isinstance(geojson, dict):
-        if geojson.get("type") in ["Polygon", "MultiPolygon"]:
-            geometry = geojson
-        elif geojson.get("type") == "Feature":
-            geometry = geojson.get("geometry")
-        elif geojson.get("type") == "FeatureCollection":
-            features = geojson.get("features", [])
-            if features:
-                geometry = features[0].get("geometry")
+    try:
+        geom = data.get("geometry")
+        geom_geojson = geom.getInfo()
 
-    if not geometry or not geometry.get("coordinates"):
-        return None
+        props = data.get("properties", {})
 
-    django_id = row.get("django_plot_id")
-    if not django_id:
-        return None
-
-    return {
-        "geometry": geometry,
-        "geom_type": geometry.get("type"),
-        "original_coords": geometry.get("coordinates"),
-        "properties": {
-            "django_id": django_id,
-            "plot_name": row.get("plot_name"),
-            "crop_type": row.get("crop_type"),
+        return {
+            "geometry": geom_geojson,
+            "geom_type": geom_geojson.get("type"),
+            "original_coords": geom_geojson.get("coordinates"),
+            "properties": {
+                "django_id": props.get("django_id"),
+                "plot_name": plot_name,
+                "crop_type": props.get("crop_type_name"),
+            }
         }
-    }
+
+    except Exception as e:
+        print("🔥 build_plot_data error:", e, flush=True)
+        return None
 
 # =====================================================
 # STORE RESULTS
@@ -153,246 +152,157 @@ def build_plot_data(row):
 
 def store_results(results, analysis_type, plot_id):
 
-    try:
-        if not results:
-            return
+    if not results:
+        return
 
-        if isinstance(results, dict):
-            results = [results]
+    if isinstance(results, dict):
+        results = [results]
 
-        for geojson in results:
+    for geojson in results:
 
-            features = geojson.get("features")
-            if not features:
-                continue
+        features = geojson.get("features")
+        if not features:
+            continue
 
-            props = features[0].get("properties", {})
+        props = features[0].get("properties", {})
 
-            analysis_date = (
-                props.get("analysis_image_date")
-                or props.get("latest_image_date")
-            )
+        analysis_date = props.get("analysis_image_date") or props.get("latest_image_date")
+        sensor = props.get("sensor_used") or props.get("sensor")
 
-            sensor = props.get("sensor_used") or props.get("sensor")
+        if not analysis_date or not sensor:
+            continue
 
-            if not analysis_date or not sensor:
-                continue
+        final_type = f"{analysis_type}_{sensor.lower().replace('-', '')}"
 
-            final_analysis_type = f"{analysis_type}_{sensor.lower().replace('-', '')}"
+        run_query(
+            """
+            INSERT INTO analysis_results
+            (plot_id, analysis_type, analysis_date, response_json)
+            VALUES (%s,%s,%s,%s)
+            ON CONFLICT (plot_id, analysis_type, analysis_date)
+            DO UPDATE SET response_json = EXCLUDED.response_json
+            """,
+            (plot_id, final_type, analysis_date, Json(geojson))
+        )
 
-            run_query(
-                """
-                INSERT INTO analysis_results
-                (plot_id, analysis_type, analysis_date, response_json)
-                VALUES (%s,%s,%s,%s)
-                ON CONFLICT (plot_id, analysis_type, analysis_date)
-                DO UPDATE SET response_json = EXCLUDED.response_json
-                """,
-                (plot_id, final_analysis_type, analysis_date, Json(geojson))
-            )
-
-            print(f"✅ Stored {final_analysis_type} for plot {plot_id}", flush=True)
-
-    except Exception as e:
-        print("🔥 store_results error:", e, flush=True)
+        print(f"✅ Stored {final_type} for plot {plot_id}", flush=True)
 
 # =====================================================
 # ANALYSIS
 # =====================================================
 
-def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
+def run_today_analysis(plot_name, plot_data, plot_id):
 
-    try:
-        with semaphore:
+    with semaphore:
 
-            print(f"🌅 Running TODAY analysis for {plot_name}", flush=True)
+        print(f"🌅 TODAY analysis: {plot_name}", flush=True)
 
-            end_date = date.today()
-            start_date = (end_date - timedelta(days=30)).isoformat()
-            end_date = end_date.isoformat()
+        end_date = date.today()
+        start_date = (end_date - timedelta(days=30)).isoformat()
+        end_date = end_date.isoformat()
 
-            with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
 
-                executor.submit(lambda: store_results(
-                    run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                    "growth", plot_id))
+            executor.submit(lambda: store_results(
+                run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                "growth", plot_id))
 
-                executor.submit(lambda: store_results(
-                    run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                    "water", plot_id))
+            executor.submit(lambda: store_results(
+                run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                "water", plot_id))
 
-                executor.submit(lambda: store_results(
-                    run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                    "soil", plot_id))
+            executor.submit(lambda: store_results(
+                run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                "soil", plot_id))
 
-                executor.submit(lambda: store_results(
-                    run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                    "pest", plot_id))
-
-    except Exception as e:
-        print(f"🔥 Analysis failed for {plot_name}: {e}", flush=True)
+            executor.submit(lambda: store_results(
+                run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date),
+                "pest", plot_id))
 
 # =====================================================
-# PROCESS PLOT
+# PROCESS (PRIORITY)
 # =====================================================
 
 def process_plot(plot_name):
 
-    try:
-        print(f"⚙️ Processing plot: {plot_name}", flush=True)
+    print(f"⚙️ PRIORITY processing: {plot_name}", flush=True)
 
-        row = run_query(
-            """
-            SELECT id, geojson, django_plot_id, plot_name, crop_type
-            FROM plots
-            WHERE plot_name=%s
-            """,
-            (plot_name,),
-            fetchone=True
-        )
+    plot_data = build_plot_data_from_dict(plot_name)
 
-        if not row:
-            print("❌ Plot not found in DB", flush=True)
-            return
+    if not plot_data:
+        return
 
-        plot_data = build_plot_data(row)
-        if not plot_data:
-            print("❌ Invalid plot data", flush=True)
-            return
+    # Insert plot in DB first
+    run_query(
+        """
+        INSERT INTO plots (plot_name, geojson)
+        VALUES (%s, %s)
+        ON CONFLICT (plot_name)
+        DO UPDATE SET geojson = EXCLUDED.geojson
+        """,
+        (plot_name, Json(plot_data["geometry"]))
+    )
 
-        plot_id = row["id"]
+    row = run_query(
+        "SELECT id FROM plots WHERE plot_name=%s",
+        (plot_name,),
+        fetchone=True
+    )
 
-        run_today_analysis_for_plot(plot_name, plot_data, plot_id)
+    plot_id = row["id"]
 
-        threading.Thread(
-            target=run_monthly_backfill_for_plot,
-            args=(plot_name, plot_data),
-            daemon=True
-        ).start()
+    run_today_analysis(plot_name, plot_data, plot_id)
 
-    except Exception as e:
-        print(f"🔥 process_plot error: {e}", flush=True)
+    threading.Thread(
+        target=run_monthly_backfill_for_plot,
+        args=(plot_name, plot_data),
+        daemon=True
+    ).start()
 
-def sync_single_plot_from_django(plot_name):
-
-    print(f"🔄 Fetching single plot from Django: {plot_name}", flush=True)
-
-    from shared_services import PlotSyncService
-
-    service = PlotSyncService()
-
-    plots = service.get_plots_dict(force_refresh=True)
-
-    if plot_name not in plots:
-        print("❌ Plot not found in Django API", flush=True)
-        return None
-
-    data = plots[plot_name]
-
-    try:
-        geom = data.get("geometry")
-        geom_geojson = geom.getInfo()
-        area_ha = float(geom.area().divide(10000).getInfo())
-
-        props = data.get("properties", {})
-
-        django_id = props.get("django_id")
-        plantation_date = props.get("plantation_date")
-        crop_type = props.get("crop_type_name")
-
-        run_query(
-            """
-            INSERT INTO plots
-            (plot_name, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (plot_name)
-            DO UPDATE SET
-                geojson = EXCLUDED.geojson,
-                area_hectares = EXCLUDED.area_hectares,
-                django_plot_id = EXCLUDED.django_plot_id,
-                plantation_date = EXCLUDED.plantation_date,
-                crop_type = EXCLUDED.crop_type
-            """,
-            (
-                plot_name,
-                Json(geom_geojson),
-                area_ha,
-                str(django_id),
-                plantation_date,
-                crop_type
-            )
-        )
-
-        print(f"✅ Plot synced: {plot_name}", flush=True)
-
-        return True
-
-    except Exception as e:
-        print(f"🔥 Sync single plot failed: {e}", flush=True)
-        return None
-
+# =====================================================
+# 🚀 TRIGGER (FINAL FIXED)
+# =====================================================
 
 @app.post("/trigger-new-plot")
 async def trigger_new_plot(request: Request):
 
     global priority_processing
 
-    # ---------------------------
-    # READ BODY SAFELY
-    # ---------------------------
-    try:
-        body = await request.json()
-        plot_name = body.get("plot_name")
-    except Exception:
-        return {"status": "error", "message": "Invalid JSON"}
+    body = await request.json()
+    plot_name = body.get("plot_name")
 
     if not plot_name:
         return {"status": "error", "message": "plot_name required"}
 
-    print(f"🚀 PRIORITY trigger: {plot_name}", flush=True)
+    print(f"🚀 PRIORITY TRIGGER: {plot_name}", flush=True)
 
-    def full_pipeline():
+    def pipeline():
         global priority_processing
 
         try:
-            priority_processing = True   # 🚨 BLOCK OTHER JOBS
+            priority_processing = True
 
-            # ---------------------------
-            # FAST SYNC (ONLY THIS PLOT)
-            # ---------------------------
-            print(f"🔄 Syncing {plot_name}", flush=True)
+            # ✅ STEP 1: FORCE REFRESH
+            print("🔄 Refreshing Django...", flush=True)
+            global plot_dict
+            plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
 
-            synced = sync_single_plot_from_django(plot_name)
-
-            if not synced:
-                print("❌ Sync failed", flush=True)
-                priority_processing = False
-                return
-
-            print(f"✅ Sync done: {plot_name}", flush=True)
-
-            # ---------------------------
-            # PRIORITY PROCESS
-            # ---------------------------
+            # ✅ STEP 2: PROCESS IMMEDIATELY
             process_plot(plot_name)
 
-            print(f"🔥 PRIORITY DONE: {plot_name}", flush=True)
-
-        except Exception as e:
-            print(f"🔥 trigger error: {e}", flush=True)
+            print(f"🔥 DONE: {plot_name}", flush=True)
 
         finally:
-            priority_processing = False   # ✅ RESUME NORMAL
+            priority_processing = False
 
-    threading.Thread(target=full_pipeline, daemon=True).start()
+    threading.Thread(target=pipeline, daemon=True).start()
 
-    return {
-        "status": "priority processing started",
-        "plot_name": plot_name
-    }
+    return {"status": "started", "plot": plot_name}
+
 # =====================================================
 # DAILY JOB
 # =====================================================
+
 def daily_scheduler():
 
     global priority_processing
@@ -400,27 +310,17 @@ def daily_scheduler():
     while True:
 
         if priority_processing:
-            print("⏸ Skipping daily job (priority running)", flush=True)
+            print("⏸ Skipping daily (priority running)", flush=True)
             time.sleep(10)
             continue
 
-        print("🕛 Running DAILY job", flush=True)
+        print("🕛 DAILY RUN", flush=True)
 
-        rows = run_query(
-            """
-            SELECT plot_name 
-            FROM plots 
-            WHERE geojson IS NOT NULL
-            AND geojson::text != '{}'
-            AND django_plot_id IS NOT NULL
-            """,
-            fetchall=True
-        ) or []
+        rows = run_query("SELECT plot_name FROM plots", fetchall=True) or []
 
         for r in rows:
 
             if priority_processing:
-                print("⏸ Breaking daily loop (priority triggered)", flush=True)
                 break
 
             process_plot(r["plot_name"])
@@ -428,13 +328,12 @@ def daily_scheduler():
         time.sleep(86400)
 
 # =====================================================
-# STARTUP (IMPORTANT FIX)
+# STARTUP
 # =====================================================
 
 @app.on_event("startup")
-def startup_event():
-    print("🚀 App started", flush=True)
-    threading.Thread(target=initial_load, daemon=True).start()
+def startup():
+    print("🚀 Worker started", flush=True)
     threading.Thread(target=daily_scheduler, daemon=True).start()
 
 # =====================================================
@@ -442,7 +341,4 @@ def startup_event():
 # =====================================================
 
 if __name__ == "__main__":
-
-    print("🌐 Worker starting...", flush=True)
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
