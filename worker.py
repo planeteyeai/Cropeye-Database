@@ -8,7 +8,8 @@ from pydantic import BaseModel
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor, Json
-
+from typing import Optional
+from fastapi import Request
 from gee_growth import (
     run_growth_analysis_by_plot,
     run_water_uptake_analysis_by_plot,
@@ -332,23 +333,56 @@ def sync_single_plot_from_django(plot_name):
 
 
 @app.post("/trigger-new-plot")
-def trigger_new_plot(data: PlotRequest):
+async def trigger_new_plot(
+    request: Request,
+    data: Optional[PlotRequest] = None
+):
 
-    plot_name = data.plot_name
+    # -------------------------------------------------
+    # ✅ STEP 0: SAFELY EXTRACT plot_name
+    # (works with or without JSON body → NO 422 EVER)
+    # -------------------------------------------------
+    plot_name = None
+
+    try:
+        if data and data.plot_name:
+            plot_name = data.plot_name
+        else:
+            body = await request.json()
+            plot_name = body.get("plot_name")
+    except Exception:
+        plot_name = None
+
+    if not plot_name:
+        return {
+            "status": "error",
+            "message": "plot_name is required"
+        }
 
     print(f"🚀 Trigger received: {plot_name}", flush=True)
 
+    # -------------------------------------------------
+    # ✅ BACKGROUND PIPELINE (PRIORITY)
+    # -------------------------------------------------
     def full_pipeline():
 
         try:
             # ✅ STEP 1: Sync ONLY this plot (FAST)
+            print(f"🔄 Syncing plot: {plot_name}", flush=True)
+
             synced = sync_single_plot_from_django(plot_name)
 
             if not synced:
-                print("❌ Sync failed, aborting", flush=True)
+                print(f"❌ Sync failed for {plot_name}", flush=True)
                 return
 
-            # ✅ STEP 2: Process immediately (PRIORITY)
+            print(f"✅ Sync complete for {plot_name}", flush=True)
+
+            # -------------------------------------------------
+            # ✅ STEP 2: PROCESS IMMEDIATELY (TODAY)
+            # -------------------------------------------------
+            print(f"⚙️ Running priority analysis for {plot_name}", flush=True)
+
             process_plot(plot_name)
 
             print(f"🔥 PRIORITY processing done for {plot_name}", flush=True)
@@ -356,9 +390,16 @@ def trigger_new_plot(data: PlotRequest):
         except Exception as e:
             print(f"🔥 trigger pipeline error: {e}", flush=True)
 
+    # -------------------------------------------------
+    # ✅ RUN IN BACKGROUND THREAD
+    # -------------------------------------------------
     threading.Thread(target=full_pipeline, daemon=True).start()
 
-    return {"status": f"{plot_name} priority processing started"}
+    return {
+        "status": "started",
+        "plot_name": plot_name,
+        "message": "Priority sync + processing started"
+    }
 
 # =====================================================
 # DAILY JOB
