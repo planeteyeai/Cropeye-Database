@@ -272,31 +272,93 @@ def process_plot(plot_name):
     except Exception as e:
         print(f"🔥 process_plot error: {e}", flush=True)
 
-# =====================================================
-# API (FIXED)
-# =====================================================
+def sync_single_plot_from_django(plot_name):
+
+    print(f"🔄 Fetching single plot from Django: {plot_name}", flush=True)
+
+    from shared_services import PlotSyncService
+
+    service = PlotSyncService()
+
+    plots = service.get_plots_dict(force_refresh=True)
+
+    if plot_name not in plots:
+        print("❌ Plot not found in Django API", flush=True)
+        return None
+
+    data = plots[plot_name]
+
+    try:
+        geom = data.get("geometry")
+        geom_geojson = geom.getInfo()
+        area_ha = float(geom.area().divide(10000).getInfo())
+
+        props = data.get("properties", {})
+
+        django_id = props.get("django_id")
+        plantation_date = props.get("plantation_date")
+        crop_type = props.get("crop_type_name")
+
+        run_query(
+            """
+            INSERT INTO plots
+            (plot_name, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (plot_name)
+            DO UPDATE SET
+                geojson = EXCLUDED.geojson,
+                area_hectares = EXCLUDED.area_hectares,
+                django_plot_id = EXCLUDED.django_plot_id,
+                plantation_date = EXCLUDED.plantation_date,
+                crop_type = EXCLUDED.crop_type
+            """,
+            (
+                plot_name,
+                Json(geom_geojson),
+                area_ha,
+                str(django_id),
+                plantation_date,
+                crop_type
+            )
+        )
+
+        print(f"✅ Plot synced: {plot_name}", flush=True)
+
+        return True
+
+    except Exception as e:
+        print(f"🔥 Sync single plot failed: {e}", flush=True)
+        return None
+
 
 @app.post("/trigger-new-plot")
-def trigger_new_plot():
+def trigger_new_plot(data: PlotRequest):
 
-    print("🚀 Trigger received (no input)", flush=True)
+    plot_name = data.plot_name
+
+    print(f"🚀 Trigger received: {plot_name}", flush=True)
 
     def full_pipeline():
 
         try:
-            # ✅ STEP 1: Sync latest plots
-            print("🔄 Syncing plots from Django...", flush=True)
-            run_plot_sync()
+            # ✅ STEP 1: Sync ONLY this plot (FAST)
+            synced = sync_single_plot_from_django(plot_name)
 
-            # ✅ STEP 2: Detect & process new plots automatically
-            trigger_new_plot_backfill()
+            if not synced:
+                print("❌ Sync failed, aborting", flush=True)
+                return
+
+            # ✅ STEP 2: Process immediately (PRIORITY)
+            process_plot(plot_name)
+
+            print(f"🔥 PRIORITY processing done for {plot_name}", flush=True)
 
         except Exception as e:
             print(f"🔥 trigger pipeline error: {e}", flush=True)
 
     threading.Thread(target=full_pipeline, daemon=True).start()
 
-    return {"status": "sync + auto-detect processing started"}
+    return {"status": f"{plot_name} priority processing started"}
 
 # =====================================================
 # DAILY JOB
