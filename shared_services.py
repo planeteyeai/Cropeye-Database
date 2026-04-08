@@ -75,24 +75,38 @@ class PlotSyncService:
         self.cache_duration = 300  # 5 minutes cache
 
     def fetch_plots_from_api(self) -> Dict[str, Any]:
-        """Fetch all plots from Django API"""
-        try:
+    """Fetch ALL plots from Django API with pagination"""
+
+    all_results = []
+    url = f"{self.django_api_url}/api/plots/public/"
+
+    try:
+        while url:
             response = requests.get(
-                f"{self.django_api_url}/api/plots/public/",
+                url,
                 headers={'Content-Type': 'application/json'},
                 timeout=180
             )
 
-            if response.status_code == 200:
-                plots_data = response.json()
-                return self._process_plots_response(plots_data)
-            else:
-                print(f"Warning: Django API returned status {response.status_code}. Using empty plot list.")
-                return {}
+            if response.status_code != 200:
+                print(f"❌ Django API error: {response.status_code}", flush=True)
+                break
 
-        except requests.exceptions.RequestException as e:
-            print(f"Warning: Could not connect to Django API: {str(e)}. Using empty plot list.")
-            return {}
+            data = response.json()
+
+            results = data.get("results", [])
+            all_results.extend(results)
+
+            # 👉 IMPORTANT: go to next page
+            url = data.get("next")
+
+        print(f"✅ Total plots fetched: {len(all_results)}", flush=True)
+
+        return self._process_plots_response({"results": all_results})
+
+    except Exception as e:
+        print(f"❌ API fetch failed: {e}", flush=True)
+        return {}
 
     def _process_plots_response(self, plots_data: Dict[str, Any]) -> Dict[str, Dict]:
         """Process the Django API response and convert to plot dictionary format"""
