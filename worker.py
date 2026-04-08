@@ -281,13 +281,22 @@ def trigger_new_plot(data: PlotRequest):
 
     print(f"🚀 Trigger received: {data.plot_name}", flush=True)
 
-    threading.Thread(
-        target=process_plot,
-        args=(data.plot_name,),
-        daemon=True
-    ).start()
+    def full_pipeline():
 
-    return {"status": "processing started"}
+        try:
+            # ✅ STEP 1: Force sync from Django
+            print("🔄 Syncing plots from Django...", flush=True)
+            run_plot_sync()
+
+            # ✅ STEP 2: Now process (plot will exist)
+            process_plot(data.plot_name)
+
+        except Exception as e:
+            print(f"🔥 trigger pipeline error: {e}", flush=True)
+
+    threading.Thread(target=full_pipeline, daemon=True).start()
+
+    return {"status": "sync + processing started"}
 
 # =====================================================
 # DAILY JOB
