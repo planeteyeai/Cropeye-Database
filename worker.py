@@ -22,7 +22,7 @@ from Admin import run_monthly_backfill_for_plot
 from shared_services import run_plot_sync
 
 app = FastAPI()
-
+priority_processing = False
 MAX_PARALLEL_ANALYSIS = 3
 GLOBAL_LIMIT = 4
 
@@ -237,7 +237,8 @@ def run_today_analysis_for_plot(plot_name, plot_data, plot_id):
 # =====================================================
 
 def process_plot(plot_name):
-
+    if plot_name in known_plot_ids:
+    print(f"⚠ Already processed recently: {plot_name}", flush=True)
     try:
         print(f"⚙️ Processing plot: {plot_name}", flush=True)
 
@@ -335,67 +336,74 @@ def sync_single_plot_from_django(plot_name):
 @app.post("/trigger-new-plot")
 async def trigger_new_plot(request: Request):
 
-    # -------------------------------------------------
-    # ✅ STEP 1: READ RAW BODY (NO VALIDATION → NO 422)
-    # -------------------------------------------------
-    plot_name = None
+    global priority_processing
 
+    # ---------------------------
+    # READ BODY SAFELY
+    # ---------------------------
     try:
         body = await request.json()
         plot_name = body.get("plot_name")
     except Exception:
-        plot_name = None
+        return {"status": "error", "message": "Invalid JSON"}
 
-    # -------------------------------------------------
-    # ✅ STEP 2: VALIDATION (MANUAL)
-    # -------------------------------------------------
     if not plot_name:
-        return {
-            "status": "error",
-            "message": "plot_name is required"
-        }
+        return {"status": "error", "message": "plot_name required"}
 
-    print(f"🚀 Trigger received: {plot_name}", flush=True)
+    print(f"🚀 PRIORITY trigger: {plot_name}", flush=True)
 
-    # -------------------------------------------------
-    # ✅ STEP 3: BACKGROUND PIPELINE
-    # -------------------------------------------------
     def full_pipeline():
+        global priority_processing
 
         try:
-            print(f"🔄 Syncing plot: {plot_name}", flush=True)
+            priority_processing = True   # 🚨 BLOCK OTHER JOBS
+
+            # ---------------------------
+            # FAST SYNC (ONLY THIS PLOT)
+            # ---------------------------
+            print(f"🔄 Syncing {plot_name}", flush=True)
 
             synced = sync_single_plot_from_django(plot_name)
 
             if not synced:
-                print(f"❌ Sync failed for {plot_name}", flush=True)
+                print("❌ Sync failed", flush=True)
+                priority_processing = False
                 return
 
-            print(f"✅ Sync complete for {plot_name}", flush=True)
+            print(f"✅ Sync done: {plot_name}", flush=True)
 
-            print(f"⚙️ Running priority analysis for {plot_name}", flush=True)
-
+            # ---------------------------
+            # PRIORITY PROCESS
+            # ---------------------------
             process_plot(plot_name)
 
-            print(f"🔥 PRIORITY processing done for {plot_name}", flush=True)
+            print(f"🔥 PRIORITY DONE: {plot_name}", flush=True)
 
         except Exception as e:
-            print(f"🔥 trigger pipeline error: {e}", flush=True)
+            print(f"🔥 trigger error: {e}", flush=True)
+
+        finally:
+            priority_processing = False   # ✅ RESUME NORMAL
 
     threading.Thread(target=full_pipeline, daemon=True).start()
 
     return {
-        "status": "started",
+        "status": "priority processing started",
         "plot_name": plot_name
     }
-
 # =====================================================
 # DAILY JOB
 # =====================================================
-
 def daily_scheduler():
 
+    global priority_processing
+
     while True:
+
+        if priority_processing:
+            print("⏸ Skipping daily job (priority running)", flush=True)
+            time.sleep(10)
+            continue
 
         print("🕛 Running DAILY job", flush=True)
 
@@ -411,6 +419,11 @@ def daily_scheduler():
         ) or []
 
         for r in rows:
+
+            if priority_processing:
+                print("⏸ Breaking daily loop (priority triggered)", flush=True)
+                break
+
             process_plot(r["plot_name"])
 
         time.sleep(86400)
