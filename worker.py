@@ -2,7 +2,7 @@ from datetime import date, timedelta
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor, Json
@@ -19,7 +19,7 @@ from Admin import run_monthly_backfill_for_plot
 from shared_services import PlotSyncService
 
 # =====================================================
-# APP INIT
+# INIT
 # =====================================================
 
 app = FastAPI()
@@ -55,11 +55,10 @@ def health():
     return {"status": "alive"}
 
 # =====================================================
-# DB HELPER
+# DB
 # =====================================================
 
 def run_query(query, params=None, fetchone=False, fetchall=False):
-
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -89,73 +88,69 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# 🚀 FETCH ONLY LATEST PLOT
+# FETCH LATEST (WITH RETRY)
 # =====================================================
 
 def fetch_latest_plot():
 
+    import requests
+
     url = f"{plot_sync_service.django_api_url}/api/plots/public/?ordering=-id&page_size=1"
 
-    try:
-        import requests
+    for attempt in range(3):
+        try:
+            print(f"🌐 Fetch latest attempt {attempt+1}", flush=True)
 
-        response = requests.get(url, timeout=10)
+            r = requests.get(url, timeout=10)
 
-        if response.status_code != 200:
-            print("❌ Failed latest fetch", flush=True)
-            return None
+            if r.status_code != 200:
+                print(f"❌ Django API error: {r.status_code} | {r.text}", flush=True)
+                time.sleep(2)
+                continue
 
-        data = response.json()
-        results = data.get("results", [])
+            data = r.json()
+            results = data.get("results", [])
 
-        if not results:
-            return None
+            if not results:
+                print("⚠️ No plots in API response", flush=True)
+                return None
 
-        processed = plot_sync_service._process_plots_response({"results": results})
+            return plot_sync_service._process_plots_response({"results": results})
 
-        return processed
+        except Exception as e:
+            print(f"❌ Fetch error: {e}", flush=True)
+            time.sleep(2)
 
-    except Exception as e:
-        print(f"❌ Latest fetch error: {e}", flush=True)
-        return None
+    return None
 
 # =====================================================
-# GEOJSON BUILDER
+# BUILD GEOJSON
 # =====================================================
 
 def build_plot_data_from_dict(plot_name):
 
-    global plot_dict
-
     if plot_name not in plot_dict:
-        print(f"⚠️ Skipping missing plot: {plot_name}", flush=True)
         return None
 
-    data = plot_dict[plot_name]
-
     try:
-        geom = data.get("geometry")
-        geom_geojson = geom.getInfo()
-
+        data = plot_dict[plot_name]
+        geom_geojson = data["geometry"].getInfo()
         props = data.get("properties", {})
 
         return {
             "geometry": geom_geojson,
-            "geom_type": geom_geojson.get("type"),
-            "original_coords": geom_geojson.get("coordinates"),
             "properties": {
-                "django_id": props.get("django_id"),
                 "plot_name": plot_name,
                 "crop_type": props.get("crop_type_name"),
             }
         }
 
     except Exception as e:
-        print("🔥 build_plot_data error:", e, flush=True)
+        print("🔥 build error:", e, flush=True)
         return None
 
 # =====================================================
-# STORE RESULTS
+# STORE
 # =====================================================
 
 def store_results(results, analysis_type, plot_id):
@@ -172,7 +167,7 @@ def store_results(results, analysis_type, plot_id):
         if not features:
             continue
 
-        props = features[0].get("properties", {})
+        props = features[0]["properties"]
 
         analysis_date = props.get("analysis_image_date") or props.get("latest_image_date")
         sensor = props.get("sensor_used") or props.get("sensor")
@@ -193,8 +188,6 @@ def store_results(results, analysis_type, plot_id):
             (plot_id, final_type, analysis_date, Json(geojson))
         )
 
-        print(f"✅ Stored {final_type} for plot {plot_id}", flush=True)
-
 # =====================================================
 # ANALYSIS
 # =====================================================
@@ -203,29 +196,16 @@ def run_today_analysis(plot_name, plot_data, plot_id):
 
     with semaphore:
 
-        print(f"🌅 TODAY analysis: {plot_name}", flush=True)
+        end = date.today()
+        start = (end - timedelta(days=30)).isoformat()
+        end = end.isoformat()
 
-        end_date = date.today()
-        start_date = (end_date - timedelta(days=30)).isoformat()
-        end_date = end_date.isoformat()
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as ex:
 
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as executor:
-
-            executor.submit(lambda: store_results(
-                run_growth_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "growth", plot_id))
-
-            executor.submit(lambda: store_results(
-                run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "water", plot_id))
-
-            executor.submit(lambda: store_results(
-                run_soil_moisture_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "soil", plot_id))
-
-            executor.submit(lambda: store_results(
-                run_pest_detection_analysis_by_plot(plot_name, plot_data, start_date, end_date),
-                "pest", plot_id))
+            ex.submit(lambda: store_results(run_growth_analysis_by_plot(plot_name, plot_data, start, end), "growth", plot_id))
+            ex.submit(lambda: store_results(run_water_uptake_analysis_by_plot(plot_name, plot_data, start, end), "water", plot_id))
+            ex.submit(lambda: store_results(run_soil_moisture_analysis_by_plot(plot_name, plot_data, start, end), "soil", plot_id))
+            ex.submit(lambda: store_results(run_pest_detection_analysis_by_plot(plot_name, plot_data, start, end), "pest", plot_id))
 
 # =====================================================
 # PROCESS
@@ -233,10 +213,7 @@ def run_today_analysis(plot_name, plot_data, plot_id):
 
 def process_plot(plot_name):
 
-    print(f"⚙️ Processing: {plot_name}", flush=True)
-
     plot_data = build_plot_data_from_dict(plot_name)
-
     if not plot_data:
         return
 
@@ -250,11 +227,11 @@ def process_plot(plot_name):
         (plot_name, Json(plot_data["geometry"]))
     )
 
-    row = run_query(
-        "SELECT id FROM plots WHERE plot_name=%s",
-        (plot_name,),
-        fetchone=True
-    )
+    row = run_query("SELECT id FROM plots WHERE plot_name=%s", (plot_name,), fetchone=True)
+
+    if not row:
+        print("❌ Plot not inserted", flush=True)
+        return
 
     plot_id = row["id"]
 
@@ -267,52 +244,51 @@ def process_plot(plot_name):
     ).start()
 
 # =====================================================
-# 🚀 TRIGGER (LATEST ONLY)
+# TRIGGER (FIXED)
 # =====================================================
 
-@app.post("/trigger-latest-plot")
-async def trigger_latest_plot():
+def trigger_pipeline():
 
     global priority_processing, plot_dict
 
-    print("🚀 TRIGGER: latest plot", flush=True)
+    try:
+        priority_processing = True
 
-    def pipeline():
-        global priority_processing, plot_dict
+        latest = fetch_latest_plot()
 
-        try:
-            priority_processing = True
+        if not latest:
+            print("❌ No latest plot", flush=True)
+            return
 
-            latest_plot = fetch_latest_plot()
+        plot_name = list(latest.keys())[0]
 
-            if not latest_plot:
-                print("❌ No latest plot found", flush=True)
-                return
+        plot_dict.update(latest)
 
-            plot_name = list(latest_plot.keys())[0]
+        process_plot(plot_name)
 
-            print(f"🆕 Latest plot: {plot_name}", flush=True)
+        print(f"🔥 DONE {plot_name}", flush=True)
 
-            plot_dict.update(latest_plot)
+    finally:
+        priority_processing = False
 
-            process_plot(plot_name)
 
-            print(f"🔥 DONE: {plot_name}", flush=True)
+@app.post("/trigger-latest-plot")
+async def trigger_latest():
+    threading.Thread(target=trigger_pipeline, daemon=True).start()
+    return {"status": "started"}
 
-        finally:
-            priority_processing = False
-
-    threading.Thread(target=pipeline, daemon=True).start()
-
-    return {"status": "started", "mode": "latest-only"}
+# ✅ alias fix
+@app.post("/trigger-new-plot")
+async def trigger_new():
+    return await trigger_latest()
 
 # =====================================================
-# ✅ FIXED DAILY JOB
+# DAILY
 # =====================================================
 
 def daily_scheduler():
 
-    global priority_processing, plot_dict
+    global plot_dict
 
     while True:
 
@@ -320,34 +296,31 @@ def daily_scheduler():
             time.sleep(10)
             continue
 
-        print("🕛 DAILY RUN (FULL REFRESH)", flush=True)
+        print("🕛 DAILY", flush=True)
 
-        # ✅ IMPORTANT FIX
-        plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
-
-        if not plot_dict:
-            print("❌ No plots fetched", flush=True)
+        try:
+            plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+        except Exception as e:
+            print("❌ Full fetch failed:", e)
             time.sleep(3600)
             continue
 
-        print(f"📊 Total plots: {len(plot_dict)}", flush=True)
+        if not plot_dict:
+            print("❌ No plots", flush=True)
+            time.sleep(3600)
+            continue
 
-        for plot_name in plot_dict.keys():
-
-            if priority_processing:
-                break
-
-            process_plot(plot_name)
+        for p in plot_dict.keys():
+            process_plot(p)
 
         time.sleep(86400)
 
 # =====================================================
-# STARTUP
+# START
 # =====================================================
 
 @app.on_event("startup")
 def startup():
-    print("🚀 Worker started", flush=True)
     threading.Thread(target=daily_scheduler, daemon=True).start()
 
 # =====================================================
