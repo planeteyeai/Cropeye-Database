@@ -130,23 +130,47 @@ def fetch_latest_plot():
 def build_plot_data_from_dict(plot_name):
 
     if plot_name not in plot_dict:
+        print(f"❌ Plot not found: {plot_name}", flush=True)
         return None
 
     try:
         data = plot_dict[plot_name]
-        geom_geojson = data["geometry"].getInfo()
+
+        geom_obj = data.get("geometry")
+
+        if not geom_obj:
+            print(f"❌ Missing geometry for {plot_name}", flush=True)
+            return None
+
+        # Convert EE → GeoJSON
+        geom_geojson = geom_obj.getInfo()
+
+        if not geom_geojson:
+            print(f"❌ Empty geometry for {plot_name}", flush=True)
+            return None
+
+        geom_type = geom_geojson.get("type")
+        coords = geom_geojson.get("coordinates")
+
+        if not geom_type or not coords:
+            print(f"❌ Invalid geojson for {plot_name}", flush=True)
+            return None
+
         props = data.get("properties", {})
 
         return {
             "geometry": geom_geojson,
+            "geom_type": geom_type,               # ✅ FIX
+            "original_coords": coords,            # ✅ FIX
             "properties": {
+                "django_id": props.get("django_id"),
                 "plot_name": plot_name,
                 "crop_type": props.get("crop_type_name"),
             }
         }
 
     except Exception as e:
-        print("🔥 build error:", e, flush=True)
+        print(f"🔥 build error for {plot_name}: {e}", flush=True)
         return None
 
 # =====================================================
