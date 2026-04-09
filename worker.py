@@ -2,7 +2,7 @@ from datetime import date, timedelta
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor, Json
@@ -89,27 +89,35 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# 🔥 REFRESH FROM DJANGO (NEW)
+# 🚀 FETCH ONLY LATEST PLOT (FASTEST)
 # =====================================================
 
-@app.post("/refresh-from-django")
-async def refresh_from_django():
+def fetch_latest_plot():
+
+    url = f"{plot_sync_service.django_api_url}/api/plots/public/?ordering=-id&page_size=1"
+
     try:
-        global plot_dict
+        import requests
 
-        print("🔄 FULL REFRESH from Django...", flush=True)
+        response = requests.get(url, timeout=10)
 
-        plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+        if response.status_code != 200:
+            print("❌ Failed latest fetch", flush=True)
+            return None
 
-        print(f"✅ Loaded {len(plot_dict)} plots from Django", flush=True)
+        data = response.json()
+        results = data.get("results", [])
 
-        return {
-            "status": "success",
-            "plot_count": len(plot_dict)
-        }
+        if not results:
+            return None
+
+        processed = plot_sync_service._process_plots_response({"results": results})
+
+        return processed
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Latest fetch error: {e}", flush=True)
+        return None
 
 # =====================================================
 # GEOJSON BUILDER
@@ -120,7 +128,7 @@ def build_plot_data_from_dict(plot_name):
     global plot_dict
 
     if plot_name not in plot_dict:
-        print("❌ Plot not in refreshed dict", flush=True)
+        print(f"❌ Plot {plot_name} not found in dict", flush=True)
         return None
 
     data = plot_dict[plot_name]
@@ -220,19 +228,18 @@ def run_today_analysis(plot_name, plot_data, plot_id):
                 "pest", plot_id))
 
 # =====================================================
-# PROCESS (PRIORITY)
+# PROCESS
 # =====================================================
 
 def process_plot(plot_name):
 
-    print(f"⚙️ PRIORITY processing: {plot_name}", flush=True)
+    print(f"⚙️ Processing: {plot_name}", flush=True)
 
     plot_data = build_plot_data_from_dict(plot_name)
 
     if not plot_data:
         return
 
-    # Insert plot in DB first
     run_query(
         """
         INSERT INTO plots (plot_name, geojson)
@@ -260,15 +267,15 @@ def process_plot(plot_name):
     ).start()
 
 # =====================================================
-# 🚀 TRIGGER (FINAL FIXED)
+# 🚀 TRIGGER (LATEST ONLY - FINAL)
 # =====================================================
 
-@app.post("/trigger-new-plot")
-async def trigger_new_plot():
+@app.post("/trigger-latest-plot")
+async def trigger_latest_plot():
 
     global priority_processing, plot_dict
 
-    print("🚀 TRIGGER RECEIVED (AUTO DETECT MODE)", flush=True)
+    print("🚀 TRIGGER: latest plot", flush=True)
 
     def pipeline():
         global priority_processing, plot_dict
@@ -276,59 +283,29 @@ async def trigger_new_plot():
         try:
             priority_processing = True
 
-            # ✅ STEP 1: Refresh from Django
-            print("🔄 Fetching latest plots...", flush=True)
+            latest_plot = fetch_latest_plot()
 
-            new_plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
-
-            if not new_plot_dict:
-                print("❌ No plots fetched", flush=True)
+            if not latest_plot:
+                print("❌ No latest plot found", flush=True)
                 return
 
-            # ✅ STEP 2: Get existing plots from DB
-            rows = run_query(
-                "SELECT plot_name FROM plots",
-                fetchall=True
-            ) or []
+            plot_name = list(latest_plot.keys())[0]
 
-            existing_plots = set(r["plot_name"] for r in rows)
+            print(f"🆕 Latest plot: {plot_name}", flush=True)
 
-            # ✅ STEP 3: Find NEW plots
-            new_plots = [
-                name for name in new_plot_dict.keys()
-                if name not in existing_plots
-            ]
+            plot_dict.update(latest_plot)
 
-            if not new_plots:
-                print("⚠️ No new plots found", flush=True)
-                return
+            process_plot(plot_name)
 
-            print(f"🆕 New plots detected: {new_plots}", flush=True)
-
-            # ✅ STEP 4: Update global dict
-            plot_dict = new_plot_dict
-
-            # ✅ STEP 5: Process ONLY new plots
-            for plot_name in new_plots:
-
-                print(f"⚙️ Processing NEW plot: {plot_name}", flush=True)
-
-                process_plot(plot_name)
-
-            print("🔥 DONE processing new plots", flush=True)
-
-        except Exception as e:
-            print(f"🔥 ERROR: {e}", flush=True)
+            print(f"🔥 DONE: {plot_name}", flush=True)
 
         finally:
             priority_processing = False
 
     threading.Thread(target=pipeline, daemon=True).start()
 
-    return {
-        "status": "started",
-        "mode": "auto-detect-new-plot"
-    }
+    return {"status": "started", "mode": "latest-only"}
+
 # =====================================================
 # DAILY JOB
 # =====================================================
@@ -340,7 +317,6 @@ def daily_scheduler():
     while True:
 
         if priority_processing:
-            print("⏸ Skipping daily (priority running)", flush=True)
             time.sleep(10)
             continue
 
@@ -349,10 +325,8 @@ def daily_scheduler():
         rows = run_query("SELECT plot_name FROM plots", fetchall=True) or []
 
         for r in rows:
-
             if priority_processing:
                 break
-
             process_plot(r["plot_name"])
 
         time.sleep(86400)
