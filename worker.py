@@ -334,7 +334,7 @@ def daily_scheduler():
             time.sleep(3600)
             continue
 
-        for p in plot_dict.keys():
+        for p in list(plot_dict.keys()):
             process_plot(p)
 
         time.sleep(86400)
