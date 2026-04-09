@@ -264,41 +264,71 @@ def process_plot(plot_name):
 # =====================================================
 
 @app.post("/trigger-new-plot")
-async def trigger_new_plot(request: Request):
+async def trigger_new_plot():
 
-    global priority_processing
+    global priority_processing, plot_dict
 
-    body = await request.json()
-    plot_name = body.get("plot_name")
-
-    if not plot_name:
-        return {"status": "error", "message": "plot_name required"}
-
-    print(f"🚀 PRIORITY TRIGGER: {plot_name}", flush=True)
+    print("🚀 TRIGGER RECEIVED (AUTO DETECT MODE)", flush=True)
 
     def pipeline():
-        global priority_processing
+        global priority_processing, plot_dict
 
         try:
             priority_processing = True
 
-            # ✅ STEP 1: FORCE REFRESH
-            print("🔄 Refreshing Django...", flush=True)
-            global plot_dict
-            plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+            # ✅ STEP 1: Refresh from Django
+            print("🔄 Fetching latest plots...", flush=True)
 
-            # ✅ STEP 2: PROCESS IMMEDIATELY
-            process_plot(plot_name)
+            new_plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
 
-            print(f"🔥 DONE: {plot_name}", flush=True)
+            if not new_plot_dict:
+                print("❌ No plots fetched", flush=True)
+                return
+
+            # ✅ STEP 2: Get existing plots from DB
+            rows = run_query(
+                "SELECT plot_name FROM plots",
+                fetchall=True
+            ) or []
+
+            existing_plots = set(r["plot_name"] for r in rows)
+
+            # ✅ STEP 3: Find NEW plots
+            new_plots = [
+                name for name in new_plot_dict.keys()
+                if name not in existing_plots
+            ]
+
+            if not new_plots:
+                print("⚠️ No new plots found", flush=True)
+                return
+
+            print(f"🆕 New plots detected: {new_plots}", flush=True)
+
+            # ✅ STEP 4: Update global dict
+            plot_dict = new_plot_dict
+
+            # ✅ STEP 5: Process ONLY new plots
+            for plot_name in new_plots:
+
+                print(f"⚙️ Processing NEW plot: {plot_name}", flush=True)
+
+                process_plot(plot_name)
+
+            print("🔥 DONE processing new plots", flush=True)
+
+        except Exception as e:
+            print(f"🔥 ERROR: {e}", flush=True)
 
         finally:
             priority_processing = False
 
     threading.Thread(target=pipeline, daemon=True).start()
 
-    return {"status": "started", "plot": plot_name}
-
+    return {
+        "status": "started",
+        "mode": "auto-detect-new-plot"
+    }
 # =====================================================
 # DAILY JOB
 # =====================================================
