@@ -89,7 +89,7 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# 🚀 FETCH ONLY LATEST PLOT (FASTEST)
+# 🚀 FETCH ONLY LATEST PLOT
 # =====================================================
 
 def fetch_latest_plot():
@@ -128,7 +128,7 @@ def build_plot_data_from_dict(plot_name):
     global plot_dict
 
     if plot_name not in plot_dict:
-        print(f"❌ Plot {plot_name} not found in dict", flush=True)
+        print(f"⚠️ Skipping missing plot: {plot_name}", flush=True)
         return None
 
     data = plot_dict[plot_name]
@@ -267,7 +267,7 @@ def process_plot(plot_name):
     ).start()
 
 # =====================================================
-# 🚀 TRIGGER (LATEST ONLY - FINAL)
+# 🚀 TRIGGER (LATEST ONLY)
 # =====================================================
 
 @app.post("/trigger-latest-plot")
@@ -307,12 +307,12 @@ async def trigger_latest_plot():
     return {"status": "started", "mode": "latest-only"}
 
 # =====================================================
-# DAILY JOB
+# ✅ FIXED DAILY JOB
 # =====================================================
 
 def daily_scheduler():
 
-    global priority_processing
+    global priority_processing, plot_dict
 
     while True:
 
@@ -320,14 +320,24 @@ def daily_scheduler():
             time.sleep(10)
             continue
 
-        print("🕛 DAILY RUN", flush=True)
+        print("🕛 DAILY RUN (FULL REFRESH)", flush=True)
 
-        rows = run_query("SELECT plot_name FROM plots", fetchall=True) or []
+        # ✅ IMPORTANT FIX
+        plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
 
-        for r in rows:
+        if not plot_dict:
+            print("❌ No plots fetched", flush=True)
+            time.sleep(3600)
+            continue
+
+        print(f"📊 Total plots: {len(plot_dict)}", flush=True)
+
+        for plot_name in plot_dict.keys():
+
             if priority_processing:
                 break
-            process_plot(r["plot_name"])
+
+            process_plot(plot_name)
 
         time.sleep(86400)
 
