@@ -3,6 +3,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI
+from contextlib import asynccontextmanager
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor, Json
@@ -22,18 +23,27 @@ from shared_services import PlotSyncService
 # INIT
 # =====================================================
 
-app = FastAPI()
-
 plot_sync_service = PlotSyncService()
 plot_dict = {}
 
 priority_processing = False
-STOP_ALL = False   # 🔥 NEW
+STOP_ALL = False
 
 MAX_PARALLEL_ANALYSIS = 3
 GLOBAL_LIMIT = 4
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
+
+# =====================================================
+# FASTAPI (FIXED LIFESPAN)
+# =====================================================
+
+@asynccontextmanager
+async def lifespan(app):
+    threading.Thread(target=daily_scheduler, daemon=True).start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # =====================================================
 # CORS
@@ -96,35 +106,59 @@ def fetch_latest_plot():
     if not results:
         return None
 
-    processed = plot_sync_service._process_plots_response({"results": results})
-    return processed
+    return plot_sync_service._process_plots_response({"results": results})
 
 # =====================================================
-# BUILD
+# BUILD (CRITICAL FIX)
 # =====================================================
 
 def build_plot_data_from_dict(plot_name):
 
     if plot_name not in plot_dict:
+        print(f"❌ Not in dict: {plot_name}", flush=True)
         return None
 
     data = plot_dict[plot_name]
+
     geom_obj = data.get("geometry")
+
+    if not geom_obj:
+        print(f"❌ Missing geometry for {plot_name}", flush=True)
+        return None
 
     try:
         geom_geojson = geom_obj.getInfo()
-    except:
+    except Exception as e:
+        print(f"🔥 getInfo failed {plot_name}: {e}", flush=True)
+        return None
+
+    if not geom_geojson:
+        print(f"❌ Empty geometry {plot_name}", flush=True)
+        return None
+
+    geom_type = geom_geojson.get("type")
+    coords = geom_geojson.get("coordinates")
+
+    if not geom_type or not coords:
+        print(f"❌ Invalid geometry {plot_name}", flush=True)
         return None
 
     props = data.get("properties", {})
 
     crop_type = props.get("crop_type_name") or "generic"
+    django_id = props.get("django_id")
+
+    if not django_id:
+        print(f"⚠ Missing django_id for {plot_name}", flush=True)
 
     return {
         "geometry": geom_geojson,
+        "geom_type": geom_type,              # ✅ REQUIRED
+        "original_coords": coords,           # ✅ REQUIRED
         "properties": {
             "plot_name": plot_name,
             "crop_type": crop_type,
+            "django_id": django_id
         }
     }
 
@@ -134,10 +168,7 @@ def build_plot_data_from_dict(plot_name):
 
 def store_results(results, analysis_type, plot_id):
 
-    if STOP_ALL:
-        return
-
-    if not results:
+    if STOP_ALL or not results:
         return
 
     if isinstance(results, dict):
@@ -182,12 +213,11 @@ def run_today_analysis(plot_name, plot_data, plot_id):
     if STOP_ALL:
         return
 
+    end = date.today()
+    start = (end - timedelta(days=30)).isoformat()
+    end = end.isoformat()
+
     with semaphore:
-
-        end = date.today()
-        start = (end - timedelta(days=30)).isoformat()
-        end = end.isoformat()
-
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as ex:
 
             ex.submit(lambda: store_results(run_growth_analysis_by_plot(plot_name, plot_data, start, end), "growth", plot_id))
@@ -211,7 +241,7 @@ def process_plot(plot_name):
         return
 
     run_query(
-        "INSERT INTO plots (plot_name, geojson) VALUES (%s, %s) ON CONFLICT (plot_name) DO UPDATE SET geojson = EXCLUDED.geojson",
+        "INSERT INTO plots (plot_name, geojson) VALUES (%s,%s) ON CONFLICT (plot_name) DO UPDATE SET geojson = EXCLUDED.geojson",
         (plot_name, Json(plot_data["geometry"]))
     )
 
@@ -223,7 +253,6 @@ def process_plot(plot_name):
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    # 🔥 BACKFILL with STOP CHECK
     def safe_backfill():
         if STOP_ALL:
             return
@@ -232,19 +261,17 @@ def process_plot(plot_name):
     threading.Thread(target=safe_backfill, daemon=True).start()
 
 # =====================================================
-# TRIGGER (PRIORITY)
+# TRIGGER
 # =====================================================
 
 def trigger_pipeline():
 
-    global priority_processing, STOP_ALL, plot_dict
+    global STOP_ALL, priority_processing
 
-    print("🔥 PRIORITY MODE ON", flush=True)
-
-    STOP_ALL = True          # ⛔ STOP EVERYTHING
+    STOP_ALL = True
     priority_processing = True
 
-    time.sleep(2)            # let threads stop
+    time.sleep(2)
 
     latest = fetch_latest_plot()
     if not latest:
@@ -260,7 +287,7 @@ def trigger_pipeline():
 
     print(f"🔥 DONE PRIORITY {plot_name}", flush=True)
 
-    STOP_ALL = False         # ✅ RESUME
+    STOP_ALL = False
     priority_processing = False
 
 @app.post("/trigger-new-plot")
@@ -278,13 +305,18 @@ def daily_scheduler():
 
     while True:
 
-        if priority_processing or STOP_ALL:
+        if STOP_ALL or priority_processing:
             time.sleep(5)
             continue
 
         print("🕛 DAILY START", flush=True)
 
-        plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+        try:
+            plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+        except Exception as e:
+            print("❌ Fetch failed:", e)
+            time.sleep(3600)
+            continue
 
         for p in list(plot_dict.keys()):
 
@@ -295,18 +327,3 @@ def daily_scheduler():
             process_plot(p)
 
         time.sleep(86400)
-
-# =====================================================
-# START
-# =====================================================
-
-@app.on_event("startup")
-def startup():
-    threading.Thread(target=daily_scheduler, daemon=True).start()
-
-# =====================================================
-# MAIN
-# =====================================================
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
