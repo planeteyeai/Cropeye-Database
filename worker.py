@@ -91,24 +91,6 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# FETCH
-# =====================================================
-
-def fetch_latest_plot():
-    import requests
-
-    url = f"{plot_sync_service.django_api_url}/api/plots/public/?ordering=-id&page_size=1"
-
-    r = requests.get(url, timeout=10)
-    data = r.json()
-
-    results = data.get("results", [])
-    if not results:
-        return None
-
-    return plot_sync_service._process_plots_response({"results": results})
-
-# =====================================================
 # BUILD (CRITICAL FIX)
 # =====================================================
 
@@ -264,36 +246,62 @@ def process_plot(plot_name):
 # TRIGGER
 # =====================================================
 
-def trigger_pipeline():
+def trigger_pipeline(plot_name):
 
-    global STOP_ALL, priority_processing
+    global STOP_ALL, priority_processing, plot_dict
+
+    print(f"🚨 PRIORITY START: {plot_name}", flush=True)
 
     STOP_ALL = True
     priority_processing = True
 
-    time.sleep(2)
+    try:
+        # ----------------------------------
+        # STEP 1: HARD REFRESH FROM DJANGO
+        # ----------------------------------
+        print("🔄 Refreshing Django...", flush=True)
 
-    latest = fetch_latest_plot()
-    if not latest:
+        plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+
+        # ----------------------------------
+        # STEP 2: VALIDATE PLOT EXISTS
+        # ----------------------------------
+        if plot_name not in plot_dict:
+            print(f"❌ Plot NOT FOUND after refresh: {plot_name}", flush=True)
+            return
+
+        print(f"✅ Plot found: {plot_name}", flush=True)
+
+        # ----------------------------------
+        # STEP 3: PROCESS ONLY THIS PLOT
+        # ----------------------------------
+        process_plot(plot_name)
+
+        print(f"🔥 DONE PRIORITY {plot_name}", flush=True)
+
+    except Exception as e:
+        print(f"🔥 PRIORITY ERROR: {e}", flush=True)
+
+    finally:
         STOP_ALL = False
         priority_processing = False
-        return
-
-    plot_name = list(latest.keys())[0]
-
-    plot_dict[plot_name] = latest[plot_name]
-
-    process_plot(plot_name)
-
-    print(f"🔥 DONE PRIORITY {plot_name}", flush=True)
-
-    STOP_ALL = False
-    priority_processing = False
 
 @app.post("/trigger-new-plot")
-async def trigger_new():
-    threading.Thread(target=trigger_pipeline, daemon=True).start()
-    return {"status": "priority started"}
+async def trigger_new(request: Request):
+
+    body = await request.json()
+    plot_name = body.get("plot_name")
+
+    if not plot_name:
+        return {"status": "error", "message": "plot_name required"}
+
+    threading.Thread(
+        target=trigger_pipeline,
+        args=(plot_name,),
+        daemon=True
+    ).start()
+
+    return {"status": "priority started", "plot": plot_name}
 
 # =====================================================
 # DAILY
@@ -320,7 +328,7 @@ def daily_scheduler():
 
         for p in list(plot_dict.keys()):
 
-            if STOP_ALL:
+            if STOP_ALL or priority_processing:
                 print("⛔ DAILY INTERRUPTED", flush=True)
                 break
 
