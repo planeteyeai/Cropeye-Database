@@ -65,118 +65,6 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# BUILD (FIXED GEOMETRY)
-# =====================================================
-
-def build_plot_data_from_dict(plot_name):
-
-    if plot_name not in plot_dict:
-        return None
-
-    data = plot_dict[plot_name]
-    geom_obj = data.get("geometry")
-
-    if not geom_obj:
-        print(f"⛔ No geometry: {plot_name}", flush=True)
-        return None
-
-    try:
-        if hasattr(geom_obj, "getInfo"):
-            geom_geojson = geom_obj.getInfo()
-        else:
-            geom_geojson = geom_obj
-    except Exception as e:
-        print(f"❌ getInfo failed: {e}", flush=True)
-        return None
-
-    if not geom_geojson:
-        return None
-
-    # Handle FeatureCollection
-    if geom_geojson.get("type") == "FeatureCollection":
-        features = geom_geojson.get("features", [])
-        if not features:
-            return None
-        geom_geojson = features[0].get("geometry")
-
-    # 🔥 FORCE VALID STRUCTURE
-    if geom_geojson.get("type") not in ["Polygon", "MultiPolygon"]:
-        print(f"❌ Invalid geom type: {geom_geojson.get('type')}", flush=True)
-        return None
-
-    props = data.get("properties", {})
-
-    return {
-        "geometry": geom_geojson,
-        "properties": {
-            "plot_name": plot_name,
-            "crop_type": props.get("crop_type_name") or "generic",
-            "django_id": props.get("django_id")
-        }
-    }
-
-# =====================================================
-# METADATA
-# =====================================================
-
-def extract_metadata(geojson):
-    try:
-        props = geojson["features"][0]["properties"]
-
-        return (
-            props.get("tile_url") or props.get("tiles_url"),
-            props.get("sensor_used") or props.get("sensor")
-        )
-    except Exception:
-        return None, None
-
-# =====================================================
-# STORE (FIXED)
-# =====================================================
-
-def store_results(results, analysis_type, plot_id):
-
-    if not results:
-        print(f"⚠ No results for {analysis_type}", flush=True)
-        return
-
-    if isinstance(results, dict):
-        results = [results]
-
-    for geojson in results:
-
-        features = geojson.get("features")
-        if not features:
-            continue
-
-        props = features[0]["properties"]
-
-        analysis_date = props.get("analysis_image_date") or props.get("latest_image_date")
-        sensor = props.get("sensor_used") or props.get("sensor") or "unknown"
-
-        tile_url, sensor_used = extract_metadata(geojson)
-
-        if not analysis_date:
-            continue
-
-        final_type = f"{analysis_type}_{sensor.lower().replace('-', '')}"
-
-        # 🔥 INSERT WITH TILE + SENSOR
-        run_query(
-            """
-            INSERT INTO analysis_results
-            (plot_id, analysis_type, analysis_date, response_json, tile_url, sensor_used)
-            VALUES (%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (plot_id, analysis_type, analysis_date)
-            DO UPDATE SET 
-                response_json = EXCLUDED.response_json,
-                tile_url = COALESCE(EXCLUDED.tile_url, analysis_results.tile_url),
-                sensor_used = COALESCE(EXCLUDED.sensor_used, analysis_results.sensor_used)
-            """,
-            (plot_id, final_type, analysis_date, Json(geojson), tile_url, sensor_used)
-        )
-
-# =====================================================
 # ANALYSIS
 # =====================================================
 
@@ -184,7 +72,8 @@ def safe_analysis(fn, name, plot_name, plot_data, start, end, plot_id):
     try:
         print(f"🔎 Running {name}", flush=True)
         result = fn(plot_name, plot_data, start, end)
-        store_results(result, name, plot_id)
+        if result:
+            store_results(result, name, plot_id)
     except Exception as e:
         print(f"🔥 {name} failed: {e}", flush=True)
 
@@ -203,7 +92,55 @@ def run_today_analysis(plot_name, plot_data, plot_id):
             ex.submit(safe_analysis, run_pest_detection_analysis_by_plot, "pest", plot_name, plot_data, start, end, plot_id)
 
 # =====================================================
-# PROCESS
+# STORE RESULTS
+# =====================================================
+
+def extract_metadata(geojson):
+    try:
+        props = geojson["features"][0]["properties"]
+        return props.get("tile_url"), props.get("sensor_used")
+    except:
+        return None, None
+
+def store_results(results, analysis_type, plot_id):
+
+    if isinstance(results, dict):
+        results = [results]
+
+    for geojson in results:
+
+        features = geojson.get("features")
+        if not features:
+            continue
+
+        props = features[0]["properties"]
+
+        analysis_date = props.get("analysis_image_date") or props.get("latest_image_date")
+        sensor = props.get("sensor_used") or "unknown"
+
+        tile_url, sensor_used = extract_metadata(geojson)
+
+        if not analysis_date:
+            continue
+
+        final_type = f"{analysis_type}_{sensor.lower()}"
+
+        run_query(
+            """
+            INSERT INTO analysis_results
+            (plot_id, analysis_type, analysis_date, response_json, tile_url, sensor_used)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (plot_id, analysis_type, analysis_date)
+            DO UPDATE SET 
+                response_json = EXCLUDED.response_json,
+                tile_url = EXCLUDED.tile_url,
+                sensor_used = EXCLUDED.sensor_used
+            """,
+            (plot_id, final_type, analysis_date, Json(geojson), tile_url, sensor_used)
+        )
+
+# =====================================================
+# PROCESS (NO REFETCH BUG)
 # =====================================================
 
 def process_plot(plot_name):
@@ -212,25 +149,25 @@ def process_plot(plot_name):
 
     print(f"🚀 Processing: {plot_name}", flush=True)
 
-    plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
-
-    plot_data = build_plot_data_from_dict(plot_name)
-    if not plot_data:
-        print(f"⛔ Skipping invalid plot: {plot_name}", flush=True)
+    if plot_name not in plot_dict:
+        print(f"❌ Not in memory: {plot_name}")
         return
 
-    run_query(
-        """
-        INSERT INTO plots (plot_name, geojson)
-        VALUES (%s,%s)
-        ON CONFLICT (plot_name)
-        DO UPDATE SET geojson = EXCLUDED.geojson
-        """,
-        (plot_name, Json(plot_data["geometry"]))
+    plot_data = plot_dict[plot_name]
+    geom = plot_data.get("geometry")
+
+    if not geom:
+        print(f"⛔ No geometry: {plot_name}")
+        return
+
+    row = run_query(
+        "SELECT id FROM plots WHERE plot_name=%s",
+        (plot_name,),
+        fetchone=True
     )
 
-    row = run_query("SELECT id FROM plots WHERE plot_name=%s", (plot_name,), fetchone=True)
     if not row:
+        print(f"❌ Not in DB: {plot_name}")
         return
 
     plot_id = row["id"]
@@ -261,7 +198,7 @@ def worker():
         task_queue.task_done()
 
 # =====================================================
-# DAILY (FILTER FIX)
+# DAILY
 # =====================================================
 
 def daily_scheduler():
@@ -273,7 +210,8 @@ def daily_scheduler():
         print("🕛 DAILY FETCH", flush=True)
 
         try:
-            plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+            plot_dict.clear()
+            plot_dict.update(plot_sync_service.get_plots_dict(force_refresh=True))
         except Exception as e:
             print("❌ Fetch failed:", e)
             time.sleep(3600)
@@ -282,11 +220,10 @@ def daily_scheduler():
         for p, data in plot_dict.items():
 
             if not data.get("geometry"):
-                print(f"⛔ Skipping {p} (no geometry)", flush=True)
                 continue
 
             task_queue.put((10, time.time(), p))
 
-        print(f"📦 Added filtered plots", flush=True)
+        print("📦 Daily queue added", flush=True)
 
         time.sleep(86400)
