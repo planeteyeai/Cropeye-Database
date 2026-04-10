@@ -104,32 +104,22 @@ def build_plot_data_from_dict(plot_name):
     geom_obj = data.get("geometry")
 
     if not geom_obj:
-        print(f"❌ Missing geometry for {plot_name}", flush=True)
         return None
 
     try:
         geom_geojson = geom_obj.getInfo()
-    except Exception as e:
-        print(f"🔥 getInfo failed {plot_name}: {e}", flush=True)
+    except Exception:
         return None
 
     if not geom_geojson:
-        print(f"❌ Empty geometry {plot_name}", flush=True)
-        return None
-
-    geom_type = geom_geojson.get("type")
-    coords = geom_geojson.get("coordinates")
-
-    if not geom_type or not coords:
-        print(f"❌ Invalid geometry {plot_name}", flush=True)
         return None
 
     props = data.get("properties", {})
 
     return {
         "geometry": geom_geojson,
-        "geom_type": geom_type,
-        "original_coords": coords,
+        "geom_type": geom_geojson.get("type"),
+        "original_coords": geom_geojson.get("coordinates"),
         "properties": {
             "plot_name": plot_name,
             "crop_type": props.get("crop_type_name") or "generic",
@@ -152,6 +142,7 @@ def store_results(results, analysis_type, plot_id):
     for geojson in results:
 
         if STOP_ALL:
+            print("⛔ STOPPED store_results", flush=True)
             return
 
         features = geojson.get("features")
@@ -186,6 +177,7 @@ def store_results(results, analysis_type, plot_id):
 def run_today_analysis(plot_name, plot_data, plot_id):
 
     if STOP_ALL:
+        print("⛔ STOPPED analysis", flush=True)
         return
 
     end = date.today()
@@ -207,6 +199,7 @@ def run_today_analysis(plot_name, plot_data, plot_id):
 def process_plot(plot_name):
 
     if STOP_ALL:
+        print(f"⛔ Skipping {plot_name}", flush=True)
         return
 
     print(f"🚀 Processing: {plot_name}", flush=True)
@@ -225,8 +218,6 @@ def process_plot(plot_name):
         (plot_name, Json(plot_data["geometry"]))
     )
 
-    print(f"✅ Inserted/Updated plot in DB: {plot_name}", flush=True)
-
     row = run_query("SELECT id FROM plots WHERE plot_name=%s", (plot_name,), fetchone=True)
     if not row:
         return
@@ -237,13 +228,14 @@ def process_plot(plot_name):
 
     def safe_backfill():
         if STOP_ALL:
+            print("⛔ Backfill stopped", flush=True)
             return
         run_monthly_backfill_for_plot(plot_name, plot_data)
 
     threading.Thread(target=safe_backfill, daemon=True).start()
 
 # =====================================================
-# TRIGGER (FIXED WITH RETRY)
+# PRIORITY PIPELINE (FIXED HARD STOP)
 # =====================================================
 
 def trigger_pipeline(plot_name):
@@ -255,38 +247,31 @@ def trigger_pipeline(plot_name):
     STOP_ALL = True
     priority_processing = True
 
-    time.sleep(1)
+    # 🔴 WAIT for existing threads to actually stop
+    print("⏳ Waiting for old tasks to stop...", flush=True)
+    time.sleep(5)
 
     try:
-        print("🔄 Refreshing Django with retry...", flush=True)
+        print("🔄 Refreshing Django...", flush=True)
 
-        max_retries = 5
-        retry_delay = 2
-        found = False
-
-        for i in range(max_retries):
+        for i in range(5):
             plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
 
-            print(f"📊 Total plots fetched: {len(plot_dict)}", flush=True)
-
             if plot_name in plot_dict:
-                found = True
-                print(f"✅ Plot found after {i+1} tries: {plot_name}", flush=True)
+                print(f"✅ Found plot: {plot_name}", flush=True)
                 break
 
-            print(f"⏳ Retry {i+1}: Plot not found yet...", flush=True)
-            time.sleep(retry_delay)
+            print(f"⏳ Retry {i+1}...", flush=True)
+            time.sleep(2)
 
-        if not found:
-            print(f"❌ Plot STILL NOT FOUND: {plot_name}", flush=True)
+        if plot_name not in plot_dict:
+            print(f"❌ Plot NOT FOUND: {plot_name}", flush=True)
             return
 
+        # ✅ FORCE PROCESS FIRST
         process_plot(plot_name)
 
         print(f"🔥 DONE PRIORITY {plot_name}", flush=True)
-
-    except Exception as e:
-        print(f"🔥 PRIORITY ERROR: {e}", flush=True)
 
     finally:
         STOP_ALL = False
