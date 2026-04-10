@@ -2,6 +2,7 @@ from datetime import date, timedelta
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from queue import PriorityQueue
 from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 import uvicorn
@@ -26,8 +27,8 @@ from shared_services import PlotSyncService
 plot_sync_service = PlotSyncService()
 plot_dict = {}
 
-priority_processing = False
-STOP_ALL = False
+# 🔥 PRIORITY QUEUE
+task_queue = PriorityQueue()
 
 MAX_PARALLEL_ANALYSIS = 3
 GLOBAL_LIMIT = 4
@@ -40,6 +41,7 @@ semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
 @asynccontextmanager
 async def lifespan(app):
+    threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=daily_scheduler, daemon=True).start()
     yield
 
@@ -133,17 +135,13 @@ def build_plot_data_from_dict(plot_name):
 
 def store_results(results, analysis_type, plot_id):
 
-    if STOP_ALL or not results:
+    if not results:
         return
 
     if isinstance(results, dict):
         results = [results]
 
     for geojson in results:
-
-        if STOP_ALL:
-            print("⛔ STOPPED store_results", flush=True)
-            return
 
         features = geojson.get("features")
         if not features:
@@ -176,10 +174,6 @@ def store_results(results, analysis_type, plot_id):
 
 def run_today_analysis(plot_name, plot_data, plot_id):
 
-    if STOP_ALL:
-        print("⛔ STOPPED analysis", flush=True)
-        return
-
     end = date.today()
     start = (end - timedelta(days=30)).isoformat()
     end = end.isoformat()
@@ -198,14 +192,16 @@ def run_today_analysis(plot_name, plot_data, plot_id):
 
 def process_plot(plot_name):
 
-    if STOP_ALL:
-        print(f"⛔ Skipping {plot_name}", flush=True)
-        return
+    global plot_dict
 
     print(f"🚀 Processing: {plot_name}", flush=True)
 
+    # 🔄 Always refresh before processing (important)
+    plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+
     plot_data = build_plot_data_from_dict(plot_name)
     if not plot_data:
+        print(f"❌ Skipping {plot_name} (no data)", flush=True)
         return
 
     run_query(
@@ -226,59 +222,33 @@ def process_plot(plot_name):
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    def safe_backfill():
-        if STOP_ALL:
-            print("⛔ Backfill stopped", flush=True)
-            return
-        run_monthly_backfill_for_plot(plot_name, plot_data)
-
-    threading.Thread(target=safe_backfill, daemon=True).start()
-
-# =====================================================
-# PRIORITY PIPELINE (FIXED HARD STOP)
-# =====================================================
-
-def trigger_pipeline(plot_name):
-
-    global STOP_ALL, priority_processing, plot_dict
-
-    print(f"🚨 PRIORITY START: {plot_name}", flush=True)
-
-    STOP_ALL = True
-    priority_processing = True
-
-    # 🔴 WAIT for existing threads to actually stop
-    print("⏳ Waiting for old tasks to stop...", flush=True)
-    time.sleep(5)
-
-    try:
-        print("🔄 Refreshing Django...", flush=True)
-
-        for i in range(5):
-            plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
-
-            if plot_name in plot_dict:
-                print(f"✅ Found plot: {plot_name}", flush=True)
-                break
-
-            print(f"⏳ Retry {i+1}...", flush=True)
-            time.sleep(2)
-
-        if plot_name not in plot_dict:
-            print(f"❌ Plot NOT FOUND: {plot_name}", flush=True)
-            return
-
-        # ✅ FORCE PROCESS FIRST
-        process_plot(plot_name)
-
-        print(f"🔥 DONE PRIORITY {plot_name}", flush=True)
-
-    finally:
-        STOP_ALL = False
-        priority_processing = False
+    # 🔥 backfill runs async but DOES NOT block worker
+    threading.Thread(
+        target=run_monthly_backfill_for_plot,
+        args=(plot_name, plot_data),
+        daemon=True
+    ).start()
 
 # =====================================================
-# API
+# WORKER (CORE ENGINE)
+# =====================================================
+
+def worker():
+
+    while True:
+        priority, timestamp, plot_name = task_queue.get()
+
+        print(f"⚙️ Worker picked: {plot_name} (priority {priority})", flush=True)
+
+        try:
+            process_plot(plot_name)
+        except Exception as e:
+            print(f"🔥 Worker error: {e}", flush=True)
+
+        task_queue.task_done()
+
+# =====================================================
+# API (PRIORITY INSERT)
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -290,16 +260,15 @@ async def trigger_new(request: Request):
     if not plot_name:
         return {"status": "error", "message": "plot_name required"}
 
-    threading.Thread(
-        target=trigger_pipeline,
-        args=(plot_name,),
-        daemon=True
-    ).start()
+    # 🔥 HIGHEST PRIORITY
+    task_queue.put((0, time.time(), plot_name))
 
-    return {"status": "priority started", "plot": plot_name}
+    print(f"🚨 PRIORITY TASK ADDED: {plot_name}", flush=True)
+
+    return {"status": "queued with priority", "plot": plot_name}
 
 # =====================================================
-# DAILY
+# DAILY (LOW PRIORITY)
 # =====================================================
 
 def daily_scheduler():
@@ -308,11 +277,7 @@ def daily_scheduler():
 
     while True:
 
-        if STOP_ALL or priority_processing:
-            time.sleep(5)
-            continue
-
-        print("🕛 DAILY START", flush=True)
+        print("🕛 DAILY FETCH", flush=True)
 
         try:
             plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
@@ -323,10 +288,10 @@ def daily_scheduler():
 
         for p in list(plot_dict.keys()):
 
-            if STOP_ALL or priority_processing:
-                print("⛔ DAILY INTERRUPTED", flush=True)
-                break
+            # 🟡 LOW PRIORITY
+            task_queue.put((10, time.time(), p))
 
-            process_plot(p)
+        print(f"📦 Added {len(plot_dict)} plots to queue", flush=True)
 
         time.sleep(86400)
+        
