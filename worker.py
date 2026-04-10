@@ -35,7 +35,7 @@ GLOBAL_LIMIT = 4
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
 # =====================================================
-# FASTAPI (FIXED LIFESPAN)
+# FASTAPI
 # =====================================================
 
 @asynccontextmanager
@@ -91,7 +91,7 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# BUILD (CRITICAL FIX)
+# BUILD
 # =====================================================
 
 def build_plot_data_from_dict(plot_name):
@@ -101,7 +101,6 @@ def build_plot_data_from_dict(plot_name):
         return None
 
     data = plot_dict[plot_name]
-
     geom_obj = data.get("geometry")
 
     if not geom_obj:
@@ -127,20 +126,14 @@ def build_plot_data_from_dict(plot_name):
 
     props = data.get("properties", {})
 
-    crop_type = props.get("crop_type_name") or "generic"
-    django_id = props.get("django_id")
-
-    if not django_id:
-        print(f"⚠ Missing django_id for {plot_name}", flush=True)
-
     return {
         "geometry": geom_geojson,
-        "geom_type": geom_type,              # ✅ REQUIRED
-        "original_coords": coords,           # ✅ REQUIRED
+        "geom_type": geom_type,
+        "original_coords": coords,
         "properties": {
             "plot_name": plot_name,
-            "crop_type": crop_type,
-            "django_id": django_id
+            "crop_type": props.get("crop_type_name") or "generic",
+            "django_id": props.get("django_id")
         }
     }
 
@@ -223,9 +216,16 @@ def process_plot(plot_name):
         return
 
     run_query(
-        "INSERT INTO plots (plot_name, geojson) VALUES (%s,%s) ON CONFLICT (plot_name) DO UPDATE SET geojson = EXCLUDED.geojson",
+        """
+        INSERT INTO plots (plot_name, geojson)
+        VALUES (%s,%s)
+        ON CONFLICT (plot_name)
+        DO UPDATE SET geojson = EXCLUDED.geojson
+        """,
         (plot_name, Json(plot_data["geometry"]))
     )
+
+    print(f"✅ Inserted/Updated plot in DB: {plot_name}", flush=True)
 
     row = run_query("SELECT id FROM plots WHERE plot_name=%s", (plot_name,), fetchone=True)
     if not row:
@@ -243,7 +243,7 @@ def process_plot(plot_name):
     threading.Thread(target=safe_backfill, daemon=True).start()
 
 # =====================================================
-# TRIGGER
+# TRIGGER (FIXED WITH RETRY)
 # =====================================================
 
 def trigger_pipeline(plot_name):
@@ -255,26 +255,32 @@ def trigger_pipeline(plot_name):
     STOP_ALL = True
     priority_processing = True
 
+    time.sleep(1)
+
     try:
-        # ----------------------------------
-        # STEP 1: HARD REFRESH FROM DJANGO
-        # ----------------------------------
-        print("🔄 Refreshing Django...", flush=True)
+        print("🔄 Refreshing Django with retry...", flush=True)
 
-        plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+        max_retries = 5
+        retry_delay = 2
+        found = False
 
-        # ----------------------------------
-        # STEP 2: VALIDATE PLOT EXISTS
-        # ----------------------------------
-        if plot_name not in plot_dict:
-            print(f"❌ Plot NOT FOUND after refresh: {plot_name}", flush=True)
+        for i in range(max_retries):
+            plot_dict = plot_sync_service.get_plots_dict(force_refresh=True)
+
+            print(f"📊 Total plots fetched: {len(plot_dict)}", flush=True)
+
+            if plot_name in plot_dict:
+                found = True
+                print(f"✅ Plot found after {i+1} tries: {plot_name}", flush=True)
+                break
+
+            print(f"⏳ Retry {i+1}: Plot not found yet...", flush=True)
+            time.sleep(retry_delay)
+
+        if not found:
+            print(f"❌ Plot STILL NOT FOUND: {plot_name}", flush=True)
             return
 
-        print(f"✅ Plot found: {plot_name}", flush=True)
-
-        # ----------------------------------
-        # STEP 3: PROCESS ONLY THIS PLOT
-        # ----------------------------------
         process_plot(plot_name)
 
         print(f"🔥 DONE PRIORITY {plot_name}", flush=True)
@@ -285,6 +291,10 @@ def trigger_pipeline(plot_name):
     finally:
         STOP_ALL = False
         priority_processing = False
+
+# =====================================================
+# API
+# =====================================================
 
 @app.post("/trigger-new-plot")
 async def trigger_new(request: Request):
