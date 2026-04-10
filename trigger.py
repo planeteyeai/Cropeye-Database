@@ -2,10 +2,17 @@ from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 import threading
 import time
+from datetime import date, timedelta
 
 from fastapi.middleware.cors import CORSMiddleware
 
 from worker import task_queue, worker, daily_scheduler, plot_sync_service, plot_dict, run_query
+from gee_growth import (
+    run_growth_analysis_by_plot,
+    run_water_uptake_analysis_by_plot,
+    run_soil_moisture_analysis_by_plot,
+    run_pest_detection_analysis_by_plot,
+)
 from psycopg2.extras import Json
 
 # =====================================================
@@ -33,7 +40,42 @@ app.add_middleware(
 )
 
 # =====================================================
-# TRIGGER NEW PLOT (FINAL)
+# HELPERS
+# =====================================================
+
+def extract_result(geojson_list):
+    """Pull the first valid GeoJSON result from a list or dict."""
+    if isinstance(geojson_list, dict):
+        geojson_list = [geojson_list]
+    for item in geojson_list or []:
+        if item and item.get("features"):
+            return item
+    return None
+
+def run_fresh_analysis(plot_name, plot_data):
+    """Run all 4 analyses fresh and return results dict."""
+    end = date.today()
+    start = (end - timedelta(days=30)).isoformat()
+    end = end.isoformat()
+
+    results = {}
+    for name, fn in [
+        ("growth", run_growth_analysis_by_plot),
+        ("water", run_water_uptake_analysis_by_plot),
+        ("soil", run_soil_moisture_analysis_by_plot),
+        ("pest", run_pest_detection_analysis_by_plot),
+    ]:
+        try:
+            raw = fn(plot_name, plot_data, start, end)
+            results[name] = extract_result(raw)
+        except Exception as e:
+            print(f"⚠ {name} analysis failed: {e}", flush=True)
+            results[name] = None
+
+    return results
+
+# =====================================================
+# TRIGGER NEW PLOT
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -53,7 +95,7 @@ async def trigger_new(request: Request):
 
     print(f"🚀 Trigger received: {plot_name}", flush=True)
 
-    # ✅ FORCE REFRESH FROM DJANGO
+    # Force fresh fetch from Django
     plot_dict.clear()
     plot_dict.update(plot_sync_service.get_plots_dict(force_refresh=True))
 
@@ -74,7 +116,7 @@ async def trigger_new(request: Request):
 
     props = plot_data.get("properties", {})
 
-    # ✅ STORE FULL DATA (MATCH YOUR TABLE)
+    # Upsert plot into DB
     run_query(
         """
         INSERT INTO plots 
@@ -98,9 +140,54 @@ async def trigger_new(request: Request):
         )
     )
 
-    # ✅ PRIORITY QUEUE
-    task_queue.put((0, time.time(), plot_name))
+    # Run fresh analysis synchronously so we return new data
+    print(f"🔎 Running fresh analysis for: {plot_name}", flush=True)
+    analysis_results = run_fresh_analysis(plot_name, plot_data)
 
-    print(f"🚨 PRIORITY TASK ADDED: {plot_name}", flush=True)
+    # Persist fresh results to DB
+    plot_row = run_query(
+        "SELECT id FROM plots WHERE plot_name=%s",
+        (plot_name,),
+        fetchone=True
+    )
+    plot_id = plot_row["id"] if plot_row else None
 
-    return {"status": "queued", "plot": plot_name}
+    if plot_id:
+        end_str = date.today().isoformat()
+        for analysis_type, geojson in analysis_results.items():
+            if not geojson:
+                continue
+            try:
+                feat_props = geojson["features"][0]["properties"]
+                analysis_date = (
+                    feat_props.get("analysis_image_date")
+                    or feat_props.get("latest_image_date")
+                    or end_str
+                )
+                sensor = feat_props.get("sensor_used", "unknown")
+                tile_url = feat_props.get("tile_url")
+                final_type = f"{analysis_type}_{sensor.lower()}"
+
+                run_query(
+                    """
+                    INSERT INTO analysis_results
+                    (plot_id, analysis_type, analysis_date, response_json, tile_url, sensor_used)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (plot_id, analysis_type, analysis_date)
+                    DO UPDATE SET
+                        response_json = EXCLUDED.response_json,
+                        tile_url = EXCLUDED.tile_url,
+                        sensor_used = EXCLUDED.sensor_used
+                    """,
+                    (plot_id, final_type, analysis_date, Json(geojson), tile_url, sensor)
+                )
+            except Exception as e:
+                print(f"⚠ Store failed for {analysis_type}: {e}", flush=True)
+
+    print(f"✅ Fresh analysis done for: {plot_name}", flush=True)
+
+    return {
+        "status": "success",
+        "plot": plot_name,
+        "results": analysis_results,
+    }
