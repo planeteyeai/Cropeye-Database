@@ -6,7 +6,7 @@ import time
 from fastapi.middleware.cors import CORSMiddleware
 
 # 🔥 IMPORT SHARED QUEUE + WORKER
-from plot_worker import task_queue, worker, daily_scheduler
+from worker import task_queue, worker, daily_scheduler
 
 # =====================================================
 # FASTAPI
