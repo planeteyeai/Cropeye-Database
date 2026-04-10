@@ -64,10 +64,6 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         cursor.close()
         conn.close()
 
-# =====================================================
-# BUILD
-# =====================================================
-
 def build_plot_data_from_dict(plot_name):
 
     if plot_name not in plot_dict:
@@ -76,9 +72,34 @@ def build_plot_data_from_dict(plot_name):
     data = plot_dict[plot_name]
     geom_obj = data.get("geometry")
 
+    if not geom_obj:
+        print("⚠ Missing geometry", flush=True)
+        return None
+
+    # ✅ HANDLE MULTIPLE FORMATS
     try:
-        geom_geojson = geom_obj.getInfo()
-    except Exception:
+        if hasattr(geom_obj, "getInfo"):
+            geom_geojson = geom_obj.getInfo()
+        else:
+            geom_geojson = geom_obj  # already geojson
+    except Exception as e:
+        print("❌ Geometry getInfo failed:", e, flush=True)
+        return None
+
+    if not geom_geojson:
+        return None
+
+    # ✅ HANDLE FeatureCollection
+    if geom_geojson.get("type") == "FeatureCollection":
+        features = geom_geojson.get("features", [])
+        if not features:
+            print("❌ Empty FeatureCollection", flush=True)
+            return None
+        geom_geojson = features[0].get("geometry")
+
+    # ✅ FINAL VALIDATION
+    if "type" not in geom_geojson:
+        print("❌ Invalid geometry format", flush=True)
         return None
 
     props = data.get("properties", {})
@@ -91,7 +112,6 @@ def build_plot_data_from_dict(plot_name):
             "django_id": props.get("django_id")
         }
     }
-
 # =====================================================
 # 🔥 NEW: EXTRACT TILE + SENSOR
 # =====================================================
