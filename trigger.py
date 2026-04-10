@@ -39,14 +39,27 @@ app.add_middleware(
 @app.post("/trigger-new-plot")
 async def trigger_new(request: Request):
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return {
+            "status": "error",
+            "message": "Invalid or empty JSON body"
+        }
+
     plot_name = body.get("plot_name")
 
     if not plot_name:
-        return {"status": "error", "message": "plot_name required"}
+        return {
+            "status": "error",
+            "message": "plot_name required"
+        }
 
-    # 🔥 HIGHEST PRIORITY
     task_queue.put((0, time.time(), plot_name))
+
+    print(f"🚨 PRIORITY TASK ADDED: {plot_name}", flush=True)
+
+    return {"status": "queued", "plot": plot_name}
 
     print(f"🚨 PRIORITY TASK ADDED: {plot_name}", flush=True)
 
