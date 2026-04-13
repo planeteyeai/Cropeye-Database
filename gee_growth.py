@@ -356,6 +356,7 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
                         "tile_url": tile_url,
                         "sensor_used": "s2",
                         "image_count_in_range": s2_collection.size().getInfo(),
+                        "latest_image_date": latest_date,
                         "analysis_dates": {
                             "start_date": start_date,
                             "end_date": end_date,
@@ -452,6 +453,7 @@ def run_water_uptake_analysis_by_plot(plot_name, plot_data, start_date, end_date
                         "tile_url": tile_url,
                         "sensor_used": "s1",
                         "image_count_in_range": s1_collection.size().getInfo(),
+                        "latest_image_date": latest_date,
                         "analysis_dates": {
                             "start_date": start_date,
                             "end_date": end_date,
