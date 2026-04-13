@@ -49,11 +49,12 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=["*"],  # change in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # =====================================================
 # DB
 # =====================================================
@@ -95,10 +96,15 @@ def safe_analysis(fn, name, plot_name, plot_data, start, end, plot_id):
     try:
         print(f"🔎 Running {name}", flush=True)
         result = fn(plot_name, plot_data, start, end)
+
         if result:
             store_results(result, name, plot_id)
+        else:
+            print(f"⚠ No result for {name}", flush=True)
+
     except Exception as e:
         print(f"🔥 {name} failed: {e}", flush=True)
+
 
 def run_today_analysis(plot_name, plot_data, plot_id):
 
@@ -114,7 +120,7 @@ def run_today_analysis(plot_name, plot_data, plot_id):
             ex.submit(safe_analysis, run_pest_detection_analysis_by_plot, "pest", plot_name, plot_data, start, end, plot_id)
 
 # =====================================================
-# STORE RESULTS
+# STORE RESULTS (FIXED)
 # =====================================================
 
 def extract_metadata(geojson):
@@ -123,6 +129,7 @@ def extract_metadata(geojson):
         return props.get("tile_url"), props.get("sensor_used")
     except:
         return None, None
+
 
 def store_results(results, analysis_type, plot_id):
 
@@ -137,15 +144,22 @@ def store_results(results, analysis_type, plot_id):
 
         props = features[0]["properties"]
 
-        analysis_date = props.get("analysis_image_date") or props.get("latest_image_date")
+        # ✅ FIX: handle all cases (growth + water + soil + pest)
+        analysis_date = (
+            props.get("analysis_image_date")
+            or props.get("latest_image_date")
+            or props.get("analysis_dates", {}).get("latest_image_date")
+        )
+
         sensor = props.get("sensor_used") or "unknown"
 
         tile_url, sensor_used = extract_metadata(geojson)
 
         if not analysis_date:
+            print("⚠ Skipping due to missing analysis_date", flush=True)
             continue
 
-        final_type = f"{analysis_type}_{sensor.lower()}"
+        final_type = f"{analysis_type}_{str(sensor).lower()}"
 
         run_query(
             """
@@ -182,7 +196,6 @@ def process_plot(plot_name):
         print(f"⛔ No geometry: {plot_name}")
         return
 
-    # ✅ UPSERT FIRST (fix for "Not in DB")
     try:
         geom_geojson = geom.getInfo()
         area_ha = float(geom.area().divide(10000).getInfo())
@@ -220,11 +233,13 @@ def process_plot(plot_name):
         fetchone=True
     )
 
+    if not row:
+        print("❌ plot_id not found")
+        return
+
     plot_id = row["id"]
 
     run_today_analysis(plot_name, plot_data, plot_id)
-
-    task_queue.put((20, time.time(), f"backfill::{plot_name}"))
 
 # =====================================================
 # WORKER
@@ -252,7 +267,7 @@ def worker():
         task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER
+# DAILY SCHEDULER (FIXED)
 # =====================================================
 
 def daily_scheduler():
@@ -288,7 +303,8 @@ def daily_scheduler():
 
         for p in newly_added:
             if plot_dict[p].get("geometry"):
-                task_queue.put((1, time.time(), p))  # HIGH priority
+                task_queue.put((1, time.time(), p))
+                task_queue.put((2, time.time(), f"backfill::{p}"))  # ✅ only new
 
         for p in new_plot_names:
             if p in newly_added:
@@ -301,7 +317,7 @@ def daily_scheduler():
         time.sleep(86400)
 
 # =====================================================
-# TRIGGER (NO INPUT REQUIRED)
+# TRIGGER (FIXED)
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -331,6 +347,7 @@ async def trigger_new():
     for p in newly_added:
         if plot_dict[p].get("geometry"):
             task_queue.put((1, time.time(), p))
+            task_queue.put((2, time.time(), f"backfill::{p}"))  # ✅ only new
 
     print(f"🆕 Trigger detected {len(newly_added)} new plots")
 
