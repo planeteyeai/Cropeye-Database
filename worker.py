@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -89,18 +89,6 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
         conn.close()
 
 # =====================================================
-# HELPERS
-# =====================================================
-
-def extract_result(geojson_list):
-    if isinstance(geojson_list, dict):
-        geojson_list = [geojson_list]
-    for item in geojson_list or []:
-        if item and item.get("features"):
-            return item
-    return None
-
-# =====================================================
 # ANALYSIS
 # =====================================================
 
@@ -121,7 +109,6 @@ def run_today_analysis(plot_name, plot_data, plot_id):
 
     with semaphore:
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as ex:
-
             ex.submit(safe_analysis, run_growth_analysis_by_plot, "growth", plot_name, plot_data, start, end, plot_id)
             ex.submit(safe_analysis, run_water_uptake_analysis_by_plot, "water", plot_name, plot_data, start, end, plot_id)
             ex.submit(safe_analysis, run_soil_moisture_analysis_by_plot, "soil", plot_name, plot_data, start, end, plot_id)
@@ -190,6 +177,43 @@ def process_plot(plot_name):
         return
 
     plot_data = plot_dict[plot_name]
+    geom = plot_data.get("geometry")
+
+    if not geom:
+        print(f"⛔ No geometry: {plot_name}")
+        return
+
+    # ✅ UPSERT FIRST (fix for "Not in DB")
+    try:
+        geom_geojson = geom.getInfo()
+        area_ha = float(geom.area().divide(10000).getInfo())
+        props = plot_data.get("properties", {})
+    except Exception as e:
+        print(f"❌ Geometry error: {e}")
+        return
+
+    run_query(
+        """
+        INSERT INTO plots 
+        (plot_name, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (plot_name)
+        DO UPDATE SET
+            geojson = EXCLUDED.geojson,
+            area_hectares = EXCLUDED.area_hectares,
+            django_plot_id = EXCLUDED.django_plot_id,
+            plantation_date = EXCLUDED.plantation_date,
+            crop_type = EXCLUDED.crop_type
+        """,
+        (
+            plot_name,
+            Json(geom_geojson),
+            area_ha,
+            props.get("django_id"),
+            props.get("plantation_date"),
+            props.get("crop_type_name"),
+        )
+    )
 
     row = run_query(
         "SELECT id FROM plots WHERE plot_name=%s",
@@ -197,15 +221,10 @@ def process_plot(plot_name):
         fetchone=True
     )
 
-    if not row:
-        print(f"❌ Not in DB: {plot_name}")
-        return
-
     plot_id = row["id"]
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    # 🧠 Backfill LOW priority
     task_queue.put((20, time.time(), f"backfill::{plot_name}"))
 
 # =====================================================
@@ -234,7 +253,7 @@ def worker():
         task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER (FIXED)
+# DAILY SCHEDULER
 # =====================================================
 
 def daily_scheduler():
@@ -254,7 +273,6 @@ def daily_scheduler():
 
         new_plot_names = set(new_data.keys())
 
-        # ✅ DB-based detection
         existing_rows = run_query(
             "SELECT plot_name FROM plots",
             fetchall=True
@@ -269,12 +287,10 @@ def daily_scheduler():
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # 🔥 NEW plots
         for p in newly_added:
             if plot_dict[p].get("geometry"):
-                task_queue.put((1, time.time(), p))
+                task_queue.put((1, time.time(), p))  # HIGH priority
 
-        # ⚡ EXISTING plots
         for p in new_plot_names:
             if p in newly_added:
                 continue
@@ -286,25 +302,40 @@ def daily_scheduler():
         time.sleep(86400)
 
 # =====================================================
-# MANUAL TRIGGER
+# TRIGGER (NO INPUT REQUIRED)
 # =====================================================
 
 @app.post("/trigger-new-plot")
-async def trigger_new(request: Request):
+async def trigger_new():
 
-    body = await request.json()
-    plot_name = body.get("plot_name")
+    print("🚀 Manual trigger (AUTO DETECT NEW PLOTS)")
 
-    if not plot_name:
-        return {"status": "error", "message": "plot_name required"}
+    try:
+        new_data = plot_sync_service.get_plots_dict(force_refresh=True)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-    print(f"🚀 Manual trigger: {plot_name}")
+    new_plot_names = set(new_data.keys())
 
-    plot_dict.update(plot_sync_service.get_plots_dict(force_refresh=True))
+    existing_rows = run_query(
+        "SELECT plot_name FROM plots",
+        fetchall=True
+    ) or []
 
-    if plot_name not in plot_dict:
-        return {"status": "error", "message": "Plot not found"}
+    existing_plots = {row["plot_name"] for row in existing_rows}
 
-    task_queue.put((1, time.time(), plot_name))
+    newly_added = new_plot_names - existing_plots
 
-    return {"status": "queued", "plot": plot_name}
+    plot_dict.clear()
+    plot_dict.update(new_data)
+
+    for p in newly_added:
+        if plot_dict[p].get("geometry"):
+            task_queue.put((1, time.time(), p))
+
+    print(f"🆕 Trigger detected {len(newly_added)} new plots")
+
+    return {
+        "status": "queued",
+        "new_plots": len(newly_added)
+    }
