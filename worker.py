@@ -49,18 +49,11 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://cropeye.ai",
-        "http://localhost:3000",
-        "http://localhost:5173"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],  # 🔥 TEMPORARY FIX (important)
+    allow_credentials=False,  # must be False when using "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.options("/{full_path:path}")
-async def preflight_handler():
-    return {"status": "ok"}
 # =====================================================
 # DB
 # =====================================================
