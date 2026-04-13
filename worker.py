@@ -27,7 +27,6 @@ from shared_services import PlotSyncService
 
 plot_sync_service = PlotSyncService()
 plot_dict = {}
-SELECT plot_name FROM plots;
 
 task_queue = PriorityQueue()
 
@@ -100,27 +99,6 @@ def extract_result(geojson_list):
         if item and item.get("features"):
             return item
     return None
-
-def run_fresh_analysis(plot_name, plot_data):
-    end = date.today()
-    start = (end - timedelta(days=30)).isoformat()
-    end = end.isoformat()
-
-    results = {}
-    for name, fn in [
-        ("growth", run_growth_analysis_by_plot),
-        ("water", run_water_uptake_analysis_by_plot),
-        ("soil", run_soil_moisture_analysis_by_plot),
-        ("pest", run_pest_detection_analysis_by_plot),
-    ]:
-        try:
-            raw = fn(plot_name, plot_data, start, end)
-            results[name] = extract_result(raw)
-        except Exception as e:
-            print(f"⚠ {name} analysis failed: {e}", flush=True)
-            results[name] = None
-
-    return results
 
 # =====================================================
 # ANALYSIS
@@ -212,11 +190,6 @@ def process_plot(plot_name):
         return
 
     plot_data = plot_dict[plot_name]
-    geom = plot_data.get("geometry")
-
-    if not geom:
-        print(f"⛔ No geometry: {plot_name}")
-        return
 
     row = run_query(
         "SELECT id FROM plots WHERE plot_name=%s",
@@ -232,7 +205,7 @@ def process_plot(plot_name):
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    # 🧠 enqueue backfill (LOW PRIORITY)
+    # 🧠 Backfill LOW priority
     task_queue.put((20, time.time(), f"backfill::{plot_name}"))
 
 # =====================================================
@@ -252,9 +225,8 @@ def worker():
                     run_monthly_backfill_for_plot(plot_name, plot_dict[plot_name])
 
             else:
-                plot_name = item
-                print(f"⚙️ Worker picked: {plot_name}")
-                process_plot(plot_name)
+                print(f"⚙️ Worker picked: {item}")
+                process_plot(item)
 
         except Exception as e:
             print(f"🔥 Worker error: {e}", flush=True)
@@ -262,12 +234,12 @@ def worker():
         task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER (SMART)
+# DAILY SCHEDULER (FIXED)
 # =====================================================
 
 def daily_scheduler():
 
-    global plot_dict, known_plots
+    global plot_dict
 
     while True:
 
@@ -281,6 +253,8 @@ def daily_scheduler():
             continue
 
         new_plot_names = set(new_data.keys())
+
+        # ✅ DB-based detection
         existing_rows = run_query(
             "SELECT plot_name FROM plots",
             fetchall=True
@@ -289,31 +263,30 @@ def daily_scheduler():
         existing_plots = {row["plot_name"] for row in existing_rows}
 
         newly_added = new_plot_names - existing_plots
+
         print(f"🆕 New plots detected: {len(newly_added)}")
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # 🔥 NEW plots → HIGH PRIORITY
+        # 🔥 NEW plots
         for p in newly_added:
             if plot_dict[p].get("geometry"):
                 task_queue.put((1, time.time(), p))
 
-        # ⚡ EXISTING plots → NORMAL PRIORITY
+        # ⚡ EXISTING plots
         for p in new_plot_names:
             if p in newly_added:
                 continue
             if plot_dict[p].get("geometry"):
                 task_queue.put((10, time.time(), p))
 
-        known_plots = new_plot_names
-
         print("📦 Queue updated", flush=True)
 
         time.sleep(86400)
 
 # =====================================================
-# MANUAL TRIGGER (OPTIONAL BUT USEFUL)
+# MANUAL TRIGGER
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -332,7 +305,6 @@ async def trigger_new(request: Request):
     if plot_name not in plot_dict:
         return {"status": "error", "message": "Plot not found"}
 
-    # push HIGH priority
     task_queue.put((1, time.time(), plot_name))
 
     return {"status": "queued", "plot": plot_name}
