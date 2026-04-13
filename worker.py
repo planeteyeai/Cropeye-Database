@@ -58,7 +58,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+@app.options("/{full_path:path}")
+async def preflight_handler():
+    return {"status": "ok"}
 # =====================================================
 # DB
 # =====================================================
