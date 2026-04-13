@@ -27,7 +27,7 @@ from shared_services import PlotSyncService
 
 plot_sync_service = PlotSyncService()
 plot_dict = {}
-known_plots = set()
+SELECT plot_name FROM plots;
 
 task_queue = PriorityQueue()
 
@@ -281,8 +281,14 @@ def daily_scheduler():
             continue
 
         new_plot_names = set(new_data.keys())
-        newly_added = new_plot_names - known_plots
+        existing_rows = run_query(
+            "SELECT plot_name FROM plots",
+            fetchall=True
+        ) or []
 
+        existing_plots = {row["plot_name"] for row in existing_rows}
+
+        newly_added = new_plot_names - existing_plots
         print(f"🆕 New plots detected: {len(newly_added)}")
 
         plot_dict.clear()
