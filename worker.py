@@ -36,7 +36,6 @@ GLOBAL_LIMIT = 10
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
-# prevent duplicate execution
 active_tasks = set()
 active_lock = threading.Lock()
 
@@ -55,10 +54,7 @@ async def lifespan(app):
     threading.Thread(target=daily_scheduler, daemon=True).start()
 
     yield
-    
-    # 🔥 SHUTDOWN START
-    print("🛑 Shutting down workers...", flush=True)
-    is_shutting_down = True
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -136,6 +132,22 @@ def run_today_analysis(plot_name, plot_data, plot_id):
             ex.submit(safe_analysis, run_pest_detection_analysis_by_plot, "pest", plot_name, plot_data, start, end, plot_id)
 
 # =====================================================
+# BACKFILL CHECK
+# =====================================================
+
+def should_run_backfill(plot_id):
+    row = run_query(
+        """
+        SELECT 1 FROM analysis_results
+        WHERE plot_id=%s
+        LIMIT 1
+        """,
+        (plot_id,),
+        fetchone=True
+    )
+    return row is None  # no data → needs backfill
+
+# =====================================================
 # STORE RESULTS
 # =====================================================
 
@@ -190,7 +202,7 @@ def store_results(results, analysis_type, plot_id):
         )
 
 # =====================================================
-# PROCESS (KEY FIX HERE)
+# PROCESS
 # =====================================================
 
 def process_plot(plot_name):
@@ -248,11 +260,13 @@ def process_plot(plot_name):
 
     plot_id = row["id"]
 
-    # ✅ Step 1: today analysis
+    # ✅ STEP 1: DAILY
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    # ✅ Step 2: immediate backfill ONLY for this plot
-    task_queue.put((0, time.time(), f"backfill::{plot_name}"))
+    # ✅ STEP 2: INSTANT BACKFILL (ONLY IF NEEDED)
+    if should_run_backfill(plot_id):
+        print(f"⚡ Instant Backfill: {plot_name}", flush=True)
+        run_monthly_backfill_for_plot(plot_name, plot_data)
 
 # =====================================================
 # WORKER
@@ -269,15 +283,7 @@ def worker():
             active_tasks.add(item)
 
         try:
-            if isinstance(item, str) and item.startswith("backfill::"):
-                plot_name = item.split("::")[1]
-                print(f"🧠 Backfill: {plot_name}")
-
-                if plot_name in plot_dict:
-                    run_monthly_backfill_for_plot(plot_name, plot_dict[plot_name])
-            else:
-                process_plot(item)
-
+            process_plot(item)
         finally:
             with active_lock:
                 active_tasks.discard(item)
@@ -314,11 +320,10 @@ def daily_scheduler():
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # ✅ ONLY process plot (backfill handled inside process_plot)
+        # 🚀 ONLY PROCESS (backfill handled inside)
         for p in newly_added:
             task_queue.put((1, time.time(), p))
 
-        # existing plots
         for p in existing_plots:
             if p in plot_dict:
                 task_queue.put((10, time.time(), p))
@@ -351,13 +356,10 @@ async def trigger_new():
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        count = 0
-
         for p in newly_added:
             task_queue.put((1, time.time(), p))
-            count += 1
 
-        print(f"🆕 Trigger detected {count} new plots")
+        print(f"🆕 Trigger detected {len(newly_added)} new plots")
 
     threading.Thread(target=background, daemon=True).start()
 
