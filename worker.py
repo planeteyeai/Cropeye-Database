@@ -30,9 +30,6 @@ plot_dict = {}
 
 task_queue = PriorityQueue()
 
-# ✅ NEW: track processed plots (FIX)
-processed_plots = set()
-
 MAX_PARALLEL_ANALYSIS = 3
 GLOBAL_LIMIT = 4
 
@@ -158,7 +155,6 @@ def store_results(results, analysis_type, plot_id):
         tile_url, sensor_used = extract_metadata(geojson)
 
         if not analysis_date:
-            print("⚠ Skipping due to missing analysis_date", flush=True)
             continue
 
         final_type = f"{analysis_type}_{str(sensor).lower()}"
@@ -183,7 +179,7 @@ def store_results(results, analysis_type, plot_id):
 
 def process_plot(plot_name):
 
-    global plot_dict, processed_plots
+    global plot_dict
 
     print(f"🚀 Processing: {plot_name}", flush=True)
 
@@ -236,15 +232,11 @@ def process_plot(plot_name):
     )
 
     if not row:
-        print("❌ plot_id not found")
         return
 
     plot_id = row["id"]
 
     run_today_analysis(plot_name, plot_data, plot_id)
-
-    # ✅ mark processed (FIX)
-    processed_plots.add(plot_name)
 
 # =====================================================
 # WORKER
@@ -272,81 +264,34 @@ def worker():
         task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER (FIXED)
-# =====================================================
-
-def daily_scheduler():
-
-    global plot_dict, processed_plots
-
-    while True:
-
-        print("🕛 DAILY FETCH", flush=True)
-
-        try:
-            new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-        except Exception as e:
-            print("❌ Fetch failed:", e)
-            time.sleep(3600)
-            continue
-
-        new_plot_names = set(new_data.keys())
-
-        # ✅ FIX: use processed_plots instead of DB
-        newly_added = new_plot_names - processed_plots
-
-        print(f"🆕 New plots detected: {len(newly_added)}")
-
-        plot_dict.clear()
-        plot_dict.update(new_data)
-
-        for p in newly_added:
-            if plot_dict[p].get("geometry"):
-                task_queue.put((1, time.time(), p))
-                task_queue.put((2, time.time(), f"backfill::{p}"))
-
-        for p in new_plot_names:
-            if p in newly_added:
-                continue
-            if plot_dict[p].get("geometry"):
-                task_queue.put((10, time.time(), p))
-
-        print("📦 Queue updated", flush=True)
-
-        time.sleep(86400)
-
-# =====================================================
-# TRIGGER (FIXED)
+# TRIGGER (FINAL FIX)
 # =====================================================
 
 @app.post("/trigger-new-plot")
 async def trigger_new():
 
-    global processed_plots
+    print("🚀 Manual trigger")
 
-    print("🚀 Manual trigger (AUTO DETECT NEW PLOTS)")
-
-    try:
-        new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-    new_plot_names = set(new_data.keys())
-
-    # ✅ FIX: use processed_plots instead of DB
-    newly_added = new_plot_names - processed_plots
-
+    new_data = plot_sync_service.get_plots_dict(force_refresh=True)
     plot_dict.clear()
     plot_dict.update(new_data)
 
-    for p in newly_added:
-        if plot_dict[p].get("geometry"):
-            task_queue.put((1, time.time(), p))
-            task_queue.put((2, time.time(), f"backfill::{p}"))
+    count = 0
 
-    print(f"🆕 Trigger detected {len(newly_added)} new plots")
+    for p, pdata in new_data.items():
 
-    return {
-        "status": "queued",
-        "new_plots": len(newly_added)
-    }
+        exists = run_query(
+            "SELECT 1 FROM plots WHERE plot_name=%s",
+            (p,),
+            fetchone=True
+        )
+
+        if not exists and pdata.get("geometry"):
+            # ✅ Immediately insert → fixes delay issue
+            task_queue.put((0, time.time(), p))  # highest priority
+            task_queue.put((1, time.time(), f"backfill::{p}"))
+            count += 1
+
+    print(f"🆕 Trigger detected {count} new plots")
+
+    return {"status": "queued", "new_plots": count}
