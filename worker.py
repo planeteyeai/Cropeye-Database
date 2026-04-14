@@ -178,7 +178,6 @@ def store_results(results, analysis_type, plot_id):
 def process_plot(plot_name):
 
     if plot_name not in plot_dict:
-        print(f"❌ Not in memory: {plot_name}")
         return
 
     print(f"🚀 Processing: {plot_name}", flush=True)
@@ -196,14 +195,6 @@ def process_plot(plot_name):
     except Exception as e:
         print(f"❌ Geometry error: {e}")
         return
-
-    existing = run_query(
-        "SELECT id FROM plots WHERE plot_name=%s",
-        (plot_name,),
-        fetchone=True
-    )
-
-    is_new = existing is None
 
     run_query(
         """
@@ -236,10 +227,6 @@ def process_plot(plot_name):
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    if is_new:
-        print(f"⚡ Backfill NEW plot: {plot_name}", flush=True)
-        run_monthly_backfill_for_plot(plot_name, plot_data)
-
 # =====================================================
 # WORKER
 # =====================================================
@@ -252,8 +239,10 @@ def worker():
             if isinstance(item, str) and item.startswith("backfill::"):
                 plot_name = item.split("::")[1]
                 print(f"🧠 Backfill: {plot_name}")
+
                 if plot_name in plot_dict:
                     run_monthly_backfill_for_plot(plot_name, plot_dict[plot_name])
+
             else:
                 process_plot(item)
 
@@ -283,19 +272,7 @@ def daily_scheduler():
         time.sleep(86400)
 
 # =====================================================
-# CLEAR QUEUE
-# =====================================================
-
-def clear_queue():
-    while not task_queue.empty():
-        try:
-            task_queue.get_nowait()
-            task_queue.task_done()
-        except:
-            break
-
-# =====================================================
-# TRIGGER (FINAL PERFECT VERSION)
+# TRIGGER (FIXED)
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -306,10 +283,7 @@ async def trigger_new():
 
         print("🚀 Manual trigger")
 
-        # ✅ IMPORTANT: clear old queue
-        clear_queue()
-
-        max_attempts = 20  # ~1 min
+        max_attempts = 20
         found_new = set()
 
         for attempt in range(max_attempts):
