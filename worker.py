@@ -39,8 +39,9 @@ semaphore = threading.Semaphore(GLOBAL_LIMIT)
 active_tasks = set()
 active_lock = threading.Lock()
 
-# ✅ MEMORY TRACKING (FIX)
+# ✅ MEMORY TRACKING
 last_seen_plots = set()
+initialized = False   # 🔥 IMPORTANT FIX
 
 # =====================================================
 # FASTAPI
@@ -288,7 +289,7 @@ def worker():
 # =====================================================
 
 def daily_scheduler():
-    global plot_dict, last_seen_plots
+    global plot_dict, last_seen_plots, initialized
 
     while True:
 
@@ -297,7 +298,19 @@ def daily_scheduler():
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
         new_plot_names = set(new_data.keys())
 
-        # ✅ FIX: compare with memory, not DB
+        # 🔥 FIRST RUN FIX
+        if not initialized:
+            print("⚙ Initializing baseline (no plots treated as new)")
+            last_seen_plots = new_plot_names
+            initialized = True
+
+            plot_dict.clear()
+            plot_dict.update(new_data)
+
+            time.sleep(86400)
+            continue
+
+        # ✅ NORMAL LOGIC
         newly_added = new_plot_names - last_seen_plots
 
         print(f"🆕 New plots: {len(newly_added)}")
@@ -323,12 +336,18 @@ def daily_scheduler():
 async def trigger_new():
 
     def background():
-        global plot_dict, last_seen_plots
+        global plot_dict, last_seen_plots, initialized
 
         print("🚀 Manual trigger")
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
         new_plot_names = set(new_data.keys())
+
+        if not initialized:
+            print("⚙ Initializing baseline (trigger)")
+            last_seen_plots = new_plot_names
+            initialized = True
+            return
 
         newly_added = new_plot_names - last_seen_plots
 
