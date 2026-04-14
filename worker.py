@@ -283,7 +283,7 @@ async def trigger_new():
 
         print("🚀 Manual trigger")
 
-        max_attempts = 20
+        max_attempts = 60
         found_new = set()
 
         for attempt in range(max_attempts):
