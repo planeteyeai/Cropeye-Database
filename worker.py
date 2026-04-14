@@ -134,21 +134,8 @@ def run_today_analysis(plot_name, plot_data, plot_id):
             futures.append(ex.submit(safe_analysis, run_soil_moisture_analysis_by_plot, "soil", plot_name, plot_data, start, end, plot_id))
             futures.append(ex.submit(safe_analysis, run_pest_detection_analysis_by_plot, "pest", plot_name, plot_data, start, end, plot_id))
 
-            # ✅ WAIT for ALL to finish
             for f in as_completed(futures):
                 pass
-
-# =====================================================
-# BACKFILL CHECK
-# =====================================================
-
-def should_run_backfill(plot_id):
-    row = run_query(
-        "SELECT 1 FROM analysis_results WHERE plot_id=%s LIMIT 1",
-        (plot_id,),
-        fetchone=True
-    )
-    return row is None
 
 # =====================================================
 # STORE
@@ -208,9 +195,9 @@ def store_results(results, analysis_type, plot_id):
 # PROCESS
 # =====================================================
 
-def process_plot(plot_name):
+def process_plot(plot_name, is_new=False):
 
-    print(f"🚀 Processing: {plot_name}", flush=True)
+    print(f"🚀 Processing: {plot_name} | new={is_new}", flush=True)
 
     if plot_name not in plot_dict:
         return
@@ -229,6 +216,7 @@ def process_plot(plot_name):
         print(f"❌ Geometry error: {e}")
         return
 
+    # INSERT AFTER detection (safe now)
     run_query(
         """
         INSERT INTO plots
@@ -263,11 +251,10 @@ def process_plot(plot_name):
 
     plot_id = row["id"]
 
-    # ✅ STEP 1: DAILY (WAITS NOW)
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    # ✅ STEP 2: INSTANT BACKFILL
-    if should_run_backfill(plot_id):
+    # ✅ ONLY for new plots
+    if is_new:
         print(f"⚡ Instant Backfill: {plot_name}", flush=True)
         run_monthly_backfill_for_plot(plot_name, plot_data)
 
@@ -279,17 +266,19 @@ def worker():
     while True:
         priority, timestamp, item = task_queue.get()
 
+        plot_name, is_new = item
+
         with active_lock:
-            if item in active_tasks:
+            if plot_name in active_tasks:
                 task_queue.task_done()
                 continue
-            active_tasks.add(item)
+            active_tasks.add(plot_name)
 
         try:
-            process_plot(item)
+            process_plot(plot_name, is_new)
         finally:
             with active_lock:
-                active_tasks.discard(item)
+                active_tasks.discard(plot_name)
 
             task_queue.task_done()
 
@@ -306,7 +295,6 @@ def daily_scheduler():
         print("🕛 DAILY FETCH", flush=True)
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-
         new_plot_names = set(new_data.keys())
 
         existing_rows = run_query(
@@ -323,12 +311,14 @@ def daily_scheduler():
         plot_dict.clear()
         plot_dict.update(new_data)
 
+        # ✅ NEW plots
         for p in newly_added:
-            task_queue.put((1, time.time(), p))
+            task_queue.put((1, time.time(), (p, True)))
 
+        # ✅ EXISTING plots
         for p in existing_plots:
             if p in plot_dict:
-                task_queue.put((10, time.time(), p))
+                task_queue.put((10, time.time(), (p, False)))
 
         time.sleep(86400)
 
@@ -343,7 +333,6 @@ async def trigger_new():
         print("🚀 Manual trigger")
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-
         new_plot_names = set(new_data.keys())
 
         existing_rows = run_query(
@@ -359,7 +348,7 @@ async def trigger_new():
         plot_dict.update(new_data)
 
         for p in newly_added:
-            task_queue.put((1, time.time(), p))
+            task_queue.put((1, time.time(), (p, True)))
 
         print(f"🆕 Trigger detected {len(newly_added)} new plots")
 
