@@ -39,10 +39,6 @@ semaphore = threading.Semaphore(GLOBAL_LIMIT)
 active_tasks = set()
 active_lock = threading.Lock()
 
-# ✅ MEMORY
-last_seen_plots = set()
-initialized = False   # 🔥 IMPORTANT FIX
-
 # =====================================================
 # FASTAPI
 # =====================================================
@@ -220,6 +216,15 @@ def process_plot(plot_name, is_new=False):
         print(f"❌ Geometry error: {e}")
         return
 
+    # 🔥 CHECK BEFORE INSERT (CRITICAL FIX)
+    existing = run_query(
+        "SELECT id FROM plots WHERE plot_name=%s",
+        (plot_name,),
+        fetchone=True
+    )
+
+    is_new_plot = existing is None
+
     run_query(
         """
         INSERT INTO plots
@@ -256,7 +261,8 @@ def process_plot(plot_name, is_new=False):
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    if is_new:
+    # ✅ ONLY TRUE NEW (DB-based)
+    if is_new_plot:
         print(f"⚡ Instant Backfill: {plot_name}", flush=True)
         run_monthly_backfill_for_plot(plot_name, plot_data)
 
@@ -268,7 +274,7 @@ def worker():
     while True:
         priority, timestamp, item = task_queue.get()
 
-        plot_name, is_new = item
+        plot_name, _ = item  # ignore passed is_new
 
         with active_lock:
             if plot_name in active_tasks:
@@ -277,7 +283,7 @@ def worker():
             active_tasks.add(plot_name)
 
         try:
-            process_plot(plot_name, is_new)
+            process_plot(plot_name)
         finally:
             with active_lock:
                 active_tasks.discard(plot_name)
@@ -285,46 +291,24 @@ def worker():
             task_queue.task_done()
 
 # =====================================================
-# SCHEDULER (FINAL FIX)
+# SCHEDULER
 # =====================================================
 
 def daily_scheduler():
-    global plot_dict, last_seen_plots, initialized
+
+    global plot_dict
 
     while True:
 
         print("🕛 DAILY FETCH", flush=True)
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-        new_plot_names = set(new_data.keys())
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # ✅ FIRST RUN
-        if not initialized:
-            print("⚙ First run → processing all plots as EXISTING", flush=True)
-
-            for p in new_plot_names:
-                task_queue.put((10, time.time(), (p, False)))
-
-            last_seen_plots = new_plot_names
-            initialized = True
-
-        else:
-            newly_added = new_plot_names - last_seen_plots
-
-            print(f"🆕 New plots: {len(newly_added)}", flush=True)
-
-            # ✅ NEW plots
-            for p in newly_added:
-                task_queue.put((1, time.time(), (p, True)))
-
-            # ✅ EXISTING plots
-            for p in new_plot_names - newly_added:
-                task_queue.put((10, time.time(), (p, False)))
-
-            last_seen_plots = new_plot_names
+        for p in new_data.keys():
+            task_queue.put((10, time.time(), (p, False)))
 
         time.sleep(86400)
 
@@ -336,30 +320,15 @@ def daily_scheduler():
 async def trigger_new():
 
     def background():
-        global plot_dict, last_seen_plots, initialized
-
         print("🚀 Manual trigger")
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-        new_plot_names = set(new_data.keys())
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        if not initialized:
-            print("⚙ First trigger → no new detection", flush=True)
-            last_seen_plots = new_plot_names
-            initialized = True
-            return
-
-        newly_added = new_plot_names - last_seen_plots
-
-        print(f"🆕 Trigger detected {len(newly_added)} new plots", flush=True)
-
-        for p in newly_added:
-            task_queue.put((1, time.time(), (p, True)))
-
-        last_seen_plots = new_plot_names
+        for p in new_data.keys():
+            task_queue.put((1, time.time(), (p, False)))
 
     threading.Thread(target=background, daemon=True).start()
 
