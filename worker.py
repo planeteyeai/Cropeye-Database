@@ -119,7 +119,6 @@ def safe_analysis(fn, name, plot_name, plot_data, start, end, plot_id):
 
 
 def run_today_analysis(plot_name, plot_data, plot_id):
-
     end = date.today()
     start = (end - timedelta(days=30)).isoformat()
     end = end.isoformat()
@@ -141,21 +140,11 @@ def run_today_analysis(plot_name, plot_data, plot_id):
 # STORE
 # =====================================================
 
-def extract_metadata(geojson):
-    try:
-        props = geojson["features"][0]["properties"]
-        return props.get("tile_url"), props.get("sensor_used")
-    except:
-        return None, None
-
-
 def store_results(results, analysis_type, plot_id):
-
     if isinstance(results, dict):
         results = [results]
 
     for geojson in results:
-
         features = geojson.get("features")
         if not features:
             continue
@@ -168,39 +157,30 @@ def store_results(results, analysis_type, plot_id):
             or props.get("analysis_dates", {}).get("latest_image_date")
         )
 
-        sensor = props.get("sensor_used") or "unknown"
-
-        tile_url, sensor_used = extract_metadata(geojson)
-
         if not analysis_date:
             continue
-
-        final_type = f"{analysis_type}_{str(sensor).lower()}"
 
         run_query(
             """
             INSERT INTO analysis_results
-            (plot_id, analysis_type, analysis_date, response_json, tile_url, sensor_used)
-            VALUES (%s,%s,%s,%s,%s,%s)
+            (plot_id, analysis_type, analysis_date, response_json)
+            VALUES (%s,%s,%s,%s)
             ON CONFLICT (plot_id, analysis_type, analysis_date)
-            DO UPDATE SET
-                response_json = EXCLUDED.response_json,
-                tile_url = EXCLUDED.tile_url,
-                sensor_used = EXCLUDED.sensor_used
+            DO UPDATE SET response_json = EXCLUDED.response_json
             """,
-            (plot_id, final_type, analysis_date, Json(geojson), tile_url, sensor_used)
+            (plot_id, analysis_type, analysis_date, Json(geojson))
         )
 
 # =====================================================
 # PROCESS
 # =====================================================
 
-def process_plot(plot_name, is_new=False):
-
-    print(f"🚀 Processing: {plot_name} | new={is_new}", flush=True)
+def process_plot(plot_name):
 
     if plot_name not in plot_dict:
         return
+
+    print(f"🚀 Processing: {plot_name}", flush=True)
 
     plot_data = plot_dict[plot_name]
     geom = plot_data.get("geometry")
@@ -216,14 +196,13 @@ def process_plot(plot_name, is_new=False):
         print(f"❌ Geometry error: {e}")
         return
 
-    # 🔥 CHECK BEFORE INSERT (CRITICAL FIX)
     existing = run_query(
         "SELECT id FROM plots WHERE plot_name=%s",
         (plot_name,),
         fetchone=True
     )
 
-    is_new_plot = existing is None
+    is_new = existing is None
 
     run_query(
         """
@@ -231,12 +210,7 @@ def process_plot(plot_name, is_new=False):
         (plot_name, geojson, area_hectares, django_plot_id, plantation_date, crop_type)
         VALUES (%s,%s,%s,%s,%s,%s)
         ON CONFLICT (plot_name)
-        DO UPDATE SET
-            geojson = EXCLUDED.geojson,
-            area_hectares = EXCLUDED.area_hectares,
-            django_plot_id = EXCLUDED.django_plot_id,
-            plantation_date = EXCLUDED.plantation_date,
-            crop_type = EXCLUDED.crop_type
+        DO UPDATE SET geojson = EXCLUDED.geojson
         """,
         (
             plot_name,
@@ -261,9 +235,8 @@ def process_plot(plot_name, is_new=False):
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    # ✅ ONLY TRUE NEW (DB-based)
-    if is_new_plot:
-        print(f"⚡ Instant Backfill: {plot_name}", flush=True)
+    if is_new:
+        print(f"⚡ Backfill NEW plot: {plot_name}", flush=True)
         run_monthly_backfill_for_plot(plot_name, plot_data)
 
 # =====================================================
@@ -272,9 +245,7 @@ def process_plot(plot_name, is_new=False):
 
 def worker():
     while True:
-        priority, timestamp, item = task_queue.get()
-
-        plot_name, _ = item  # ignore passed is_new
+        _, _, plot_name = task_queue.get()
 
         with active_lock:
             if plot_name in active_tasks:
@@ -287,48 +258,59 @@ def worker():
         finally:
             with active_lock:
                 active_tasks.discard(plot_name)
-
             task_queue.task_done()
 
 # =====================================================
-# SCHEDULER
+# SCHEDULER (ALL PLOTS DAILY)
 # =====================================================
 
 def daily_scheduler():
-
     global plot_dict
 
     while True:
-
         print("🕛 DAILY FETCH", flush=True)
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-
         plot_dict.clear()
         plot_dict.update(new_data)
 
         for p in new_data.keys():
-            task_queue.put((10, time.time(), (p, False)))
+            task_queue.put((10, time.time(), p))
 
         time.sleep(86400)
 
 # =====================================================
-# TRIGGER
+# TRIGGER (ONLY NEW PLOTS)
 # =====================================================
 
 @app.post("/trigger-new-plot")
 async def trigger_new():
 
     def background():
+        global plot_dict
+
         print("🚀 Manual trigger")
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
+        new_plot_names = set(new_data.keys())
+
+        existing_rows = run_query(
+            "SELECT plot_name FROM plots",
+            fetchall=True
+        ) or []
+
+        existing_plots = {row["plot_name"] for row in existing_rows}
+
+        # ✅ ONLY NEW
+        new_plots = new_plot_names - existing_plots
+
+        print(f"🆕 New plots detected: {len(new_plots)}", flush=True)
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        for p in new_data.keys():
-            task_queue.put((1, time.time(), (p, False)))
+        for p in new_plots:
+            task_queue.put((1, time.time(), p))
 
     threading.Thread(target=background, daemon=True).start()
 
