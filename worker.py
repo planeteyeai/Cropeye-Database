@@ -55,6 +55,10 @@ async def lifespan(app):
     threading.Thread(target=daily_scheduler, daemon=True).start()
 
     yield
+    
+    # 🔥 SHUTDOWN START
+    print("🛑 Shutting down workers...", flush=True)
+    is_shutting_down = True
 
 app = FastAPI(lifespan=lifespan)
 
