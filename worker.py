@@ -30,12 +30,16 @@ plot_dict = {}
 
 task_queue = PriorityQueue()
 
-# 🔥 TUNED PERFORMANCE SETTINGS
-WORKER_COUNT = 5              # 👈 number of queue workers
-MAX_PARALLEL_ANALYSIS = 5     # 👈 threads per plot
-GLOBAL_LIMIT = 8              # 👈 total concurrent plots
+# 🔥 PERFORMANCE SETTINGS
+WORKER_COUNT = 6
+MAX_PARALLEL_ANALYSIS = 5
+GLOBAL_LIMIT = 10
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
+
+# ✅ PREVENT DUPLICATES
+active_tasks = set()
+active_lock = threading.Lock()
 
 # =====================================================
 # FASTAPI
@@ -45,7 +49,6 @@ semaphore = threading.Semaphore(GLOBAL_LIMIT)
 async def lifespan(app):
     print("🚀 Starting workers + scheduler", flush=True)
 
-    # 🔥 MULTIPLE WORKERS
     for i in range(WORKER_COUNT):
         threading.Thread(target=worker, daemon=True).start()
         print(f"👷 Worker-{i+1} started")
@@ -247,12 +250,18 @@ def process_plot(plot_name):
     run_today_analysis(plot_name, plot_data, plot_id)
 
 # =====================================================
-# WORKER
+# WORKER (DEDUP FIX)
 # =====================================================
 
 def worker():
     while True:
         priority, timestamp, item = task_queue.get()
+
+        with active_lock:
+            if item in active_tasks:
+                task_queue.task_done()
+                continue
+            active_tasks.add(item)
 
         try:
             if isinstance(item, str) and item.startswith("backfill::"):
@@ -268,10 +277,14 @@ def worker():
         except Exception as e:
             print(f"🔥 Worker error: {e}", flush=True)
 
-        task_queue.task_done()
+        finally:
+            with active_lock:
+                active_tasks.discard(item)
+
+            task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER (PRIORITY FIXED)
+# DAILY SCHEDULER
 # =====================================================
 
 def daily_scheduler():
@@ -305,13 +318,13 @@ def daily_scheduler():
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # 🔥 PRIORITY 1 → NEW plots
+        # 🚀 NEW plots → instant
         for p in newly_added:
             if plot_dict[p].get("geometry"):
                 task_queue.put((1, time.time(), p))
                 task_queue.put((2, time.time(), f"backfill::{p}"))
 
-        # 🔥 PRIORITY 2 → EXISTING plots
+        # 📅 existing plots
         for p in existing_plots:
             if p in plot_dict and plot_dict[p].get("geometry"):
                 task_queue.put((10, time.time(), p))
