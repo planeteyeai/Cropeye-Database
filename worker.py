@@ -39,6 +39,9 @@ semaphore = threading.Semaphore(GLOBAL_LIMIT)
 active_tasks = set()
 active_lock = threading.Lock()
 
+# ✅ MEMORY TRACKING (FIX)
+last_seen_plots = set()
+
 # =====================================================
 # FASTAPI
 # =====================================================
@@ -134,7 +137,7 @@ def run_today_analysis(plot_name, plot_data, plot_id):
             futures.append(ex.submit(safe_analysis, run_soil_moisture_analysis_by_plot, "soil", plot_name, plot_data, start, end, plot_id))
             futures.append(ex.submit(safe_analysis, run_pest_detection_analysis_by_plot, "pest", plot_name, plot_data, start, end, plot_id))
 
-            for f in as_completed(futures):
+            for _ in as_completed(futures):
                 pass
 
 # =====================================================
@@ -216,7 +219,6 @@ def process_plot(plot_name, is_new=False):
         print(f"❌ Geometry error: {e}")
         return
 
-    # INSERT AFTER detection (safe now)
     run_query(
         """
         INSERT INTO plots
@@ -253,7 +255,6 @@ def process_plot(plot_name, is_new=False):
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    # ✅ ONLY for new plots
     if is_new:
         print(f"⚡ Instant Backfill: {plot_name}", flush=True)
         run_monthly_backfill_for_plot(plot_name, plot_data)
@@ -287,8 +288,7 @@ def worker():
 # =====================================================
 
 def daily_scheduler():
-
-    global plot_dict
+    global plot_dict, last_seen_plots
 
     while True:
 
@@ -297,28 +297,21 @@ def daily_scheduler():
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
         new_plot_names = set(new_data.keys())
 
-        existing_rows = run_query(
-            "SELECT plot_name FROM plots",
-            fetchall=True
-        ) or []
-
-        existing_plots = {row["plot_name"] for row in existing_rows}
-
-        newly_added = new_plot_names - existing_plots
+        # ✅ FIX: compare with memory, not DB
+        newly_added = new_plot_names - last_seen_plots
 
         print(f"🆕 New plots: {len(newly_added)}")
+
+        last_seen_plots = new_plot_names
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # ✅ NEW plots
         for p in newly_added:
             task_queue.put((1, time.time(), (p, True)))
 
-        # ✅ EXISTING plots
-        for p in existing_plots:
-            if p in plot_dict:
-                task_queue.put((10, time.time(), (p, False)))
+        for p in new_plot_names - newly_added:
+            task_queue.put((10, time.time(), (p, False)))
 
         time.sleep(86400)
 
@@ -330,27 +323,24 @@ def daily_scheduler():
 async def trigger_new():
 
     def background():
+        global plot_dict, last_seen_plots
+
         print("🚀 Manual trigger")
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
         new_plot_names = set(new_data.keys())
 
-        existing_rows = run_query(
-            "SELECT plot_name FROM plots",
-            fetchall=True
-        ) or []
+        newly_added = new_plot_names - last_seen_plots
 
-        existing_plots = {row["plot_name"] for row in existing_rows}
+        print(f"🆕 Trigger detected {len(newly_added)} new plots")
 
-        newly_added = new_plot_names - existing_plots
+        last_seen_plots = new_plot_names
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
         for p in newly_added:
             task_queue.put((1, time.time(), (p, True)))
-
-        print(f"🆕 Trigger detected {len(newly_added)} new plots")
 
     threading.Thread(target=background, daemon=True).start()
 
