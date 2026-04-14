@@ -30,22 +30,20 @@ plot_dict = {}
 
 task_queue = PriorityQueue()
 
-MAX_PARALLEL_ANALYSIS = 4
+MAX_PARALLEL_ANALYSIS = 3
 GLOBAL_LIMIT = 4
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
 # =====================================================
-# FASTAPI LIFESPAN
+# FASTAPI
 # =====================================================
 
 @asynccontextmanager
 async def lifespan(app):
     print("🚀 Starting worker + scheduler", flush=True)
-
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=daily_scheduler, daemon=True).start()
-
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -63,7 +61,6 @@ app.add_middleware(
 # =====================================================
 
 def run_query(query, params=None, fetchone=False, fetchall=False):
-
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -97,10 +94,8 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
 # =====================================================
 
 def safe_analysis(fn, name, plot_name, plot_data, start, end, plot_id):
-
     try:
         print(f"🔎 Running {name} for {plot_name}", flush=True)
-
         result = fn(plot_name, plot_data, start, end)
 
         if result:
@@ -120,7 +115,6 @@ def run_today_analysis(plot_name, plot_data, plot_id):
 
     with semaphore:
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as ex:
-
             ex.submit(safe_analysis, run_growth_analysis_by_plot, "growth", plot_name, plot_data, start, end, plot_id)
             ex.submit(safe_analysis, run_water_uptake_analysis_by_plot, "water", plot_name, plot_data, start, end, plot_id)
             ex.submit(safe_analysis, run_soil_moisture_analysis_by_plot, "soil", plot_name, plot_data, start, end, plot_id)
@@ -157,11 +151,12 @@ def store_results(results, analysis_type, plot_id):
             or props.get("analysis_dates", {}).get("latest_image_date")
         )
 
+        sensor = props.get("sensor_used") or "unknown"
+
+        tile_url, sensor_used = extract_metadata(geojson)
+
         if not analysis_date:
             continue
-
-        sensor = props.get("sensor_used") or "unknown"
-        tile_url, sensor_used = extract_metadata(geojson)
 
         final_type = f"{analysis_type}_{str(sensor).lower()}"
 
@@ -249,24 +244,18 @@ def process_plot(plot_name):
 # =====================================================
 
 def worker():
-
     while True:
-
         priority, timestamp, item = task_queue.get()
 
         try:
-
             if isinstance(item, str) and item.startswith("backfill::"):
-
                 plot_name = item.split("::")[1]
-
                 print(f"🧠 Backfill: {plot_name}")
 
                 if plot_name in plot_dict:
                     run_monthly_backfill_for_plot(plot_name, plot_dict[plot_name])
 
             else:
-
                 print(f"⚙️ Worker picked: {item}")
                 process_plot(item)
 
@@ -276,7 +265,7 @@ def worker():
         task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER (SAFE)
+# DAILY SCHEDULER (CORRECT PRIORITY)
 # =====================================================
 
 def daily_scheduler():
@@ -285,30 +274,48 @@ def daily_scheduler():
 
     while True:
 
-        print("🕛 DAILY ANALYSIS START", flush=True)
+        print("🕛 DAILY FETCH", flush=True)
 
         try:
             new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-
-            plot_dict.clear()
-            plot_dict.update(new_data)
-
-            count = 0
-
-            for p, pdata in new_data.items():
-                if pdata.get("geometry"):
-                    task_queue.put((20, time.time(), p))  # LOW priority
-                    count += 1
-
-            print(f"📅 Daily queued plots: {count}", flush=True)
-
         except Exception as e:
-            print(f"❌ Daily scheduler error: {e}", flush=True)
+            print("❌ Fetch failed:", e)
+            time.sleep(3600)
+            continue
+
+        new_plot_names = set(new_data.keys())
+
+        existing_rows = run_query(
+            "SELECT plot_name FROM plots",
+            fetchall=True
+        ) or []
+
+        existing_plots = {row["plot_name"] for row in existing_rows}
+
+        newly_added = new_plot_names - existing_plots
+
+        print(f"🆕 New plots: {len(newly_added)}")
+
+        plot_dict.clear()
+        plot_dict.update(new_data)
+
+        # ✅ PRIORITY 1 → NEW plots
+        for p in newly_added:
+            if plot_dict[p].get("geometry"):
+                task_queue.put((1, time.time(), p))
+                task_queue.put((2, time.time(), f"backfill::{p}"))
+
+        # ✅ PRIORITY 2 → EXISTING plots (daily)
+        for p in existing_plots:
+            if p in plot_dict and plot_dict[p].get("geometry"):
+                task_queue.put((10, time.time(), p))
+
+        print("📦 Queue updated (priority applied)", flush=True)
 
         time.sleep(86400)
 
 # =====================================================
-# TRIGGER (NEW PLOTS ONLY)
+# TRIGGER
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -333,8 +340,8 @@ async def trigger_new():
 
         if not exists and pdata.get("geometry"):
 
-            task_queue.put((0, time.time(), p))  # highest priority
-            task_queue.put((1, time.time(), f"backfill::{p}"))
+            task_queue.put((1, time.time(), p))  # highest
+            task_queue.put((2, time.time(), f"backfill::{p}"))
 
             count += 1
 
