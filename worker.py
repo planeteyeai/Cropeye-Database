@@ -50,12 +50,27 @@ seen_plots = set()
 
 @asynccontextmanager
 async def lifespan(app):
+    global seen_plots, plot_dict
+
     print("🚀 Starting workers + scheduler", flush=True)
 
+    # 🔥 INITIAL LOAD (CRITICAL FIX)
+    try:
+        initial_data = plot_sync_service.get_plots_dict(force_refresh=True)
+        plot_dict.update(initial_data)
+        seen_plots.update(initial_data.keys())
+
+        print(f"✅ Initial plots loaded: {len(seen_plots)}")
+
+    except Exception as e:
+        print("❌ Initial load failed:", e)
+
+    # 🔥 START WORKERS
     for i in range(WORKER_COUNT):
         threading.Thread(target=worker, daemon=True).start()
         print(f"👷 Worker-{i+1} started")
 
+    # 🔥 START SCHEDULER
     threading.Thread(target=daily_scheduler, daemon=True).start()
 
     yield
