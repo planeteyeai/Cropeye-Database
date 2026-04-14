@@ -30,7 +30,7 @@ plot_dict = {}
 
 task_queue = PriorityQueue()
 
-MAX_PARALLEL_ANALYSIS = 3
+MAX_PARALLEL_ANALYSIS = 4
 GLOBAL_LIMIT = 4
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
