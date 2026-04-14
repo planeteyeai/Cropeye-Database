@@ -30,19 +30,15 @@ plot_dict = {}
 
 task_queue = PriorityQueue()
 
-# 🔥 PERFORMANCE SETTINGS
 WORKER_COUNT = 6
 MAX_PARALLEL_ANALYSIS = 5
 GLOBAL_LIMIT = 10
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
-# ✅ PREVENT DUPLICATES (RUNNING TASKS)
+# prevent duplicate execution
 active_tasks = set()
 active_lock = threading.Lock()
-
-# ✅ TRACK NEW PLOTS IN MEMORY (KEY FIX)
-seen_plots = set()
 
 # =====================================================
 # FASTAPI
@@ -50,27 +46,12 @@ seen_plots = set()
 
 @asynccontextmanager
 async def lifespan(app):
-    global seen_plots, plot_dict
-
     print("🚀 Starting workers + scheduler", flush=True)
 
-    # 🔥 INITIAL LOAD (CRITICAL FIX)
-    try:
-        initial_data = plot_sync_service.get_plots_dict(force_refresh=True)
-        plot_dict.update(initial_data)
-        seen_plots.update(initial_data.keys())
-
-        print(f"✅ Initial plots loaded: {len(seen_plots)}")
-
-    except Exception as e:
-        print("❌ Initial load failed:", e)
-
-    # 🔥 START WORKERS
     for i in range(WORKER_COUNT):
         threading.Thread(target=worker, daemon=True).start()
         print(f"👷 Worker-{i+1} started")
 
-    # 🔥 START SCHEDULER
     threading.Thread(target=daily_scheduler, daemon=True).start()
 
     yield
@@ -210,8 +191,6 @@ def store_results(results, analysis_type, plot_id):
 
 def process_plot(plot_name):
 
-    global plot_dict
-
     print(f"🚀 Processing: {plot_name}", flush=True)
 
     if plot_name not in plot_dict:
@@ -263,9 +242,7 @@ def process_plot(plot_name):
     if not row:
         return
 
-    plot_id = row["id"]
-
-    run_today_analysis(plot_name, plot_data, plot_id)
+    run_today_analysis(plot_name, plot_data, row["id"])
 
 # =====================================================
 # WORKER
@@ -288,12 +265,8 @@ def worker():
 
                 if plot_name in plot_dict:
                     run_monthly_backfill_for_plot(plot_name, plot_dict[plot_name])
-
             else:
                 process_plot(item)
-
-        except Exception as e:
-            print(f"🔥 Worker error: {e}", flush=True)
 
         finally:
             with active_lock:
@@ -302,90 +275,80 @@ def worker():
             task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER (FIXED)
+# DAILY SCHEDULER (DB BASED)
 # =====================================================
 
 def daily_scheduler():
 
-    global plot_dict, seen_plots
+    global plot_dict
 
     while True:
 
         print("🕛 DAILY FETCH", flush=True)
 
-        try:
-            new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-        except Exception as e:
-            print("❌ Fetch failed:", e)
-            time.sleep(3600)
-            continue
+        new_data = plot_sync_service.get_plots_dict(force_refresh=True)
 
         new_plot_names = set(new_data.keys())
 
-        # ✅ MEMORY-BASED NEW DETECTION
-        newly_added = new_plot_names - seen_plots
+        existing_rows = run_query(
+            "SELECT plot_name FROM plots",
+            fetchall=True
+        ) or []
 
-        print(f"🆕 New plots detected: {len(newly_added)}")
+        existing_plots = {row["plot_name"] for row in existing_rows}
+
+        newly_added = new_plot_names - existing_plots
+
+        print(f"🆕 New plots: {len(newly_added)}")
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        seen_plots.update(new_plot_names)
-
-        # 🚀 NEW plots
         for p in newly_added:
-            if plot_dict[p].get("geometry"):
-                task_queue.put((1, time.time(), p))
-                task_queue.put((2, time.time(), f"backfill::{p}"))
+            task_queue.put((1, time.time(), p))
+            task_queue.put((2, time.time(), f"backfill::{p}"))
 
-        # 📅 EXISTING plots
-        for p in new_plot_names - newly_added:
-            if plot_dict[p].get("geometry"):
+        for p in existing_plots:
+            if p in plot_dict:
                 task_queue.put((10, time.time(), p))
-
-        print("📦 Queue updated", flush=True)
 
         time.sleep(86400)
 
 # =====================================================
-# TRIGGER (FAST FIX)
+# TRIGGER (ASYNC + DB BASED)
 # =====================================================
 
 @app.post("/trigger-new-plot")
 async def trigger_new():
 
-    print("🚀 Manual trigger")
+    def background():
+        print("🚀 Manual trigger")
 
-    def background_job():
-        global plot_dict, seen_plots
-
-        try:
-            new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-        except Exception as e:
-            print("❌ Trigger fetch failed:", e)
-            return
+        new_data = plot_sync_service.get_plots_dict(force_refresh=True)
 
         new_plot_names = set(new_data.keys())
-        newly_added = new_plot_names - seen_plots
+
+        existing_rows = run_query(
+            "SELECT plot_name FROM plots",
+            fetchall=True
+        ) or []
+
+        existing_plots = {row["plot_name"] for row in existing_rows}
+
+        newly_added = new_plot_names - existing_plots
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        seen_plots.update(new_plot_names)
-
         count = 0
 
         for p in newly_added:
-            if plot_dict[p].get("geometry"):
-                task_queue.put((1, time.time(), p))
-                task_queue.put((2, time.time(), f"backfill::{p}"))
-                count += 1
+            task_queue.put((1, time.time(), p))
+            task_queue.put((2, time.time(), f"backfill::{p}"))
+            count += 1
 
         print(f"🆕 Trigger detected {count} new plots")
 
-    threading.Thread(target=background_job, daemon=True).start()
+    threading.Thread(target=background, daemon=True).start()
 
-    return {
-        "status": "processing",
-        "message": "Trigger started in background"
-    }
+    return {"status": "started"}
