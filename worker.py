@@ -178,6 +178,7 @@ def store_results(results, analysis_type, plot_id):
 def process_plot(plot_name):
 
     if plot_name not in plot_dict:
+        print(f"❌ Not in memory: {plot_name}")
         return
 
     print(f"🚀 Processing: {plot_name}", flush=True)
@@ -245,23 +246,24 @@ def process_plot(plot_name):
 
 def worker():
     while True:
-        _, _, plot_name = task_queue.get()
-
-        with active_lock:
-            if plot_name in active_tasks:
-                task_queue.task_done()
-                continue
-            active_tasks.add(plot_name)
+        priority, timestamp, item = task_queue.get()
 
         try:
-            process_plot(plot_name)
-        finally:
-            with active_lock:
-                active_tasks.discard(plot_name)
-            task_queue.task_done()
+            if isinstance(item, str) and item.startswith("backfill::"):
+                plot_name = item.split("::")[1]
+                print(f"🧠 Backfill: {plot_name}")
+                if plot_name in plot_dict:
+                    run_monthly_backfill_for_plot(plot_name, plot_dict[plot_name])
+            else:
+                process_plot(item)
+
+        except Exception as e:
+            print(f"🔥 Worker error: {e}", flush=True)
+
+        task_queue.task_done()
 
 # =====================================================
-# SCHEDULER (ALL PLOTS DAILY)
+# DAILY SCHEDULER
 # =====================================================
 
 def daily_scheduler():
@@ -271,6 +273,7 @@ def daily_scheduler():
         print("🕛 DAILY FETCH", flush=True)
 
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
+
         plot_dict.clear()
         plot_dict.update(new_data)
 
@@ -279,15 +282,22 @@ def daily_scheduler():
 
         time.sleep(86400)
 
+# =====================================================
+# CLEAR QUEUE
+# =====================================================
+
 def clear_queue():
-    global task_queue
     while not task_queue.empty():
         try:
             task_queue.get_nowait()
             task_queue.task_done()
         except:
             break
-            
+
+# =====================================================
+# TRIGGER (FINAL PERFECT VERSION)
+# =====================================================
+
 @app.post("/trigger-new-plot")
 async def trigger_new():
 
@@ -296,16 +306,15 @@ async def trigger_new():
 
         print("🚀 Manual trigger")
 
-        # ✅ clear old tasks (CRITICAL FIX)
+        # ✅ IMPORTANT: clear old queue
         clear_queue()
 
-        max_attempts = 20   # 20 * 3 sec = ~60 sec
-        attempt = 0
+        max_attempts = 20  # ~1 min
         found_new = set()
 
-        while attempt < max_attempts:
+        for attempt in range(max_attempts):
 
-            print(f"🔄 Attempt {attempt+1} to fetch new plots...", flush=True)
+            print(f"🔄 Attempt {attempt+1}", flush=True)
 
             new_data = plot_sync_service.get_plots_dict(force_refresh=True)
             new_plot_names = set(new_data.keys())
@@ -320,20 +329,19 @@ async def trigger_new():
             new_plots = new_plot_names - existing_plots
 
             if new_plots:
-                print(f"✅ Found new plots: {len(new_plots)}", flush=True)
                 found_new = new_plots
                 plot_dict.clear()
                 plot_dict.update(new_data)
                 break
 
-            attempt += 1
             time.sleep(3)
 
         if not found_new:
-            print("❌ No new plots found after retries", flush=True)
+            print("❌ No new plots found", flush=True)
             return
 
-        # ✅ enqueue ONLY new plots
+        print(f"✅ Found new plots: {len(found_new)}", flush=True)
+
         for p in found_new:
             task_queue.put((1, time.time(), p))
             task_queue.put((2, time.time(), f"backfill::{p}"))
