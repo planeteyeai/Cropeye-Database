@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import date, timedelta
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import PriorityQueue
 
 from psycopg2.extras import RealDictCursor, Json
@@ -124,12 +124,19 @@ def run_today_analysis(plot_name, plot_data, plot_id):
     start = (end - timedelta(days=30)).isoformat()
     end = end.isoformat()
 
+    futures = []
+
     with semaphore:
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ANALYSIS) as ex:
-            ex.submit(safe_analysis, run_growth_analysis_by_plot, "growth", plot_name, plot_data, start, end, plot_id)
-            ex.submit(safe_analysis, run_water_uptake_analysis_by_plot, "water", plot_name, plot_data, start, end, plot_id)
-            ex.submit(safe_analysis, run_soil_moisture_analysis_by_plot, "soil", plot_name, plot_data, start, end, plot_id)
-            ex.submit(safe_analysis, run_pest_detection_analysis_by_plot, "pest", plot_name, plot_data, start, end, plot_id)
+
+            futures.append(ex.submit(safe_analysis, run_growth_analysis_by_plot, "growth", plot_name, plot_data, start, end, plot_id))
+            futures.append(ex.submit(safe_analysis, run_water_uptake_analysis_by_plot, "water", plot_name, plot_data, start, end, plot_id))
+            futures.append(ex.submit(safe_analysis, run_soil_moisture_analysis_by_plot, "soil", plot_name, plot_data, start, end, plot_id))
+            futures.append(ex.submit(safe_analysis, run_pest_detection_analysis_by_plot, "pest", plot_name, plot_data, start, end, plot_id))
+
+            # ✅ WAIT for ALL to finish
+            for f in as_completed(futures):
+                pass
 
 # =====================================================
 # BACKFILL CHECK
@@ -137,18 +144,14 @@ def run_today_analysis(plot_name, plot_data, plot_id):
 
 def should_run_backfill(plot_id):
     row = run_query(
-        """
-        SELECT 1 FROM analysis_results
-        WHERE plot_id=%s
-        LIMIT 1
-        """,
+        "SELECT 1 FROM analysis_results WHERE plot_id=%s LIMIT 1",
         (plot_id,),
         fetchone=True
     )
-    return row is None  # no data → needs backfill
+    return row is None
 
 # =====================================================
-# STORE RESULTS
+# STORE
 # =====================================================
 
 def extract_metadata(geojson):
@@ -260,10 +263,10 @@ def process_plot(plot_name):
 
     plot_id = row["id"]
 
-    # ✅ STEP 1: DAILY
+    # ✅ STEP 1: DAILY (WAITS NOW)
     run_today_analysis(plot_name, plot_data, plot_id)
 
-    # ✅ STEP 2: INSTANT BACKFILL (ONLY IF NEEDED)
+    # ✅ STEP 2: INSTANT BACKFILL
     if should_run_backfill(plot_id):
         print(f"⚡ Instant Backfill: {plot_name}", flush=True)
         run_monthly_backfill_for_plot(plot_name, plot_data)
@@ -291,7 +294,7 @@ def worker():
             task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER
+# SCHEDULER
 # =====================================================
 
 def daily_scheduler():
@@ -320,7 +323,6 @@ def daily_scheduler():
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # 🚀 ONLY PROCESS (backfill handled inside)
         for p in newly_added:
             task_queue.put((1, time.time(), p))
 
