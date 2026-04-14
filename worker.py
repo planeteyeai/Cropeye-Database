@@ -30,6 +30,9 @@ plot_dict = {}
 
 task_queue = PriorityQueue()
 
+# ✅ NEW: track processed plots (FIX)
+processed_plots = set()
+
 MAX_PARALLEL_ANALYSIS = 3
 GLOBAL_LIMIT = 4
 
@@ -49,7 +52,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -120,7 +123,7 @@ def run_today_analysis(plot_name, plot_data, plot_id):
             ex.submit(safe_analysis, run_pest_detection_analysis_by_plot, "pest", plot_name, plot_data, start, end, plot_id)
 
 # =====================================================
-# STORE RESULTS (FIXED)
+# STORE RESULTS
 # =====================================================
 
 def extract_metadata(geojson):
@@ -144,7 +147,6 @@ def store_results(results, analysis_type, plot_id):
 
         props = features[0]["properties"]
 
-        # ✅ FIX: handle all cases (growth + water + soil + pest)
         analysis_date = (
             props.get("analysis_image_date")
             or props.get("latest_image_date")
@@ -181,7 +183,7 @@ def store_results(results, analysis_type, plot_id):
 
 def process_plot(plot_name):
 
-    global plot_dict
+    global plot_dict, processed_plots
 
     print(f"🚀 Processing: {plot_name}", flush=True)
 
@@ -241,6 +243,9 @@ def process_plot(plot_name):
 
     run_today_analysis(plot_name, plot_data, plot_id)
 
+    # ✅ mark processed (FIX)
+    processed_plots.add(plot_name)
+
 # =====================================================
 # WORKER
 # =====================================================
@@ -272,7 +277,7 @@ def worker():
 
 def daily_scheduler():
 
-    global plot_dict
+    global plot_dict, processed_plots
 
     while True:
 
@@ -287,14 +292,8 @@ def daily_scheduler():
 
         new_plot_names = set(new_data.keys())
 
-        existing_rows = run_query(
-            "SELECT plot_name FROM plots",
-            fetchall=True
-        ) or []
-
-        existing_plots = {row["plot_name"] for row in existing_rows}
-
-        newly_added = new_plot_names - existing_plots
+        # ✅ FIX: use processed_plots instead of DB
+        newly_added = new_plot_names - processed_plots
 
         print(f"🆕 New plots detected: {len(newly_added)}")
 
@@ -304,7 +303,7 @@ def daily_scheduler():
         for p in newly_added:
             if plot_dict[p].get("geometry"):
                 task_queue.put((1, time.time(), p))
-                task_queue.put((2, time.time(), f"backfill::{p}"))  # ✅ only new
+                task_queue.put((2, time.time(), f"backfill::{p}"))
 
         for p in new_plot_names:
             if p in newly_added:
@@ -323,6 +322,8 @@ def daily_scheduler():
 @app.post("/trigger-new-plot")
 async def trigger_new():
 
+    global processed_plots
+
     print("🚀 Manual trigger (AUTO DETECT NEW PLOTS)")
 
     try:
@@ -332,14 +333,8 @@ async def trigger_new():
 
     new_plot_names = set(new_data.keys())
 
-    existing_rows = run_query(
-        "SELECT plot_name FROM plots",
-        fetchall=True
-    ) or []
-
-    existing_plots = {row["plot_name"] for row in existing_rows}
-
-    newly_added = new_plot_names - existing_plots
+    # ✅ FIX: use processed_plots instead of DB
+    newly_added = new_plot_names - processed_plots
 
     plot_dict.clear()
     plot_dict.update(new_data)
@@ -347,7 +342,7 @@ async def trigger_new():
     for p in newly_added:
         if plot_dict[p].get("geometry"):
             task_queue.put((1, time.time(), p))
-            task_queue.put((2, time.time(), f"backfill::{p}"))  # ✅ only new
+            task_queue.put((2, time.time(), f"backfill::{p}"))
 
     print(f"🆕 Trigger detected {len(newly_added)} new plots")
 
