@@ -279,10 +279,15 @@ def daily_scheduler():
 
         time.sleep(86400)
 
-# =====================================================
-# TRIGGER (ONLY NEW PLOTS)
-# =====================================================
-
+def clear_queue():
+    global task_queue
+    while not task_queue.empty():
+        try:
+            task_queue.get_nowait()
+            task_queue.task_done()
+        except:
+            break
+            
 @app.post("/trigger-new-plot")
 async def trigger_new():
 
@@ -291,26 +296,49 @@ async def trigger_new():
 
         print("🚀 Manual trigger")
 
-        new_data = plot_sync_service.get_plots_dict(force_refresh=True)
-        new_plot_names = set(new_data.keys())
+        # ✅ clear old tasks (CRITICAL FIX)
+        clear_queue()
 
-        existing_rows = run_query(
-            "SELECT plot_name FROM plots",
-            fetchall=True
-        ) or []
+        max_attempts = 20   # 20 * 3 sec = ~60 sec
+        attempt = 0
+        found_new = set()
 
-        existing_plots = {row["plot_name"] for row in existing_rows}
+        while attempt < max_attempts:
 
-        # ✅ ONLY NEW
-        new_plots = new_plot_names - existing_plots
+            print(f"🔄 Attempt {attempt+1} to fetch new plots...", flush=True)
 
-        print(f"🆕 New plots detected: {len(new_plots)}", flush=True)
+            new_data = plot_sync_service.get_plots_dict(force_refresh=True)
+            new_plot_names = set(new_data.keys())
 
-        plot_dict.clear()
-        plot_dict.update(new_data)
+            existing_rows = run_query(
+                "SELECT plot_name FROM plots",
+                fetchall=True
+            ) or []
 
-        for p in new_plots:
+            existing_plots = {row["plot_name"] for row in existing_rows}
+
+            new_plots = new_plot_names - existing_plots
+
+            if new_plots:
+                print(f"✅ Found new plots: {len(new_plots)}", flush=True)
+                found_new = new_plots
+                plot_dict.clear()
+                plot_dict.update(new_data)
+                break
+
+            attempt += 1
+            time.sleep(3)
+
+        if not found_new:
+            print("❌ No new plots found after retries", flush=True)
+            return
+
+        # ✅ enqueue ONLY new plots
+        for p in found_new:
             task_queue.put((1, time.time(), p))
+            task_queue.put((2, time.time(), f"backfill::{p}"))
+
+        print(f"🚀 Queued {len(found_new)} new plots", flush=True)
 
     threading.Thread(target=background, daemon=True).start()
 
