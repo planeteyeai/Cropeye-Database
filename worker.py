@@ -30,8 +30,10 @@ plot_dict = {}
 
 task_queue = PriorityQueue()
 
-MAX_PARALLEL_ANALYSIS = 3
-GLOBAL_LIMIT = 4
+# 🔥 TUNED PERFORMANCE SETTINGS
+WORKER_COUNT = 5              # 👈 number of queue workers
+MAX_PARALLEL_ANALYSIS = 5     # 👈 threads per plot
+GLOBAL_LIMIT = 8              # 👈 total concurrent plots
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
@@ -41,9 +43,15 @@ semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
 @asynccontextmanager
 async def lifespan(app):
-    print("🚀 Starting worker + scheduler", flush=True)
-    threading.Thread(target=worker, daemon=True).start()
+    print("🚀 Starting workers + scheduler", flush=True)
+
+    # 🔥 MULTIPLE WORKERS
+    for i in range(WORKER_COUNT):
+        threading.Thread(target=worker, daemon=True).start()
+        print(f"👷 Worker-{i+1} started")
+
     threading.Thread(target=daily_scheduler, daemon=True).start()
+
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -95,7 +103,8 @@ def run_query(query, params=None, fetchone=False, fetchall=False):
 
 def safe_analysis(fn, name, plot_name, plot_data, start, end, plot_id):
     try:
-        print(f"🔎 Running {name} for {plot_name}", flush=True)
+        print(f"🔎 {name} → {plot_name}", flush=True)
+
         result = fn(plot_name, plot_data, start, end)
 
         if result:
@@ -185,14 +194,12 @@ def process_plot(plot_name):
     print(f"🚀 Processing: {plot_name}", flush=True)
 
     if plot_name not in plot_dict:
-        print(f"❌ Not in memory: {plot_name}")
         return
 
     plot_data = plot_dict[plot_name]
     geom = plot_data.get("geometry")
 
     if not geom:
-        print(f"⛔ No geometry: {plot_name}")
         return
 
     try:
@@ -256,7 +263,6 @@ def worker():
                     run_monthly_backfill_for_plot(plot_name, plot_dict[plot_name])
 
             else:
-                print(f"⚙️ Worker picked: {item}")
                 process_plot(item)
 
         except Exception as e:
@@ -265,7 +271,7 @@ def worker():
         task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER (CORRECT PRIORITY)
+# DAILY SCHEDULER (PRIORITY FIXED)
 # =====================================================
 
 def daily_scheduler():
@@ -299,18 +305,18 @@ def daily_scheduler():
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # ✅ PRIORITY 1 → NEW plots
+        # 🔥 PRIORITY 1 → NEW plots
         for p in newly_added:
             if plot_dict[p].get("geometry"):
                 task_queue.put((1, time.time(), p))
                 task_queue.put((2, time.time(), f"backfill::{p}"))
 
-        # ✅ PRIORITY 2 → EXISTING plots (daily)
+        # 🔥 PRIORITY 2 → EXISTING plots
         for p in existing_plots:
             if p in plot_dict and plot_dict[p].get("geometry"):
                 task_queue.put((10, time.time(), p))
 
-        print("📦 Queue updated (priority applied)", flush=True)
+        print("📦 Queue updated", flush=True)
 
         time.sleep(86400)
 
@@ -340,7 +346,7 @@ async def trigger_new():
 
         if not exists and pdata.get("geometry"):
 
-            task_queue.put((1, time.time(), p))  # highest
+            task_queue.put((1, time.time(), p))
             task_queue.put((2, time.time(), f"backfill::{p}"))
 
             count += 1
