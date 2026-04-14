@@ -37,9 +37,12 @@ GLOBAL_LIMIT = 10
 
 semaphore = threading.Semaphore(GLOBAL_LIMIT)
 
-# ✅ PREVENT DUPLICATES
+# ✅ PREVENT DUPLICATES (RUNNING TASKS)
 active_tasks = set()
 active_lock = threading.Lock()
+
+# ✅ TRACK NEW PLOTS IN MEMORY (KEY FIX)
+seen_plots = set()
 
 # =====================================================
 # FASTAPI
@@ -250,7 +253,7 @@ def process_plot(plot_name):
     run_today_analysis(plot_name, plot_data, plot_id)
 
 # =====================================================
-# WORKER (DEDUP FIX)
+# WORKER
 # =====================================================
 
 def worker():
@@ -284,12 +287,12 @@ def worker():
             task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER
+# DAILY SCHEDULER (FIXED)
 # =====================================================
 
 def daily_scheduler():
 
-    global plot_dict
+    global plot_dict, seen_plots
 
     while True:
 
@@ -304,29 +307,25 @@ def daily_scheduler():
 
         new_plot_names = set(new_data.keys())
 
-        existing_rows = run_query(
-            "SELECT plot_name FROM plots",
-            fetchall=True
-        ) or []
+        # ✅ MEMORY-BASED NEW DETECTION
+        newly_added = new_plot_names - seen_plots
 
-        existing_plots = {row["plot_name"] for row in existing_rows}
-
-        newly_added = new_plot_names - existing_plots
-
-        print(f"🆕 New plots: {len(newly_added)}")
+        print(f"🆕 New plots detected: {len(newly_added)}")
 
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        # 🚀 NEW plots → instant
+        seen_plots.update(new_plot_names)
+
+        # 🚀 NEW plots
         for p in newly_added:
             if plot_dict[p].get("geometry"):
                 task_queue.put((1, time.time(), p))
                 task_queue.put((2, time.time(), f"backfill::{p}"))
 
-        # 📅 existing plots
-        for p in existing_plots:
-            if p in plot_dict and plot_dict[p].get("geometry"):
+        # 📅 EXISTING plots
+        for p in new_plot_names - newly_added:
+            if plot_dict[p].get("geometry"):
                 task_queue.put((10, time.time(), p))
 
         print("📦 Queue updated", flush=True)
@@ -334,7 +333,7 @@ def daily_scheduler():
         time.sleep(86400)
 
 # =====================================================
-# TRIGGER
+# TRIGGER (FAST FIX)
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -342,31 +341,36 @@ async def trigger_new():
 
     print("🚀 Manual trigger")
 
-    new_data = plot_sync_service.get_plots_dict(force_refresh=True)
+    def background_job():
+        global plot_dict, seen_plots
 
-    plot_dict.clear()
-    plot_dict.update(new_data)
+        try:
+            new_data = plot_sync_service.get_plots_dict(force_refresh=True)
+        except Exception as e:
+            print("❌ Trigger fetch failed:", e)
+            return
 
-    count = 0
+        new_plot_names = set(new_data.keys())
+        newly_added = new_plot_names - seen_plots
 
-    for p, pdata in new_data.items():
+        plot_dict.clear()
+        plot_dict.update(new_data)
 
-        exists = run_query(
-            "SELECT 1 FROM plots WHERE plot_name=%s",
-            (p,),
-            fetchone=True
-        )
+        seen_plots.update(new_plot_names)
 
-        if not exists and pdata.get("geometry"):
+        count = 0
 
-            task_queue.put((1, time.time(), p))
-            task_queue.put((2, time.time(), f"backfill::{p}"))
+        for p in newly_added:
+            if plot_dict[p].get("geometry"):
+                task_queue.put((1, time.time(), p))
+                task_queue.put((2, time.time(), f"backfill::{p}"))
+                count += 1
 
-            count += 1
+        print(f"🆕 Trigger detected {count} new plots")
 
-    print(f"🆕 Trigger detected {count} new plots")
+    threading.Thread(target=background_job, daemon=True).start()
 
     return {
-        "status": "queued",
-        "new_plots": count
+        "status": "processing",
+        "message": "Trigger started in background"
     }
