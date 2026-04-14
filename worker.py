@@ -39,7 +39,7 @@ semaphore = threading.Semaphore(GLOBAL_LIMIT)
 active_tasks = set()
 active_lock = threading.Lock()
 
-# ✅ MEMORY TRACKING
+# ✅ MEMORY
 last_seen_plots = set()
 initialized = False   # 🔥 IMPORTANT FIX
 
@@ -285,7 +285,7 @@ def worker():
             task_queue.task_done()
 
 # =====================================================
-# SCHEDULER
+# SCHEDULER (FINAL FIX)
 # =====================================================
 
 def daily_scheduler():
@@ -298,33 +298,33 @@ def daily_scheduler():
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
         new_plot_names = set(new_data.keys())
 
-        # 🔥 FIRST RUN FIX
-        if not initialized:
-            print("⚙ Initializing baseline (no plots treated as new)")
-            last_seen_plots = new_plot_names
-            initialized = True
-
-            plot_dict.clear()
-            plot_dict.update(new_data)
-
-            time.sleep(86400)
-            continue
-
-        # ✅ NORMAL LOGIC
-        newly_added = new_plot_names - last_seen_plots
-
-        print(f"🆕 New plots: {len(newly_added)}")
-
-        last_seen_plots = new_plot_names
-
         plot_dict.clear()
         plot_dict.update(new_data)
 
-        for p in newly_added:
-            task_queue.put((1, time.time(), (p, True)))
+        # ✅ FIRST RUN
+        if not initialized:
+            print("⚙ First run → processing all plots as EXISTING", flush=True)
 
-        for p in new_plot_names - newly_added:
-            task_queue.put((10, time.time(), (p, False)))
+            for p in new_plot_names:
+                task_queue.put((10, time.time(), (p, False)))
+
+            last_seen_plots = new_plot_names
+            initialized = True
+
+        else:
+            newly_added = new_plot_names - last_seen_plots
+
+            print(f"🆕 New plots: {len(newly_added)}", flush=True)
+
+            # ✅ NEW plots
+            for p in newly_added:
+                task_queue.put((1, time.time(), (p, True)))
+
+            # ✅ EXISTING plots
+            for p in new_plot_names - newly_added:
+                task_queue.put((10, time.time(), (p, False)))
+
+            last_seen_plots = new_plot_names
 
         time.sleep(86400)
 
@@ -343,23 +343,23 @@ async def trigger_new():
         new_data = plot_sync_service.get_plots_dict(force_refresh=True)
         new_plot_names = set(new_data.keys())
 
+        plot_dict.clear()
+        plot_dict.update(new_data)
+
         if not initialized:
-            print("⚙ Initializing baseline (trigger)")
+            print("⚙ First trigger → no new detection", flush=True)
             last_seen_plots = new_plot_names
             initialized = True
             return
 
         newly_added = new_plot_names - last_seen_plots
 
-        print(f"🆕 Trigger detected {len(newly_added)} new plots")
-
-        last_seen_plots = new_plot_names
-
-        plot_dict.clear()
-        plot_dict.update(new_data)
+        print(f"🆕 Trigger detected {len(newly_added)} new plots", flush=True)
 
         for p in newly_added:
             task_queue.put((1, time.time(), (p, True)))
+
+        last_seen_plots = new_plot_names
 
     threading.Thread(target=background, daemon=True).start()
 
