@@ -186,7 +186,7 @@ def store_results(results, analysis_type, plot_id):
         )
 
 # =====================================================
-# PROCESS
+# PROCESS (KEY FIX HERE)
 # =====================================================
 
 def process_plot(plot_name):
@@ -242,7 +242,13 @@ def process_plot(plot_name):
     if not row:
         return
 
-    run_today_analysis(plot_name, plot_data, row["id"])
+    plot_id = row["id"]
+
+    # ✅ Step 1: today analysis
+    run_today_analysis(plot_name, plot_data, plot_id)
+
+    # ✅ Step 2: immediate backfill ONLY for this plot
+    task_queue.put((0, time.time(), f"backfill::{plot_name}"))
 
 # =====================================================
 # WORKER
@@ -275,7 +281,7 @@ def worker():
             task_queue.task_done()
 
 # =====================================================
-# DAILY SCHEDULER (DB BASED)
+# DAILY SCHEDULER
 # =====================================================
 
 def daily_scheduler():
@@ -304,10 +310,11 @@ def daily_scheduler():
         plot_dict.clear()
         plot_dict.update(new_data)
 
+        # ✅ ONLY process plot (backfill handled inside process_plot)
         for p in newly_added:
             task_queue.put((1, time.time(), p))
-            task_queue.put((2, time.time(), f"backfill::{p}"))
 
+        # existing plots
         for p in existing_plots:
             if p in plot_dict:
                 task_queue.put((10, time.time(), p))
@@ -315,7 +322,7 @@ def daily_scheduler():
         time.sleep(86400)
 
 # =====================================================
-# TRIGGER (ASYNC + DB BASED)
+# TRIGGER
 # =====================================================
 
 @app.post("/trigger-new-plot")
@@ -344,7 +351,6 @@ async def trigger_new():
 
         for p in newly_added:
             task_queue.put((1, time.time(), p))
-            task_queue.put((2, time.time(), f"backfill::{p}"))
             count += 1
 
         print(f"🆕 Trigger detected {count} new plots")
