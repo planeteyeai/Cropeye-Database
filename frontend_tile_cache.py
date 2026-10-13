@@ -26,6 +26,7 @@ from psycopg2.extras import Json, RealDictCursor
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
+
 from db import get_connection
 from s3_tiles import (
     S3_TILE_UPLOAD_ENABLED,
