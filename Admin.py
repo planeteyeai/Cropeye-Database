@@ -29,6 +29,15 @@ from dateutil.relativedelta import relativedelta
 from psycopg2.extras import RealDictCursor
 import calendar
 from psycopg2.extras import Json
+from s3_tiles import month_half_windows
+from shared_scene import list_s2_dates
+from ee_utils import sleep_between_windows
+from frontend_tile_cache import (
+    cache_frontend_tiles_for_plot,
+    cache_frontend_tiles_all_plots,
+    get_bulk_tile_cache_status,
+    request_stop_bulk_tile_cache,
+)
 # Initialize Earth Engine - move this to the top
 
 service_account_info = json.loads(os.environ["EE_SERVICE_ACCOUNT_JSON"])
@@ -819,7 +828,11 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
         return
 
     plot = run_query(
-        "SELECT id FROM plots WHERE django_plot_id=%s",
+        """
+        SELECT id, crop_type
+        FROM plots
+        WHERE django_plot_id=%s
+        """,
         (django_id,),
         fetchone=True
     )
@@ -830,35 +843,80 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
 
     plot_id = plot["id"]
 
+    # Ensure crop type is available for pest detection
+    props = plot_data.setdefault("properties", {})
+    if not (
+        props.get("crop_type_name")
+        or props.get("crop_type")
+        or props.get("crop")
+    ):
+        if plot.get("crop_type"):
+            props["crop_type_name"] = plot["crop_type"]
+            print(
+                f"ℹ Using DB crop_type '{plot['crop_type']}' for {plot_name}",
+                flush=True,
+            )
+
     today = date.today().replace(day=1)
 
+    plantation_day = None
     if plantation_date:
-
-        plantation_month = (
-            datetime.strptime(plantation_date, "%Y-%m-%d")
-            .date()
-            .replace(day=1)
-        )
-
-        stop_month = plantation_month
-
+        try:
+            plantation_day = datetime.strptime(
+                str(plantation_date)[:10], "%Y-%m-%d"
+            ).date()
+            stop_month = plantation_day.replace(day=1)
+            oldest_allowed = today - relativedelta(months=35)
+            if stop_month < oldest_allowed:
+                print(
+                    f"ℹ Plantation {plantation_day} older than 36 months "
+                    f"— capping monthly backfill at {oldest_allowed}",
+                    flush=True,
+                )
+                stop_month = oldest_allowed
+            print(
+                f"ℹ Analysis starts from plantation date {plantation_day}",
+                flush=True,
+            )
+        except Exception:
+            print("⚠ Invalid plantation date → last 10 months")
+            stop_month = today - relativedelta(months=10)
     else:
-
         print("⚠ Plantation date missing → last 10 months")
         stop_month = today - relativedelta(months=10)
 
     current_month = today
 
+    analyses = [
+        ("growth", run_growth_analysis_by_plot),
+        ("water_uptake", run_water_uptake_analysis_by_plot),
+        ("soil_moisture", run_soil_moisture_analysis_by_plot),
+        ("pest_detection", run_pest_detection_analysis_by_plot),
+    ]
+
     while current_month >= stop_month:
 
-        next_month = current_month + relativedelta(months=1)
+        halves = month_half_windows(current_month.year, current_month.month)
+        print(
+            f"\n🛰 Processing {current_month.isoformat()} "
+            f"(halves: {halves[0][0]}→{halves[0][1]}, {halves[1][0]}→{halves[1][1]})"
+        )
 
-        month_start = current_month.isoformat()
-        month_end = next_month.isoformat()
+        def process_analysis(analysis_type, func, half_start, half_end):
 
-        print(f"\n🛰 Processing {month_start} → {month_end}")
+            start_d = date.fromisoformat(half_start)
+            end_d = date.fromisoformat(half_end)
 
-        def process_analysis(analysis_type, func):
+            # Never analyze before plantation date
+            if plantation_day:
+                if end_d <= plantation_day:
+                    print(
+                        f"⏭ Skip {analysis_type} {half_start}→{half_end} "
+                        f"(before plantation {plantation_day})"
+                    )
+                    return
+                if start_d < plantation_day:
+                    half_start = plantation_day.isoformat()
 
             existing = run_query(
                 """
@@ -870,26 +928,29 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                 AND analysis_date < %s
                 LIMIT 1
                 """,
-                (plot_id, analysis_type, month_start, month_end),
+                (plot_id, analysis_type, half_start, half_end),
                 fetchone=True
             )
 
-            if existing:
-                print(f"✔ {analysis_type} already exists")
+            if existing and analysis_type != "pest_detection":
+                print(f"✔ {analysis_type} already exists for {half_start}→{half_end}")
                 return
 
-            print(f"🔎 Running {analysis_type}")
+            print(f"🔎 Running {analysis_type} for {half_start}→{half_end}")
 
             try:
 
                 results = func(
                     plot_name=plot_name,
                     plot_data=plot_data,
-                    start_date=month_start,
-                    end_date=month_end
+                    start_date=half_start,
+                    end_date=half_end,
+                    plot_id=plot_id,
+                    prefer_s2=True,
                 )
 
                 if not results:
+                    print(f"⚠ No imagery for {analysis_type} {half_start}→{half_end}")
                     return
 
                 if isinstance(results, dict):
@@ -918,24 +979,38 @@ def run_monthly_backfill_for_plot(plot_name, plot_data):
                     if not analysis_date:
                         continue
 
+                    # Skip satellite dates before plantation
+                    if plantation_day and str(analysis_date)[:10] < plantation_day.isoformat():
+                        print(
+                            f"⏭ Skip {analysis_type} {analysis_date} "
+                            f"(before plantation {plantation_day})"
+                        )
+                        continue
+
+                    # Keep response_json tile_url in sync with stored column
+                    props["tile_url"] = tile_url
+
                     run_query(
                         """
                         INSERT INTO analysis_results
                         (plot_id,analysis_type,analysis_date,sensor_used,tile_url,response_json)
                         VALUES (%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (plot_id,analysis_type,analysis_date) DO NOTHING
+                        ON CONFLICT (plot_id,analysis_type,analysis_date)
+                        DO UPDATE SET
+                            sensor_used = EXCLUDED.sensor_used,
+                            tile_url = EXCLUDED.tile_url,
+                            response_json = EXCLUDED.response_json
                         """,
                         (plot_id, analysis_type, analysis_date, sensor, tile_url, Json(geojson))
                     )
-                    print(f"   ✅ Stored {analysis_type} {analysis_date}")
+                    print(f"   ✅ Stored {analysis_type} {analysis_date} ({sensor})")
 
             except Exception as e:
                 print(f"🔥 {analysis_type} failed {e}")
 
-        process_analysis("growth", run_growth_analysis_by_plot)
-        process_analysis("water_uptake", run_water_uptake_analysis_by_plot)
-        process_analysis("soil_moisture", run_soil_moisture_analysis_by_plot)
-        process_analysis("pest_detection", run_pest_detection_analysis_by_plot)
+        for half_start, half_end in halves:
+            for analysis_type, func in analyses:
+                process_analysis(analysis_type, func, half_start, half_end)
 
         current_month = current_month - relativedelta(months=1)
 
@@ -970,16 +1045,16 @@ def fetch_analysis(plot_name, analysis_type, end_date):
 
     if end_date:
 
-        dt = datetime.strptime(end_date, "%Y-%m-%d")
+        exact_res = run_query(
+            query + " AND analysis_date = %s LIMIT 1",
+            tuple(params + [end_date]),
+            fetchone=True,
+        )
+        if exact_res:
+            return exact_res["response_json"]
 
-        start_month = dt.replace(day=1)
-        last_day = calendar.monthrange(dt.year, dt.month)[1]
-        end_month = dt.replace(day=last_day)
-
-        query += " AND analysis_date >= %s AND analysis_date <= %s"
-
-        params.append(start_month.date().isoformat())
-        params.append(end_month.date().isoformat())
+        query += " AND analysis_date <= %s"
+        params.append(end_date)
 
     query += " ORDER BY analysis_date DESC LIMIT 1"
 
@@ -1015,6 +1090,639 @@ async def analyze_pest(plot_name: str = Query(...), end_date: str | None = Query
     return fetch_analysis(plot_name, "pest_detection", end_date)
 
 
+def _parse_plantation_day(raw):
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def rebackfill_pest_for_plot(
+    plot_name: str,
+    months: int | None = None,
+    force: bool = False,
+) -> dict:
+    """
+    Fill pest_detection dates from plantation → today (max 36 months).
+
+    Resume mode (force=False, default):
+      - Does NOT wipe existing pest rows
+      - Skips half-month windows that already have pest_detection data
+      - Only computes missing windows (safe to stop and restart)
+
+    Force mode (force=True):
+      - Deletes all pest rows for the plot, then rebuilds everything
+    """
+    if plot_name not in plot_dict:
+        raise HTTPException(status_code=404, detail=f"Plot not found: {plot_name}")
+
+    plot = run_query(
+        "SELECT id, plantation_date, crop_type FROM plots WHERE plot_name=%s",
+        (plot_name,),
+        fetchone=True,
+    )
+    if not plot:
+        raise HTTPException(
+            status_code=404,
+            detail="Plot not in DB yet. Call /refresh-from-django or process the plot first.",
+        )
+
+    plot_id = plot["id"]
+    plot_data = plot_dict[plot_name]
+    props = plot_data.setdefault("properties", {})
+    if not (props.get("crop_type_name") or props.get("crop_type") or props.get("crop")):
+        if plot.get("crop_type"):
+            props["crop_type_name"] = plot["crop_type"]
+
+    deleted_count = 0
+    if force:
+        deleted = run_query(
+            """
+            DELETE FROM analysis_results
+            WHERE plot_id=%s AND analysis_type='pest_detection'
+            RETURNING id
+            """,
+            (plot_id,),
+            fetch=True,
+        )
+        deleted_count = len(deleted or [])
+        print(f"🗑 Force rebuild: deleted {deleted_count} pest rows for {plot_name}", flush=True)
+
+    today_month = date.today().replace(day=1)
+    max_lookback_months = 36
+    fallback_months = months if months is not None else 6
+
+    plantation_raw = props.get("plantation_date") or (
+        str(plot["plantation_date"]) if plot.get("plantation_date") else None
+    )
+    plantation_day = _parse_plantation_day(plantation_raw)
+
+    # Always start from plantation when available (supports >1 year old plots)
+    if plantation_day:
+        stop_month = plantation_day.replace(day=1)
+        oldest_allowed = today_month - relativedelta(months=max_lookback_months - 1)
+        if stop_month < oldest_allowed:
+            print(
+                f"ℹ Plantation {plantation_day} older than {max_lookback_months} months "
+                f"— capping pest backfill at {oldest_allowed}",
+                flush=True,
+            )
+            stop_month = oldest_allowed
+        print(
+            f"ℹ Pest {'rebuild' if force else 'resume'} {plot_name} "
+            f"from plantation {plantation_day} → today",
+            flush=True,
+        )
+        # Only remove pre-plantation junk; never wipe in-range progress on resume
+        run_query(
+            """
+            DELETE FROM analysis_results
+            WHERE plot_id=%s
+              AND analysis_type='pest_detection'
+              AND analysis_date < %s
+            """,
+            (plot_id, plantation_day.isoformat()),
+        )
+    else:
+        stop_month = today_month - relativedelta(months=fallback_months - 1)
+        print(
+            f"⚠ No plantation date for {plot_name} — last {fallback_months} months",
+            flush=True,
+        )
+
+    # Existing pest dates already in DB (for resume reporting)
+    existing_rows = run_query(
+        """
+        SELECT analysis_date
+        FROM analysis_results
+        WHERE plot_id=%s AND analysis_type='pest_detection'
+        ORDER BY analysis_date
+        """,
+        (plot_id,),
+        fetch=True,
+    ) or []
+    existing_dates = [str(r["analysis_date"])[:10] for r in existing_rows]
+
+    newly_stored = []
+    skipped_windows = 0
+    processed_windows = 0
+    current_month = today_month
+    windows_done = 0
+
+    while current_month >= stop_month:
+        for half_start, half_end in month_half_windows(
+            current_month.year, current_month.month
+        ):
+            start_d = date.fromisoformat(half_start)
+            end_d = date.fromisoformat(half_end)
+
+            if start_d > date.today():
+                continue
+
+            if plantation_day:
+                if end_d <= plantation_day:
+                    continue
+                if start_d < plantation_day:
+                    half_start = plantation_day.isoformat()
+
+            # Resume: skip windows that already have at least one pest result
+            if not force:
+                already = run_query(
+                    """
+                    SELECT id FROM analysis_results
+                    WHERE plot_id=%s
+                      AND analysis_type='pest_detection'
+                      AND analysis_date >= %s
+                      AND analysis_date < %s
+                    LIMIT 1
+                    """,
+                    (plot_id, half_start, half_end),
+                    fetchone=True,
+                )
+                if already:
+                    skipped_windows += 1
+                    print(
+                        f"✔ Skip pest {plot_name}: {half_start}→{half_end} (already stored)",
+                        flush=True,
+                    )
+                    continue
+
+            if windows_done > 0:
+                sleep_between_windows()
+
+            print(
+                f"🔎 Filling pest {plot_name}: {half_start}→{half_end}",
+                flush=True,
+            )
+            try:
+                results = run_pest_detection_analysis_by_plot(
+                    plot_name=plot_name,
+                    plot_data=plot_data,
+                    start_date=half_start,
+                    end_date=half_end,
+                    plot_id=plot_id,
+                    prefer_s2=True,
+                )
+            except Exception as e:
+                print(f"🔥 pest rebuild failed {half_start}: {e}", flush=True)
+                windows_done += 1
+                continue
+
+            windows_done += 1
+            processed_windows += 1
+
+            if not results:
+                continue
+
+            if isinstance(results, dict):
+                results = [results]
+
+            for geojson in results:
+                if not geojson.get("features"):
+                    continue
+                props_out = geojson["features"][0]["properties"]
+                analysis_date = props_out.get("latest_image_date")
+                if not analysis_date:
+                    continue
+
+                if plantation_day and str(analysis_date)[:10] < plantation_day.isoformat():
+                    continue
+
+                sensor = props_out.get("sensor_used") or "Sentinel-1"
+                tile_url = props_out.get("tile_url")
+                props_out["tile_url"] = tile_url
+
+                run_query(
+                    """
+                    INSERT INTO analysis_results
+                    (plot_id,analysis_type,analysis_date,sensor_used,tile_url,response_json)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (plot_id,analysis_type,analysis_date)
+                    DO UPDATE SET
+                        sensor_used = EXCLUDED.sensor_used,
+                        tile_url = EXCLUDED.tile_url,
+                        response_json = EXCLUDED.response_json
+                    """,
+                    (
+                        plot_id,
+                        "pest_detection",
+                        analysis_date,
+                        sensor,
+                        tile_url,
+                        Json(geojson),
+                    ),
+                )
+                newly_stored.append(str(analysis_date)[:10])
+
+        current_month = current_month - relativedelta(months=1)
+
+    all_dates = sorted(set(existing_dates + newly_stored))
+    months_covered = (
+        (today_month.year - stop_month.year) * 12
+        + (today_month.month - stop_month.month)
+        + 1
+    )
+    return {
+        "status": "ok",
+        "plot_name": plot_name,
+        "mode": "force_rebuild" if force else "resume",
+        "plantation_date": plantation_day.isoformat() if plantation_day else None,
+        "deleted_old_pest_rows": deleted_count,
+        "months_regenerated": months_covered,
+        "backfill_from": stop_month.isoformat(),
+        "windows_skipped": skipped_windows,
+        "windows_processed": processed_windows,
+        "pest_dates_new": sorted(set(newly_stored)),
+        "pest_dates_stored": all_dates,
+        "pest_date_count": len(all_dates),
+        "message": (
+            f"{'Rebuilt' if force else 'Resumed'}: "
+            f"{len(set(newly_stored))} new dates, "
+            f"{skipped_windows} windows skipped, "
+            f"{len(all_dates)} total pest dates"
+            + (
+                f" (on/after plantation {plantation_day})"
+                if plantation_day
+                else ""
+            )
+            + "."
+            if all_dates or newly_stored or skipped_windows
+            else "No Sentinel-1 images found after plantation date for this plot."
+        ),
+    }
+
+
+def plots_missing_pest_dates():
+    """
+    Plots with zero pest_detection rows on/after plantation date
+    (or zero pest rows at all if plantation is missing).
+    """
+    rows = run_query(
+        """
+        SELECT p.plot_name, p.id, p.plantation_date
+        FROM plots p
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM analysis_results ar
+            WHERE ar.plot_id = p.id
+              AND ar.analysis_type = 'pest_detection'
+              AND (
+                p.plantation_date IS NULL
+                OR ar.analysis_date >= p.plantation_date
+              )
+        )
+        ORDER BY p.plot_name
+        """,
+        fetch=True,
+    )
+    return rows or []
+
+
+@app.post("/rebackfill-pest")
+async def rebackfill_pest(
+    plot_name: str = Query(..., description="Plot name exactly as in /plots"),
+    months: int = Query(
+        6,
+        ge=1,
+        le=36,
+        description="Fallback lookback if plantation_date is missing (plantation always wins)",
+    ),
+    force: bool = Query(
+        False,
+        description="If true, wipe pest rows and rebuild. If false (default), resume and skip done windows.",
+    ),
+):
+    """
+    Fill pest_detection dates. Default is resume (keeps existing dates).
+    Use force=true only when you want a full wipe + rebuild.
+    """
+    return rebackfill_pest_for_plot(plot_name, months, force=force)
+
+
+@app.post("/cache-frontend-tiles")
+async def cache_frontend_tiles(
+    plot_name: str = Query(..., description="Exact plot name (test ONE plot first)"),
+    months: int | None = Query(
+        None,
+        ge=1,
+        le=36,
+        description=(
+            "Recent months to snapshot. "
+            "Omit for plantation_date → today (capped at 36 months)."
+        ),
+    ),
+    force: bool = Query(
+        False,
+        description="Re-snapshot even if an S3 tile already exists for that half-month",
+    ),
+    apis_base: str = Query(
+        "http://localhost:8003",
+        description="Running cropeye-apis-main Admin base URL",
+    ),
+    analysis_type: str | None = Query(
+        None,
+        description=(
+            "Optional: only this type "
+            "(growth | water_uptake | soil_moisture | pest_detection). "
+            "Default = all four."
+        ),
+    ),
+):
+    """
+    Snapshot exact frontend (cropeye-apis) tiles for ONE plot:
+    2 halves/month × growth/water/soil/pest → PNG → S3 → analysis_results.
+    Requires S3_TILE_UPLOAD_ENABLED=true and apis running on apis_base.
+    """
+    if plot_name not in plot_dict:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    allowed = {"growth", "water_uptake", "soil_moisture", "pest_detection"}
+    types = None
+    if analysis_type:
+        if analysis_type not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"analysis_type must be one of: {sorted(allowed)}",
+            )
+        types = [analysis_type]
+    try:
+        result = cache_frontend_tiles_for_plot(
+            plot_name,
+            plot_dict[plot_name],
+            apis_base=apis_base,
+            months=months,
+            force=force,
+            analysis_types=types,
+        )
+        return {"status": "ok", **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cache-frontend-tiles-all")
+async def cache_frontend_tiles_all(
+    months: int | None = Query(
+        None,
+        ge=1,
+        le=36,
+        description=(
+            "Recent calendar months to cover. "
+            "Omit for plantation_date → today (capped at 36 months)."
+        ),
+    ),
+    force: bool = Query(
+        False,
+        description="Re-store even if S3 tile already exists. Default resume/skip.",
+    ),
+    apis_base: str = Query(
+        "http://localhost:8003",
+        description="Running cropeye-apis-main Admin base URL",
+    ),
+    limit: int | None = Query(
+        None,
+        ge=1,
+        description="Optional max number of plots in this run",
+    ),
+    sleep_sec: float = Query(
+        3.0,
+        ge=0,
+        le=120,
+        description="Pause between plots (EE rate-limit friendly)",
+    ),
+    analysis_type: str | None = Query(
+        None,
+        description=(
+            "Optional: only this type "
+            "(growth | water_uptake | soil_moisture | pest_detection). "
+            "Default = all four."
+        ),
+    ),
+    start_after: str | None = Query(
+        None,
+        description="Optional: skip plot names <= this name (alphabetical resume)",
+    ),
+):
+    """
+    Background job: store growth/water/soil/pest tiles for ALL plots one-by-one.
+    Shared S2-first dates for growth/water/soil; pest uses its own S1 half-month dates.
+    Retries + stitch fallback on thumb failures. Resume-safe unless force=true.
+    """
+    import threading
+
+    status = get_bulk_tile_cache_status()
+    if status.get("running"):
+        return {
+            "status": "already_running",
+            "message": "Bulk tile cache already in progress",
+            **status,
+        }
+
+    allowed = {"growth", "water_uptake", "soil_moisture", "pest_detection"}
+    types = None
+    if analysis_type:
+        if analysis_type not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"analysis_type must be one of: {sorted(allowed)}",
+            )
+        types = [analysis_type]
+
+    names = sorted(plot_dict.keys())
+    if start_after:
+        names = [n for n in names if n > start_after]
+    if limit:
+        names = names[:limit]
+    plot_items = [(n, plot_dict[n]) for n in names]
+
+    if not plot_items:
+        return {"status": "ok", "queued": 0, "message": "No plots to process"}
+
+    def background():
+        try:
+            cache_frontend_tiles_all_plots(
+                plot_items,
+                apis_base=apis_base,
+                months=months,
+                force=force,
+                analysis_types=types,
+                sleep_sec=sleep_sec,
+            )
+        except Exception as e:
+            print(f"🔥 Bulk tile cache crashed: {e}", flush=True)
+
+    threading.Thread(target=background, daemon=True).start()
+
+    return {
+        "status": "started",
+        "message": (
+            f"Bulk frontend tile store started for {len(plot_items)} plots. "
+            "growth/water/soil share dates (S2 cloud<45% else S1); "
+            "pest uses S1 half-month dates. Existing S3 rows skipped unless force=true. "
+            "GET /cache-frontend-tiles-all/status for progress; "
+            "POST /cache-frontend-tiles-all/stop to halt."
+        ),
+        "queued": len(plot_items),
+        "months": months,
+        "force": force,
+        "apis_base": apis_base,
+        "sleep_sec": sleep_sec,
+        "analysis_types": types or sorted(allowed),
+        "first_plot": names[0],
+        "last_plot": names[-1],
+        "note": "Safe to stop and re-call — progress kept when force=false.",
+    }
+
+
+@app.get("/cache-frontend-tiles-all/status")
+async def cache_frontend_tiles_all_status():
+    return get_bulk_tile_cache_status()
+
+
+@app.post("/cache-frontend-tiles-all/stop")
+async def cache_frontend_tiles_all_stop():
+    return request_stop_bulk_tile_cache()
+
+
+@app.post("/rebackfill-pest-all")
+async def rebackfill_pest_all(
+    months: int = Query(
+        6,
+        ge=1,
+        le=36,
+        description="Fallback lookback if plantation_date is missing",
+    ),
+    only_missing: bool = Query(
+        False,
+        description=(
+            "If false (default), resume all plots (skips windows already stored). "
+            "If true, only plots with zero pest dates after plantation."
+        ),
+    ),
+    force: bool = Query(
+        False,
+        description="If true, wipe and rebuild each plot. Default resume.",
+    ),
+    limit: int | None = Query(
+        None,
+        ge=1,
+        description="Optional max number of plots to process in this run",
+    ),
+):
+    """
+    Bulk pest rebackfill. Default resumes from where it left off (no wipe).
+    """
+    import threading
+
+    # Set PEST_BULK_BACKFILL_ENABLED=false in .env to block this while focusing on tile cache
+    if os.getenv("PEST_BULK_BACKFILL_ENABLED", "true").strip().strip('"').lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return {
+            "status": "disabled",
+            "message": (
+                "Bulk pest backfill is disabled (PEST_BULK_BACKFILL_ENABLED=false). "
+                "Use POST /cache-frontend-tiles for S3 tile storage instead."
+            ),
+            "queued": 0,
+        }
+
+    if only_missing:
+        targets = plots_missing_pest_dates()
+        plot_names = [r["plot_name"] for r in targets if r["plot_name"] in plot_dict]
+        skipped_not_in_memory = [
+            r["plot_name"] for r in targets if r["plot_name"] not in plot_dict
+        ]
+    else:
+        db_plots = run_query(
+            "SELECT plot_name FROM plots ORDER BY plot_name",
+            fetch=True,
+        ) or []
+        plot_names = [r["plot_name"] for r in db_plots if r["plot_name"] in plot_dict]
+        skipped_not_in_memory = [
+            r["plot_name"] for r in db_plots if r["plot_name"] not in plot_dict
+        ]
+
+    if limit:
+        plot_names = plot_names[:limit]
+
+    if not plot_names:
+        return {
+            "status": "ok",
+            "message": "No plots need pest rebackfill",
+            "queued": 0,
+            "plot_names": [],
+            "skipped_not_in_memory": skipped_not_in_memory,
+        }
+
+    def background():
+        mode = "FORCE rebuild" if force else "RESUME"
+        print(
+            f"🚀 Bulk pest {mode} started: {len(plot_names)} plots",
+            flush=True,
+        )
+        ok, empty, failed, skipped_done = 0, 0, 0, 0
+        for i, name in enumerate(plot_names, 1):
+            if i > 1:
+                sleep_between_windows(5)
+            print(f"\n[{i}/{len(plot_names)}] Pest {mode} → {name}", flush=True)
+            try:
+                result = rebackfill_pest_for_plot(name, months, force=force)
+                count = result.get("pest_date_count", 0)
+                new_n = len(result.get("pest_dates_new") or [])
+                win_skip = result.get("windows_skipped", 0)
+                win_proc = result.get("windows_processed", 0)
+                if win_proc == 0 and win_skip > 0 and new_n == 0:
+                    skipped_done += 1
+                    print(
+                        f"✔ {name}: already complete ({count} dates, "
+                        f"{win_skip} windows skipped)",
+                        flush=True,
+                    )
+                elif count or new_n:
+                    ok += 1
+                    print(
+                        f"✅ {name}: +{new_n} new, {count} total "
+                        f"(skipped {win_skip}, processed {win_proc})",
+                        flush=True,
+                    )
+                else:
+                    empty += 1
+                    print(f"⚠ {name}: 0 pest dates", flush=True)
+            except Exception as e:
+                failed += 1
+                print(f"🔥 {name} failed: {e}", flush=True)
+
+        print(
+            f"\n✅ Bulk pest {mode} done. "
+            f"ok={ok} already_done={skipped_done} empty={empty} "
+            f"failed={failed} total={len(plot_names)}",
+            flush=True,
+        )
+
+    threading.Thread(target=background, daemon=True).start()
+
+    return {
+        "status": "started",
+        "message": (
+            f"Bulk pest {'force rebuild' if force else 'resume'} started for "
+            f"{len(plot_names)} plots in background. "
+            "Already-filled windows are skipped unless force=true."
+        ),
+        "queued": len(plot_names),
+        "mode": "force_rebuild" if force else "resume",
+        "months_fallback": months,
+        "only_missing": only_missing,
+        "force": force,
+        "plot_names": plot_names,
+        "skipped_not_in_memory": skipped_not_in_memory,
+        "note": "Stop anytime and call again — progress is kept (unless force=true).",
+    }
+
+
 # =====================================================
 # TIMELINE
 # =====================================================
@@ -1023,7 +1731,7 @@ async def analyze_pest(plot_name: str = Query(...), end_date: str | None = Query
 async def get_analysis_timeline(plot_name: str = Query(...)):
 
     plot = run_query(
-        "SELECT id FROM plots WHERE plot_name=%s",
+        "SELECT id, plantation_date, geojson FROM plots WHERE plot_name=%s",
         (plot_name,),
         fetchone=True
     )
@@ -1033,29 +1741,53 @@ async def get_analysis_timeline(plot_name: str = Query(...)):
 
     plot_id = plot["id"]
 
+    plantation_day = None
+    if plot.get("plantation_date"):
+        try:
+            plantation_day = datetime.strptime(
+                str(plot["plantation_date"])[:10], "%Y-%m-%d"
+            ).date()
+        except Exception:
+            plantation_day = None
+
+    # Growth / water / soil: every Sentinel-2 scene with cloud < 45%
+    # on or after plantation. Not the latest image of a stored window.
+    s2_scene_dates = None
+    if plantation_day and plot.get("geojson"):
+        geo = plot["geojson"]
+        if isinstance(geo, str):
+            geo = json.loads(geo)
+        if isinstance(geo, dict) and geo.get("type") == "Feature":
+            geo = geo.get("geometry")
+        geometry = ee.Geometry(geo)
+        s2_scene_dates = list_s2_dates(
+            geometry,
+            plantation_day.isoformat(),
+            (date.today() + timedelta(days=1)).isoformat(),
+        )
+        plant_iso = plantation_day.isoformat()
+        today_iso = date.today().isoformat()
+        s2_scene_dates = [
+            d for d in s2_scene_dates if plant_iso <= d <= today_iso
+        ]
+
     rows = run_query(
         """
-        SELECT analysis_type, analysis_date
+        SELECT analysis_type, analysis_date, response_json
         FROM analysis_results
         WHERE plot_id=%s
         ORDER BY analysis_date
         """,
         (plot_id,),
         fetch=True
-    )
+    ) or []
 
-    if not rows:
+    if not rows and not s2_scene_dates:
         return {"plot_name": plot_name, "timeline": []}
 
     monthly = {}
 
-    for r in rows:
-
-        analysis_type = (r["analysis_type"] or "").lower()
-        analysis_date = str(r["analysis_date"])
-
-        month = analysis_date[:7]
-
+    def _ensure_month(month):
         if month not in monthly:
             monthly[month] = {
                 "growth_dates": [],
@@ -1063,6 +1795,26 @@ async def get_analysis_timeline(plot_name: str = Query(...)):
                 "soil_moisture_dates": [],
                 "pest_detection_dates": []
             }
+        return monthly[month]
+
+    if s2_scene_dates is not None:
+        for scene_date in s2_scene_dates:
+            bucket = _ensure_month(scene_date[:7])
+            bucket["growth_dates"].append(scene_date)
+            bucket["water_uptake_dates"].append(scene_date)
+            bucket["soil_moisture_dates"].append(scene_date)
+
+    for r in rows:
+
+        analysis_type = (r["analysis_type"] or "").lower()
+        analysis_date = str(r["analysis_date"])[:10]
+
+        # Hide dates before plantation from rebin timeline
+        if plantation_day and analysis_date < plantation_day.isoformat():
+            continue
+
+        month = analysis_date[:7]
+        _ensure_month(month)
 
         # ✅ Normalize analysis_type
         if "growth" in analysis_type:
@@ -1076,7 +1828,39 @@ async def get_analysis_timeline(plot_name: str = Query(...)):
         else:
             continue  # skip unknown types safely
 
+        # Those three types use the 45% scene list when plantation geometry exists.
+        if s2_scene_dates is not None and key != "pest_detection_dates":
+            continue
+
         monthly[month][key].append(analysis_date)
+
+        if "pest" in analysis_type:
+            # Include every satellite pass stored inside legacy combined results
+            response_json = r.get("response_json") or {}
+            props = {}
+            if isinstance(response_json, dict):
+                features = response_json.get("features") or []
+                if features:
+                    props = features[0].get("properties") or {}
+                pixel_summary = response_json.get("pixel_summary") or {}
+                extra_dates = (
+                    props.get("image_dates")
+                    or pixel_summary.get("image_dates")
+                    or []
+                )
+                for d in extra_dates:
+                    d_str = str(d)[:10]
+                    if plantation_day and d_str < plantation_day.isoformat():
+                        continue
+                    d_month = d_str[:7]
+                    if d_month not in monthly:
+                        monthly[d_month] = {
+                            "growth_dates": [],
+                            "water_uptake_dates": [],
+                            "soil_moisture_dates": [],
+                            "pest_detection_dates": [],
+                        }
+                    monthly[d_month][key].append(d_str)
 
     timeline = []
 
@@ -1275,12 +2059,13 @@ async def analyze_water_uptake(
             "min": 0,
             "max": 5,
             "palette": [
-                "#EBFF34",  # Very deficient
-                "#CC8213AF",  # Low uptake
-                "#1348E88E",  # Adequat
-                "#2E199ABD",  # Adequate
-                "#0602178F",  # Excess
-            ],}
+                "#EBFF34",
+                "#CC8213AF",
+                "#00F5D4",
+                "#00B4D8",
+                "#1348E88E",
+            ],
+        }
         smoothed_vis = smoothed_class.visualize(**vis_params).clip(geometry)
         tile_url = smoothed_vis.getMapId()["tile_fetcher"].url_format
  
@@ -1425,29 +2210,21 @@ async def analyze_plot_combined(
         if s1_size == 0 and s2_size == 0:
             raise HTTPException(status_code=404, detail="No satellite images available in given date range")
        
-        # Determine which sensor to use
+        # Prefer Sentinel-2 whenever available (do not let a newer S1 override S2)
         use_sentinel2 = False
         sensor_used = None
         latest_date = None
        
-        if s1_latest_date and s2_latest_date:
-            # Both available - compare dates
-            if s2_latest_date >= s1_latest_date:
-                use_sentinel2 = True
-                sensor_used = "Sentinel-2"
-                latest_date = s2_latest_date
-            else:
-                use_sentinel2 = False
-                sensor_used = "Sentinel-1"
-                latest_date = s1_latest_date
-        elif s2_latest_date:
+        if s2_latest_date:
             use_sentinel2 = True
             sensor_used = "Sentinel-2"
             latest_date = s2_latest_date
-        else:
+        elif s1_latest_date:
             use_sentinel2 = False
             sensor_used = "Sentinel-1"
             latest_date = s1_latest_date
+        else:
+            raise HTTPException(status_code=404, detail="No satellite images available in given date range")
  
         # === Process Based on Selected Sensor ===
         if use_sentinel2:
